@@ -1,47 +1,34 @@
 [app]
-# (str) Title of your application
-title = SentinelX
-# (str) Package name
+title = Sentinel-X
 package.name = sentinelx
-# (str) Package domain (needed for android/ios packaging)
-package.domain = org.civic.enforce
+package.domain = org.sentinelx
+version = 0.1.0
 
-# (str) Source code where the main.py live
-source.dir =.
-# (list) Source files to include (let empty to include all the files)
-source.include_exts = py,png,jpg,kv,atlas,tflite
+source.dir = .
+source.include_exts = py,png,jpg,kv,atlas,json,txt
 
-# (str) Application versioning (method 1)
-version = 1.0
+# Requirements (per spec)
+requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless,reverse_geocoder
 
-# (list) Application requirements
-# reverse_geocoder requires C compilation, handled by GitHub Actions
-# Core requirements
-requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless
-
-# (str) Supported orientation (one of landscape, portrait or all)
 orientation = portrait
+fullscreen = 0
 
-# (list) Permissions
-android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WRITE_EXTERNAL_STORAGE,FOREGROUND_SERVICE,WAKE_LOCK
-
-# (list) Services to declare
-# NAME:PATH_TO_FILE
-android.services = sentinel_service:service.py
-
-# (int) Target Android API, should be as high as possible.
+# Android target (per spec)
 android.api = 33
 android.minapi = 24
+android.ndk = 25b
+android.sdk = 33
+android.archs = arm64-v8a,armeabi-v7a
 
-# (list) The Android Archs to build for, currently defaults to armeabi-v7a
-android.archs = arm64-v8a
+# Permissions (per spec)
+android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WRITE_EXTERNAL_STORAGE,FOREGROUND_SERVICE,WAKE_LOCK
 
-[buildozer]
-# (int) Log level (0 = error only, 1 = info, 2 = debug (with command output))
+# Background service
+services = service:service.py
+
+# Helpful defaults
+android.enable_androidx = True
+android.private_storage = True
+
+# (Optional) Reduce build noise
 log_level = 2
-
-warn_on_root = 1
-
-
-
-
