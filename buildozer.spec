@@ -17,7 +17,7 @@ version = 1.0
 # (list) Application requirements
 # reverse_geocoder requires C compilation, handled by GitHub Actions
 # Core requirements
-requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless,reverse_geocoder
+requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless
 
 # (str) Supported orientation (one of landscape, portrait or all)
 orientation = portrait
@@ -41,6 +41,7 @@ android.archs = arm64-v8a
 log_level = 2
 
 warn_on_root = 1
+
 
 
 
