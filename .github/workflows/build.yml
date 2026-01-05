@@ -6,7 +6,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # CHANGE: Use ubuntu-22.04 instead of 24.04 to support libtinfo5/libncurses5
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout Code
@@ -25,8 +26,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 3. Install Linux Dependencies required by Buildozer
-      - name: Install System Dependencies
+      # 3. Install System Dependencies (libtinfo5 is available on ubuntu-22.04)
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -47,13 +48,13 @@ jobs:
             libtool \
             pkg-config
 
-      # 4. Install Buildozer & Cython
+      # 4. Install Buildozer
       - name: Install Buildozer
         run: |
           pip install --upgrade pip
           pip install buildozer cython==0.29.36
 
-      # 5. Build the APK (Accepts licenses automatically)
+      # 5. Build the APK
       - name: Build APK
         run: |
           yes | buildozer android debug
