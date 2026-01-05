@@ -29,6 +29,11 @@ services = service:service.py
 # Helpful defaults
 android.enable_androidx = True
 android.private_storage = True
+# Force non-interactive acceptance & pin build-tools so AIDL exists
+android.accept_sdk_license = True
+android.sdk_build_tools = 33.0.2
+
 
 # (Optional) Reduce build noise
 log_level = 2
+
