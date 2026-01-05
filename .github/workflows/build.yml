@@ -6,27 +6,59 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Free Disk Space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
-      - name: Build with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      # 1. Setup Java 17 (Required for modern Android SDK)
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          command: buildozer android debug
-          buildozer_version: stable
-          python_version: '3.10'
+          distribution: 'temurin'
+          java-version: '17'
 
+      # 2. Setup Python 3.10
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Install Linux Dependencies required by Buildozer
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pip \
+            build-essential \
+            git \
+            python3-dev \
+            libffi-dev \
+            libssl-dev \
+            libltdl-dev \
+            zlib1g-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libtinfo5 \
+            cmake \
+            libzip-dev \
+            autoconf \
+            libtool \
+            pkg-config
+
+      # 4. Install Buildozer & Cython
+      - name: Install Buildozer
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython==0.29.36
+
+      # 5. Build the APK (Accepts licenses automatically)
+      - name: Build APK
+        run: |
+          yes | buildozer android debug
+
+      # 6. Upload the finished file
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
