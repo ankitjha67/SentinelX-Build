@@ -41,6 +41,54 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install "Cython<3" buildozer
 
+      # Step 1: Create/refresh SDK layout first (so sdkmanager exists inside .buildozer)
+      - name: Buildozer Android Update (create SDK/NDK)
+        run: |
+          buildozer -v android update
+
+      # Step 2: Accept licenses + install pinned build-tools/platforms so AIDL exists
+      - name: Accept Android SDK licenses + install required SDK packages
+        shell: bash
+        run: |
+          set -e
+
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          echo "SDK_ROOT=$SDK_ROOT"
+
+          # Find sdkmanager reliably (path differs across installs)
+          SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager | head -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $SDK_ROOT"
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager || true
+            exit 1
+          fi
+
+          chmod +x "$SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null
+
+          # Pin build-tools to avoid 36.x prompts and ensure aidl is present
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2"
+
+          # Quick sanity check for aidl
+          if [ ! -d "$SDK_ROOT/build-tools/33.0.2" ]; then
+            echo "Build-tools 33.0.2 folder missing after install!"
+            ls -la "$SDK_ROOT/build-tools" || true
+            exit 1
+          fi
+
+          if [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl" ] && [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl.exe" ]; then
+            echo "AIDL not found inside build-tools/33.0.2"
+            ls -la "$SDK_ROOT/build-tools/33.0.2" || true
+            exit 1
+          fi
+
+          echo "SDK packages installed and licenses accepted successfully."
+
       - name: Build Debug APK
         run: |
           buildozer -v android debug
