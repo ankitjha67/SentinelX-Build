@@ -41,3 +41,5 @@ android.archs = arm64-v8a
 log_level = 2
 
 warn_on_root = 1
+
+p4a.branch = master
