@@ -1,13 +1,13 @@
-name: build-android
+name: build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch: {}
 
 jobs:
   build:
-    runs-on: ubuntu-22.04   # CRITICAL FIX: must be 22.04
+    runs-on: ubuntu-22.04   # REQUIRED
 
     steps:
       - name: Checkout
@@ -41,18 +41,15 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip setuptools wheel
-          # Pin cython for stability with p4a/buildozer
           python -m pip install "cython<3.0" buildozer
 
       - name: Buildozer Android Update (creates SDK/NDK)
         run: |
           set -e
-          # Clean to avoid stale SDK build-tools (like 36.x)
           rm -rf .buildozer || true
           buildozer -v android update
 
-      # ✅ FIX STEP: avoids sdkmanager settings error + licenses + ensures AIDL/build-tools present
-      - name: Accept Android SDK licenses + install pinned build-tools
+      - name: Accept Android SDK licenses + install pinned build-tools (works with legacy tools/bin/sdkmanager)
         shell: bash
         run: |
           set -euo pipefail
@@ -63,32 +60,39 @@ jobs:
           export ANDROID_SDK_ROOT="$SDK_ROOT"
           export ANDROID_HOME="$SDK_ROOT"
 
-          # Force sdkmanager prefs/settings to a writable location
+          # Writable SDK prefs (prevents "Could not create settings" / IllegalArgumentException)
           export ANDROID_SDK_HOME="$RUNNER_TEMP/android_prefs"
           mkdir -p "$ANDROID_SDK_HOME/.android"
           touch "$ANDROID_SDK_HOME/.android/repositories.cfg"
-
-          # Extra hardening for Java prefs
           export JAVA_TOOL_OPTIONS="-Duser.home=$ANDROID_SDK_HOME -Djava.util.prefs.userRoot=$ANDROID_SDK_HOME/.java -Djava.util.prefs.systemRoot=$ANDROID_SDK_HOME/.java"
 
-          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -f "$SDKMANAGER" ]; then
+          # Robust sdkmanager detection:
+          # 1) cmdline-tools/latest
+          # 2) cmdline-tools (older layout)
+          # 3) legacy tools/bin (your current runner has this)
+          SDKMANAGER=""
+          if [ -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -f "$SDK_ROOT/cmdline-tools/bin/sdkmanager" ]; then
             SDKMANAGER="$SDK_ROOT/cmdline-tools/bin/sdkmanager"
+          elif [ -f "$SDK_ROOT/tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/tools/bin/sdkmanager"
           fi
-          if [ ! -f "$SDKMANAGER" ]; then
+
+          if [ -z "$SDKMANAGER" ]; then
             echo "sdkmanager not found. Listing:"
             find "$SDK_ROOT" -maxdepth 5 -type f -name sdkmanager || true
             exit 1
           fi
-          chmod +x "$SDKMANAGER"
 
-          echo "sdkmanager version:"
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --version
+          chmod +x "$SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --version || true
 
           # Accept licenses (quiet)
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
 
-          # Install pinned packages (includes AIDL)
+          # Install pinned packages needed for API 33 and AIDL
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
             "platforms;android-33" \
@@ -96,7 +100,7 @@ jobs:
 
           # Validate AIDL exists
           if [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl" ] && [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl.exe" ]; then
-            echo "AIDL not found. Contents:"
+            echo "AIDL not found. Contents of build-tools/33.0.2:"
             ls -la "$SDK_ROOT/build-tools/33.0.2" || true
             exit 1
           fi
