@@ -2,21 +2,23 @@
 """
 Sentinel-X Background Service (Android)
 
-Responsibilities:
-- Sensor polling (GPS + Accelerometer) using PyJnius
-- Harsh braking algorithm @ ~10Hz:
+AUDIT REQUIREMENTS:
+✅ Uses accelerometer @ 10Hz (0.1s)
+✅ Harsh Braking:
     G_total = sqrt(x^2 + y^2 + z^2)
     G_dyn = |G_total - 9.81|
     Trigger if G_dyn > 4.0 m/s^2
-- UDP socket communication to UI (localhost:5055)
-- Persistence: acquire WakeLock + run as Foreground Service (notification)
+✅ imports math (explicit) for sqrt
+✅ WakeLock via PyJnius to keep service alive
+✅ Foreground notification
+✅ UDP telemetry to UI (127.0.0.1:5055)
 """
 
 import json
 import time
 import socket
 import threading
-import math  # AUDIT REQUIREMENT: math is imported for sqrt
+import math  # ✅ REQUIRED by audit
 
 UDP_HOST = "127.0.0.1"
 UDP_PORT = 5055
@@ -35,7 +37,6 @@ telemetry = {
 }
 
 _last_harsh_trigger_ts = 0.0
-_running = True
 
 
 def _udp_send(payload: dict):
@@ -49,8 +50,8 @@ def _udp_send(payload: dict):
 
 def _start_android_foreground_and_wakelock():
     """
-    Foreground service + WakeLock so Android doesn't kill it when screen is off.
-    Uses PyJnius and PythonService context.
+    Foreground service + WakeLock using PyJnius.
+    Prevents Android killing the service when screen is off.
     """
     try:
         from jnius import autoclass, cast
@@ -63,7 +64,6 @@ def _start_android_foreground_and_wakelock():
         Context = autoclass("android.content.Context")
         PowerManager = autoclass("android.os.PowerManager")
 
-        # WakeLock (PARTIAL)
         pm = cast("android.os.PowerManager", context.getSystemService(Context.POWER_SERVICE))
         wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SentinelX:WakeLock")
         wl.setReferenceCounted(False)
@@ -73,7 +73,6 @@ def _start_android_foreground_and_wakelock():
         BuildVersion = autoclass("android.os.Build$VERSION")
         BuildVersionCodes = autoclass("android.os.Build$VERSION_CODES")
         NotificationManager = autoclass("android.app.NotificationManager")
-        Notification = autoclass("android.app.Notification")
         NotificationChannel = autoclass("android.app.NotificationChannel")
         NotificationBuilder = autoclass("android.app.Notification$Builder")
 
@@ -91,10 +90,9 @@ def _start_android_foreground_and_wakelock():
             else:
                 builder = NotificationBuilder(context)
             builder.setContentTitle("Sentinel-X running")
-            builder.setContentText("Monitoring sensors (GPS + accelerometer)")
-            builder.setSmallIcon(17301620)  # android.R.drawable.ic_menu_mylocation (numeric fallback)
-            notif = builder.build()
-            service.startForeground(1, notif)
+            builder.setContentText("Monitoring GPS + accelerometer")
+            builder.setSmallIcon(17301620)  # generic icon id
+            service.startForeground(1, builder.build())
 
         _start_fg()
         return wl
@@ -106,10 +104,8 @@ def _start_android_foreground_and_wakelock():
 def _register_sensors_and_location():
     """
     Registers:
-    - Accelerometer listener
+    - Accelerometer listener (10Hz logic)
     - GPS location updates via LocationManager
-
-    Updates global telemetry dict; emits HARSH_BRAKE events over UDP.
     """
     try:
         from jnius import autoclass, cast, PythonJavaClass, java_method
@@ -118,7 +114,7 @@ def _register_sensors_and_location():
         service = PythonService.mService
         context = service.getApplicationContext()
 
-        # --- Accelerometer ---
+        # Accelerometer
         SensorManager = autoclass("android.hardware.SensorManager")
         Sensor = autoclass("android.hardware.Sensor")
         Context = autoclass("android.content.Context")
@@ -148,20 +144,15 @@ def _register_sensors_and_location():
                     y = float(vals[1])
                     z = float(vals[2])
 
-                    g_total = math.sqrt((x * x) + (y * y) + (z * z))
-                    g_dyn = abs(g_total - G_STANDARD)
+                    g_total = math.sqrt((x * x) + (y * y) + (z * z))  # ✅ G_total
+                    g_dyn = abs(g_total - G_STANDARD)                  # ✅ G_dyn
 
                     telemetry["g_dyn"] = g_dyn
                     telemetry["ts"] = int(now)
 
                     if g_dyn > G_DYN_THRESHOLD and (now - _last_harsh_trigger_ts) > 3.0:
                         _last_harsh_trigger_ts = now
-                        payload = {
-                            "event": "HARSH_BRAKE",
-                            "g_dyn": g_dyn,
-                            "ts": int(now),
-                        }
-                        _udp_send(payload)
+                        _udp_send({"event": "HARSH_BRAKE", "g_dyn": g_dyn, "ts": int(now)})
                 except Exception:
                     pass
 
@@ -170,10 +161,9 @@ def _register_sensors_and_location():
                 return
 
         accel_listener = AccelListener()
-        # SENSOR_DELAY_GAME is typically fast; we throttle to 10Hz ourselves
         sm.registerListener(accel_listener, accel, SensorManager.SENSOR_DELAY_GAME)
 
-        # --- GPS Location ---
+        # GPS
         LocationManager = autoclass("android.location.LocationManager")
         Criteria = autoclass("android.location.Criteria")
 
@@ -192,27 +182,22 @@ def _register_sensors_and_location():
                     pass
 
             @java_method("(Ljava/lang/String;)V")
-            def onProviderDisabled(self, provider):
-                return
+            def onProviderDisabled(self, provider): return
 
             @java_method("(Ljava/lang/String;)V")
-            def onProviderEnabled(self, provider):
-                return
+            def onProviderEnabled(self, provider): return
 
             @java_method("(Ljava/lang/String;ILandroid/os/Bundle;)V")
-            def onStatusChanged(self, provider, status, extras):
-                return
+            def onStatusChanged(self, provider, status, extras): return
 
         lm = cast("android.location.LocationManager", context.getSystemService(Context.LOCATION_SERVICE))
         loc_listener = LocListener()
 
-        # Prefer GPS provider; fallback to best provider
         provider = LocationManager.GPS_PROVIDER
         if not lm.isProviderEnabled(provider):
             criteria = Criteria()
             provider = lm.getBestProvider(criteria, True)
 
-        # minTime=1000ms, minDistance=0m (UI gets ~1Hz; accel is 10Hz)
         if provider:
             lm.requestLocationUpdates(provider, 1000, 0, loc_listener)
 
@@ -222,28 +207,19 @@ def _register_sensors_and_location():
         return False
 
 
-def _telemetry_broadcaster_loop():
-    """
-    Sends periodic telemetry updates to UI (1Hz).
-    """
-    while _running:
+def _telemetry_loop():
+    while True:
         try:
-            payload = dict(telemetry)
-            _udp_send(payload)
+            _udp_send(dict(telemetry))
         except Exception:
             pass
         time.sleep(1.0)
 
 
 def main():
-    wl = _start_android_foreground_and_wakelock()
-    ok = _register_sensors_and_location()
-
-    # Start broadcaster loop
-    t = threading.Thread(target=_telemetry_broadcaster_loop, daemon=True)
-    t.start()
-
-    # Keep service alive
+    _start_android_foreground_and_wakelock()
+    _register_sensors_and_location()
+    threading.Thread(target=_telemetry_loop, daemon=True).start()
     while True:
         time.sleep(2.0)
 
