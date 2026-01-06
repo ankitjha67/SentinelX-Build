@@ -1,13 +1,13 @@
-name: Build Sentinel-X (Android APK)
+name: build-android
 
 on:
-  workflow_dispatch:
   push:
     branches: [ "main" ]
+  workflow_dispatch: {}
 
 jobs:
-  build-android:
-    runs-on: ubuntu-22.04  # ✅ AUDIT: explicitly ubuntu-22.04
+  build:
+    runs-on: ubuntu-22.04   # CRITICAL FIX: must be 22.04
 
     steps:
       - name: Checkout
@@ -26,66 +26,89 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential git zip unzip \
-            python3-dev python3-pip python3-venv \
-            libffi-dev libssl-dev zlib1g-dev \
-            libbz2-dev liblzma-dev libsqlite3-dev \
-            libncurses5 libncursesw5 libtinfo5 \
-            pkg-config cmake autoconf automake libtool \
-            libjpeg-dev libpng-dev
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip wget curl \
+            build-essential pkg-config \
+            autoconf automake libtool \
+            libffi-dev libssl-dev \
+            python3-dev \
+            libtinfo5 \
+            zlib1g-dev
 
       - name: Install Buildozer
         run: |
+          set -e
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "Cython<3" buildozer
+          # Pin cython for stability with p4a/buildozer
+          python -m pip install "cython<3.0" buildozer
 
       - name: Buildozer Android Update (creates SDK/NDK)
         run: |
+          set -e
+          # Clean to avoid stale SDK build-tools (like 36.x)
+          rm -rf .buildozer || true
           buildozer -v android update
 
+      # ✅ FIX STEP: avoids sdkmanager settings error + licenses + ensures AIDL/build-tools present
       - name: Accept Android SDK licenses + install pinned build-tools
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
           echo "SDK_ROOT=$SDK_ROOT"
 
-          SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager | head -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found under $SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export ANDROID_HOME="$SDK_ROOT"
+
+          # Force sdkmanager prefs/settings to a writable location
+          export ANDROID_SDK_HOME="$RUNNER_TEMP/android_prefs"
+          mkdir -p "$ANDROID_SDK_HOME/.android"
+          touch "$ANDROID_SDK_HOME/.android/repositories.cfg"
+
+          # Extra hardening for Java prefs
+          export JAVA_TOOL_OPTIONS="-Duser.home=$ANDROID_SDK_HOME -Djava.util.prefs.userRoot=$ANDROID_SDK_HOME/.java -Djava.util.prefs.systemRoot=$ANDROID_SDK_HOME/.java"
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/bin/sdkmanager"
+          fi
+          if [ ! -f "$SDKMANAGER" ]; then
+            echo "sdkmanager not found. Listing:"
+            find "$SDK_ROOT" -maxdepth 5 -type f -name sdkmanager || true
             exit 1
           fi
           chmod +x "$SDKMANAGER"
 
-          yes | "$SDKMANAGER" --licenses >/dev/null
+          echo "sdkmanager version:"
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --version
 
-          "$SDKMANAGER" \
+          # Accept licenses (quiet)
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+
+          # Install pinned packages (includes AIDL)
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
             "platforms;android-33" \
             "build-tools;33.0.2"
 
-          if [ ! -d "$SDK_ROOT/build-tools/33.0.2" ]; then
-            echo "Build-tools 33.0.2 missing!"
-            ls -la "$SDK_ROOT/build-tools" || true
-            exit 1
-          fi
-
+          # Validate AIDL exists
           if [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl" ] && [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl.exe" ]; then
-            echo "AIDL not found in build-tools/33.0.2"
+            echo "AIDL not found. Contents:"
             ls -la "$SDK_ROOT/build-tools/33.0.2" || true
             exit 1
           fi
-
-          echo "SDK packages OK (licenses accepted, AIDL present)."
+          echo "SDK OK: build-tools 33.0.2 installed; AIDL present"
 
       - name: Build Debug APK
         run: |
+          set -e
           buildozer -v android debug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Sentinel-X-APK
+          name: sentinelx-apk
           path: bin/*.apk
