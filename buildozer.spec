@@ -9,9 +9,9 @@ version = 1.0.0
 orientation = portrait
 fullscreen = 0
 
-requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless,reverse_geocoder
+requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,pyjnius,opencv,reverse_geocoder
 
-services = service:service.py
+services = Telemetry:service.py:foreground
 
 android.api = 33
 android.minapi = 26
@@ -22,7 +22,9 @@ android.ndk = 25b
 android.sdk_build_tools = 33.0.2
 android.accept_sdk_license = True
 
-android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WRITE_EXTERNAL_STORAGE,FOREGROUND_SERVICE,WAKE_LOCK
+android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES,FOREGROUND_SERVICE,WAKE_LOCK
+
+icon.filename = icon.png
 
 android.archs = arm64-v8a,armeabi-v7a
 

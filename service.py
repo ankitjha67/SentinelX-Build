@@ -15,7 +15,16 @@ import time
 import json
 import math  # REQUIRED (your audit instruction)
 import socket
-from kivy.utils import platform
+import sys
+
+def _get_platform():
+    try:
+        import android
+        return "android"
+    except ImportError:
+        return sys.platform
+
+platform = _get_platform()
 
 try:
     from jnius import autoclass  # type: ignore
@@ -75,13 +84,20 @@ def get_last_known_location():
         return 0.0, 0.0, 0.0
 
 
+_accel_enabled = False
+
 def read_accel_xyz():
+    global _accel_enabled
     if accelerometer is None:
         return 0.0, 0.0, 9.81
     try:
-        if not accelerometer.enabled:
+        if not _accel_enabled:
             accelerometer.enable()
-        x, y, z = accelerometer.acceleration  # type: ignore
+            _accel_enabled = True
+        val = accelerometer.acceleration
+        if val is None or val == (None, None, None):
+            return 0.0, 0.0, 9.81
+        x, y, z = val
         if x is None or y is None or z is None:
             return 0.0, 0.0, 9.81
         return float(x), float(y), float(z)
@@ -92,33 +108,45 @@ def read_accel_xyz():
 def main():
     _wl = acquire_wakelock()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        interval = 0.1  # 10Hz
+        while True:
+            try:
+                lat, lon, speed_mps = get_last_known_location()
+                x, y, z = read_accel_xyz()
 
-    interval = 0.1  # 10Hz
-    while True:
+                g_total = math.sqrt(x * x + y * y + z * z)
+                g_dyn = abs(g_total - 9.81)
+
+                payload = {
+                    "ts": time.time(),
+                    "lat": lat,
+                    "lon": lon,
+                    "speed_mps": speed_mps,
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "g_total": g_total,
+                    "g_dyn": g_dyn,
+                    "harsh_brake": bool(g_dyn > 4.0),
+                }
+                sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_HOST, UDP_PORT))
+            except Exception:
+                pass
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
         try:
-            lat, lon, speed_mps = get_last_known_location()
-            x, y, z = read_accel_xyz()
-
-            g_total = math.sqrt(x * x + y * y + z * z)
-            g_dyn = abs(g_total - 9.81)
-
-            payload = {
-                "ts": time.time(),
-                "lat": lat,
-                "lon": lon,
-                "speed_mps": speed_mps,
-                "x": x,
-                "y": y,
-                "z": z,
-                "g_total": g_total,
-                "g_dyn": g_dyn,
-                "harsh_brake": bool(g_dyn > 4.0),
-            }
-            sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_HOST, UDP_PORT))
+            sock.close()
         except Exception:
             pass
-
-        time.sleep(interval)
+        if _wl is not None:
+            try:
+                _wl.release()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
