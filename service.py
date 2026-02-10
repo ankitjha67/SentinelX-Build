@@ -17,14 +17,15 @@ import math  # REQUIRED (your audit instruction)
 import socket
 import sys
 
-def _get_platform():
+def _get_platform_name():
+    """Detect platform without importing Kivy (lightweight for service)"""
     try:
         import android
         return "android"
     except ImportError:
         return sys.platform
 
-platform = _get_platform()
+platform = _get_platform_name()
 
 try:
     from jnius import autoclass  # type: ignore

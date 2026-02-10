@@ -686,13 +686,9 @@ class RootUI(BoxLayout):
 
             # Check texture color format to avoid crashes
             colorfmt = getattr(tex, 'colorfmt', 'rgba')
-            if colorfmt == 'rgba':
-                channels = 4
-            elif colorfmt == 'rgb':
-                channels = 3
-            elif colorfmt == 'bgra':
-                channels = 4
-            else:
+            channel_map = {'rgba': 4, 'rgb': 3, 'bgra': 4}
+            channels = channel_map.get(colorfmt)
+            if channels is None:
                 return
             
             buf = bytes(tex.pixels)  # ensure we have a bytes-like object
@@ -701,9 +697,8 @@ class RootUI(BoxLayout):
                 return
             
             arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, channels))
-            if channels == 4:
-                rgb = arr[:, :, :3]
-            elif channels == 3:
+            # Extract RGB regardless of format (works for both 3 and 4 channel images)
+            if channels in (3, 4):
                 rgb = arr[:, :, :3]
             else:
                 return
@@ -758,14 +753,12 @@ class RootUI(BoxLayout):
             self.plate_validation_hint = ""
             return
         
-        # Common Indian plate patterns:
-        # XX00XX0000 (standard)
-        # XX00X0000 (old format)
-        # XX00XX0000XX (special cases like military/diplomatic)
-        pattern1 = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$'
-        pattern2 = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{1,4}$'
+        # Common Indian plate patterns (consolidated pattern):
+        # XX00XX0000 (standard), XX00X0000 (old format)
+        # Pattern allows 1-2 letters after digits, and 1-4 digits at end
+        pattern = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{1,4}$'
         
-        if re.match(pattern1, text) or re.match(pattern2, text):
+        if re.match(pattern, text):
             self.plate_validation_hint = "✓ Valid format"
         else:
             self.plate_validation_hint = "⚠ Check format (e.g., MH12AB1234)"
