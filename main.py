@@ -72,6 +72,15 @@ try:
 except Exception:
     Preview = None
 
+# PyJnius autoclass for service start
+autoclass = None
+try:
+    if platform == "android":
+        from jnius import autoclass as _autoclass  # type: ignore
+        autoclass = _autoclass
+except Exception:
+    autoclass = None
+
 
 # =============================================================================
 # 1) LEGAL DB
@@ -574,8 +583,12 @@ class RootUI(BoxLayout):
             Permission.CAMERA,
             Permission.ACCESS_FINE_LOCATION,
             Permission.ACCESS_COARSE_LOCATION,
-            Permission.WRITE_EXTERNAL_STORAGE,
         ]
+        # For API 33+, use READ_MEDIA_IMAGES instead of WRITE_EXTERNAL_STORAGE
+        try:
+            perms.append(Permission.READ_MEDIA_IMAGES)
+        except AttributeError:
+            perms.append(Permission.WRITE_EXTERNAL_STORAGE)
         try:
             request_permissions(perms)
         except Exception:
@@ -626,8 +639,30 @@ class RootUI(BoxLayout):
             if w <= 0 or h <= 0:
                 return
 
-            arr = np.frombuffer(tex.pixels, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[:, :, :3]
+            # Check texture color format to avoid crashes
+            colorfmt = getattr(tex, 'colorfmt', 'rgba')
+            if colorfmt == 'rgba':
+                channels = 4
+            elif colorfmt == 'rgb':
+                channels = 3
+            elif colorfmt == 'bgra':
+                channels = 4
+            else:
+                return
+            
+            buf = bytes(tex.pixels)  # ensure we have a bytes-like object
+            expected = h * w * channels
+            if len(buf) != expected:
+                return
+            
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, channels))
+            if channels == 4:
+                rgb = arr[:, :, :3]
+            elif channels == 3:
+                rgb = arr[:, :, :3]
+            else:
+                return
+            
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
             boxes = self._analytics.detect_plate_candidates_bgr(bgr)
@@ -692,6 +727,9 @@ class RootUI(BoxLayout):
             self._popup("Capture failed", "Could not save evidence image.")
 
     def _after_capture(self, path):
+        Clock.schedule_once(lambda dt: self._process_capture(path), 0)
+
+    def _process_capture(self, path):
         try:
             p = path if isinstance(path, str) else str(path)
             if isinstance(path, (tuple, list)) and path:
@@ -720,7 +758,11 @@ class RootUI(BoxLayout):
     def _update_geo_and_route(self, _dt):
         lat = float(self.latest_lat)
         lon = float(self.latest_lon)
+        
+        # Run geocoding in background thread to avoid UI freeze
+        threading.Thread(target=self._bg_geo_update, args=(lat, lon), daemon=True).start()
 
+    def _bg_geo_update(self, lat, lon):
         district = "—"
         state = "—"
         if rg is not None and abs(lat) > 0.0001 and abs(lon) > 0.0001:
@@ -738,17 +780,26 @@ class RootUI(BoxLayout):
         plate = self.ids.in_plate.text.strip()
         route = JurisdictionEngine.recipients_for_report(lat, lon, plate)
         rcpts = ", ".join(route["recipients"]) if route["recipients"] else "—"
-        self.route_text = (
+        route_text = (
             f"Location code: {route['loc_code'] or '—'}\n"
             f"Plate code: {route['plate_code'] or '—'}\n"
             f"Recipients: {rcpts}"
         )
 
         speed_kmh = self.latest_speed_mps * 3.6
-        self.status_text = (
+        status_text = (
             f"GPS: {lat:.5f}, {lon:.5f} | {district}, {state} | "
             f"Speed: {speed_kmh:.1f} km/h | G_dyn: {self.latest_g_dyn:.2f} | {self.cv_hint}"
         )
+        
+        # Update UI on main thread
+        Clock.schedule_once(lambda dt: self._apply_geo_results(district, state, route_text, status_text), 0)
+    
+    def _apply_geo_results(self, district, state, route_text, status_text):
+        self.district = district
+        self.state_name = state
+        self.route_text = route_text
+        self.status_text = status_text
 
     # -------------------------------------------------------------------------
     # Email reporting
@@ -826,13 +877,14 @@ class RootUI(BoxLayout):
         attachment = self.evidence_path if self.evidence_path and os.path.isfile(self.evidence_path) else None
 
         try:
+            # Try file_path first (modern plyer Android), then fallback to attachment
             try:
-                plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
-            except TypeError:
                 if attachment:
                     plyer_email.send(recipients=route["recipients"], subject=subject, text=body, file_path=attachment)
                 else:
                     plyer_email.send(recipients=route["recipients"], subject=subject, text=body)
+            except TypeError:
+                plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
 
             self._popup("Report prepared", "Email composer opened with recipients + Good Samaritan footer.")
         except Exception as e:
@@ -845,10 +897,19 @@ class RootUI(BoxLayout):
         if platform != "android":
             return
         try:
-            from android import AndroidService  # type: ignore
-            AndroidService("Sentinel-X", "Telemetry running").start("")
+            # Modern p4a service start approach
+            from android import mActivity  # type: ignore
+            context = mActivity.getApplicationContext()
+            SERVICE_NAME = str(context.getPackageName()) + ".ServiceTelemetry"
+            service = autoclass(SERVICE_NAME)
+            service.start(mActivity, "")
         except Exception:
-            pass
+            # Fallback to legacy method
+            try:
+                from android import AndroidService  # type: ignore
+                AndroidService("Sentinel-X", "Telemetry running").start("")
+            except Exception:
+                pass
 
     def _start_udp_listener(self):
         if self._udp_thread:
@@ -859,24 +920,31 @@ class RootUI(BoxLayout):
     def _udp_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 17888))
             s.settimeout(1.0)
+            
+            while not self._udp_stop.is_set():
+                try:
+                    data, _ = s.recvfrom(4096)
+                    payload = json.loads(data.decode("utf-8", errors="ignore"))
+                    lat = float(payload.get("lat", 0.0) or 0.0)
+                    lon = float(payload.get("lon", 0.0) or 0.0)
+                    speed = float(payload.get("speed_mps", 0.0) or 0.0)
+                    g_dyn = float(payload.get("g_dyn", 0.0) or 0.0)
+                    # Fix lambda closure: capture by value using default arguments
+                    Clock.schedule_once(lambda dt, la=lat, lo=lon, sp=speed, gd=g_dyn: self._apply_telemetry(la, lo, sp, gd), 0)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
         except Exception:
-            return
-
-        while not self._udp_stop.is_set():
+            pass
+        finally:
             try:
-                data, _ = s.recvfrom(4096)
-                payload = json.loads(data.decode("utf-8", errors="ignore"))
-                lat = float(payload.get("lat", 0.0) or 0.0)
-                lon = float(payload.get("lon", 0.0) or 0.0)
-                speed = float(payload.get("speed_mps", 0.0) or 0.0)
-                g_dyn = float(payload.get("g_dyn", 0.0) or 0.0)
-                Clock.schedule_once(lambda dt: self._apply_telemetry(lat, lon, speed, g_dyn), 0)
-            except socket.timeout:
-                continue
+                s.close()
             except Exception:
-                continue
+                pass
 
     def _apply_telemetry(self, lat, lon, speed_mps, g_dyn):
         self.latest_lat = lat
