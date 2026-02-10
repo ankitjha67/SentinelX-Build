@@ -25,7 +25,7 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp
-from kivy.properties import StringProperty, NumericProperty
+from kivy.properties import StringProperty, NumericProperty, BooleanProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
@@ -71,6 +71,15 @@ try:
     from camera4kivy import Preview  # type: ignore
 except Exception:
     Preview = None
+
+# PyJnius autoclass for service start
+autoclass = None
+try:
+    if platform == "android":
+        from jnius import autoclass as _autoclass  # type: ignore
+        autoclass = _autoclass
+except Exception:
+    autoclass = None
 
 
 # =============================================================================
@@ -359,6 +368,24 @@ KV = r"""
                 pos: self.pos
                 size: self.size
 
+    # Dangerous driving alert banner
+    Label:
+        size_hint_y: None
+        height: dp(40) if root.show_harsh_brake_warning else 0
+        opacity: 1 if root.show_harsh_brake_warning else 0
+        text: "⚠ HARSH BRAKING DETECTED — Dangerous Driving flagged"
+        bold: True
+        font_size: "14sp"
+        halign: "center"
+        valign: "middle"
+        text_size: self.size
+        canvas.before:
+            Color:
+                rgba: (0.9, 0.1, 0.1, 1) if root.show_harsh_brake_warning else (0, 0, 0, 0)
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
     Label:
         size_hint_y: None
         height: dp(44)
@@ -435,6 +462,20 @@ KV = r"""
                 id: in_plate
                 multiline: False
                 hint_text: "e.g., MH12AB1234"
+                on_text: root.validate_plate(self.text)
+
+            Label:
+                text: ""
+                halign: "left"
+                valign: "middle"
+                text_size: self.size
+            Label:
+                text: root.plate_validation_hint
+                font_size: "11sp"
+                color: (0.9, 0.6, 0.1, 1) if root.plate_validation_hint else (1, 1, 1, 1)
+                halign: "left"
+                valign: "middle"
+                text_size: self.size
 
             Label:
                 text: "Violation Code"
@@ -536,6 +577,12 @@ class RootUI(BoxLayout):
 
     evidence_path = StringProperty("")
     cv_hint = StringProperty("")
+    
+    # Dangerous driving alert
+    show_harsh_brake_warning = BooleanProperty(False)
+    
+    # Plate validation
+    plate_validation_hint = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -543,6 +590,8 @@ class RootUI(BoxLayout):
         self._udp_stop = threading.Event()
         self._preview = None
         self._analytics = AnalyticsEngine(self._app_dir())
+        # Create reverse mapping for offense key extraction
+        self._offense_text_to_key = {}
         Clock.schedule_once(self._post_build, 0)
 
     def _app_dir(self):
@@ -552,8 +601,13 @@ class RootUI(BoxLayout):
             return "."
 
     def _post_build(self, _dt):
-        # populate spinners
-        self.ids.sp_offense.values = [f"{k} — {v['label']}" for k, v in TrafficLawDB.OFFENSES.items()]
+        # populate spinners with offense text and create reverse mapping
+        offense_values = []
+        for k, v in TrafficLawDB.OFFENSES.items():
+            text = f"{k} — {v['label']}"
+            offense_values.append(text)
+            self._offense_text_to_key[text] = k
+        self.ids.sp_offense.values = offense_values
         self.ids.sp_sign_group.values = list(TrafficLawDB.SIGN_GROUPS.keys())
 
         self._setup_camera()
@@ -574,8 +628,12 @@ class RootUI(BoxLayout):
             Permission.CAMERA,
             Permission.ACCESS_FINE_LOCATION,
             Permission.ACCESS_COARSE_LOCATION,
-            Permission.WRITE_EXTERNAL_STORAGE,
         ]
+        # For API 33+, use READ_MEDIA_IMAGES instead of WRITE_EXTERNAL_STORAGE
+        try:
+            perms.append(Permission.READ_MEDIA_IMAGES)
+        except AttributeError:
+            perms.append(Permission.WRITE_EXTERNAL_STORAGE)
         try:
             request_permissions(perms)
         except Exception:
@@ -626,8 +684,25 @@ class RootUI(BoxLayout):
             if w <= 0 or h <= 0:
                 return
 
-            arr = np.frombuffer(tex.pixels, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[:, :, :3]
+            # Check texture color format to avoid crashes
+            colorfmt = getattr(tex, 'colorfmt', 'rgba')
+            channel_map = {'rgba': 4, 'rgb': 3, 'bgra': 4}
+            channels = channel_map.get(colorfmt)
+            if channels is None:
+                return
+            
+            buf = bytes(tex.pixels)  # ensure we have a bytes-like object
+            expected = h * w * channels
+            if len(buf) != expected:
+                return
+            
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, channels))
+            # Extract RGB regardless of format (works for both 3 and 4 channel images)
+            if channels in (3, 4):
+                rgb = arr[:, :, :3]
+            else:
+                return
+            
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
             boxes = self._analytics.detect_plate_candidates_bgr(bgr)
@@ -646,7 +721,8 @@ class RootUI(BoxLayout):
     # Form handlers
     # -------------------------------------------------------------------------
     def on_offense_selected(self, text):
-        key = (text.split("—")[0] or "").strip()
+        # Use reverse mapping for robust key extraction
+        key = self._offense_text_to_key.get(text, "")
         if key in TrafficLawDB.OFFENSES:
             v = TrafficLawDB.OFFENSES[key]
             self.section_penalty_text = f"{v['section']}\nPenalty: {v['penalty']}"
@@ -668,6 +744,24 @@ class RootUI(BoxLayout):
         self.section_penalty_text = "—"
         self.route_text = "—"
         self.evidence_path = ""
+        self.plate_validation_hint = ""
+
+    def validate_plate(self, text):
+        """Validate Indian number plate format in real-time"""
+        text = text.strip().upper()
+        if not text:
+            self.plate_validation_hint = ""
+            return
+        
+        # Common Indian plate patterns (consolidated pattern):
+        # XX00XX0000 (standard), XX00X0000 (old format)
+        # Pattern allows 1-2 letters after digits, and 1-4 digits at end
+        pattern = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{1,4}$'
+        
+        if re.match(pattern, text):
+            self.plate_validation_hint = "✓ Valid format"
+        else:
+            self.plate_validation_hint = "⚠ Check format (e.g., MH12AB1234)"
 
     # -------------------------------------------------------------------------
     # Evidence capture + CLAHE
@@ -692,6 +786,9 @@ class RootUI(BoxLayout):
             self._popup("Capture failed", "Could not save evidence image.")
 
     def _after_capture(self, path):
+        Clock.schedule_once(lambda dt: self._process_capture(path), 0)
+
+    def _process_capture(self, path):
         try:
             p = path if isinstance(path, str) else str(path)
             if isinstance(path, (tuple, list)) and path:
@@ -720,7 +817,11 @@ class RootUI(BoxLayout):
     def _update_geo_and_route(self, _dt):
         lat = float(self.latest_lat)
         lon = float(self.latest_lon)
+        
+        # Run geocoding in background thread to avoid UI freeze
+        threading.Thread(target=self._bg_geo_update, args=(lat, lon), daemon=True).start()
 
+    def _bg_geo_update(self, lat, lon):
         district = "—"
         state = "—"
         if rg is not None and abs(lat) > 0.0001 and abs(lon) > 0.0001:
@@ -738,17 +839,26 @@ class RootUI(BoxLayout):
         plate = self.ids.in_plate.text.strip()
         route = JurisdictionEngine.recipients_for_report(lat, lon, plate)
         rcpts = ", ".join(route["recipients"]) if route["recipients"] else "—"
-        self.route_text = (
+        route_text = (
             f"Location code: {route['loc_code'] or '—'}\n"
             f"Plate code: {route['plate_code'] or '—'}\n"
             f"Recipients: {rcpts}"
         )
 
         speed_kmh = self.latest_speed_mps * 3.6
-        self.status_text = (
+        status_text = (
             f"GPS: {lat:.5f}, {lon:.5f} | {district}, {state} | "
             f"Speed: {speed_kmh:.1f} km/h | G_dyn: {self.latest_g_dyn:.2f} | {self.cv_hint}"
         )
+        
+        # Update UI on main thread
+        Clock.schedule_once(lambda dt: self._apply_geo_results(district, state, route_text, status_text), 0)
+    
+    def _apply_geo_results(self, district, state, route_text, status_text):
+        self.district = district
+        self.state_name = state
+        self.route_text = route_text
+        self.status_text = status_text
 
     # -------------------------------------------------------------------------
     # Email reporting
@@ -764,7 +874,7 @@ class RootUI(BoxLayout):
             return
 
         offense_text = self.ids.sp_offense.text
-        offense_key = (offense_text.split("—")[0] or "").strip()
+        offense_key = self._offense_text_to_key.get(offense_text, "")
         if offense_key not in TrafficLawDB.OFFENSES:
             self._popup("Missing violation", "Select a violation code.")
             return
@@ -826,17 +936,60 @@ class RootUI(BoxLayout):
         attachment = self.evidence_path if self.evidence_path and os.path.isfile(self.evidence_path) else None
 
         try:
+            # Try file_path first (modern plyer Android), then fallback to attachment
             try:
-                plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
-            except TypeError:
                 if attachment:
                     plyer_email.send(recipients=route["recipients"], subject=subject, text=body, file_path=attachment)
                 else:
                     plyer_email.send(recipients=route["recipients"], subject=subject, text=body)
+            except TypeError:
+                plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
 
+            # Save report history as JSON audit trail
+            self._save_report_history(now, lat, lon, plate, offense_key, offense, route, anon, attachment)
+            
             self._popup("Report prepared", "Email composer opened with recipients + Good Samaritan footer.")
         except Exception as e:
             self._popup("Email failed", str(e))
+
+    def _save_report_history(self, timestamp, lat, lon, plate, offense_key, offense, route, anonymous, evidence_path):
+        try:
+            reports_dir = os.path.join(self._app_dir(), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            
+            # Create filename with timestamp
+            filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = os.path.join(reports_dir, filename)
+            
+            # Create report record
+            report = {
+                "timestamp": timestamp,
+                "gps": {"lat": lat, "lon": lon},
+                "location": {"district": self.district, "state": self.state_name},
+                "plate": plate,
+                "offense": {
+                    "key": offense_key,
+                    "label": offense["label"],
+                    "section": offense["section"],
+                    "penalty": offense["penalty"]
+                },
+                "recipients": route["recipients"],
+                "routing": {
+                    "location_code": route["loc_code"],
+                    "plate_code": route["plate_code"],
+                    "location_emails": route["loc_emails"],
+                    "plate_emails": route["plate_emails"]
+                },
+                "anonymous": anonymous,
+                "evidence_path": evidence_path if evidence_path else None,
+                "speed_kmh": self.latest_speed_mps * 3.6,
+                "g_dyn": self.latest_g_dyn
+            }
+            
+            with open(filepath, "w") as f:
+                json.dump(report, f, indent=2)
+        except Exception:
+            pass  # Silent failure for audit trail
 
     # -------------------------------------------------------------------------
     # Service integration (UDP from service.py)
@@ -845,10 +998,19 @@ class RootUI(BoxLayout):
         if platform != "android":
             return
         try:
-            from android import AndroidService  # type: ignore
-            AndroidService("Sentinel-X", "Telemetry running").start("")
+            # Modern p4a service start approach
+            from android import mActivity  # type: ignore
+            context = mActivity.getApplicationContext()
+            SERVICE_NAME = str(context.getPackageName()) + ".ServiceTelemetry"
+            service = autoclass(SERVICE_NAME)
+            service.start(mActivity, "")
         except Exception:
-            pass
+            # Fallback to legacy method
+            try:
+                from android import AndroidService  # type: ignore
+                AndroidService("Sentinel-X", "Telemetry running").start("")
+            except Exception:
+                pass
 
     def _start_udp_listener(self):
         if self._udp_thread:
@@ -859,30 +1021,50 @@ class RootUI(BoxLayout):
     def _udp_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("127.0.0.1", 17888))
             s.settimeout(1.0)
+            
+            while not self._udp_stop.is_set():
+                try:
+                    data, _ = s.recvfrom(4096)
+                    payload = json.loads(data.decode("utf-8", errors="ignore"))
+                    lat = float(payload.get("lat", 0.0) or 0.0)
+                    lon = float(payload.get("lon", 0.0) or 0.0)
+                    speed = float(payload.get("speed_mps", 0.0) or 0.0)
+                    g_dyn = float(payload.get("g_dyn", 0.0) or 0.0)
+                    # Fix lambda closure: capture by value using default arguments
+                    Clock.schedule_once(lambda dt, la=lat, lo=lon, sp=speed, gd=g_dyn: self._apply_telemetry(la, lo, sp, gd), 0)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
         except Exception:
-            return
-
-        while not self._udp_stop.is_set():
+            pass
+        finally:
             try:
-                data, _ = s.recvfrom(4096)
-                payload = json.loads(data.decode("utf-8", errors="ignore"))
-                lat = float(payload.get("lat", 0.0) or 0.0)
-                lon = float(payload.get("lon", 0.0) or 0.0)
-                speed = float(payload.get("speed_mps", 0.0) or 0.0)
-                g_dyn = float(payload.get("g_dyn", 0.0) or 0.0)
-                Clock.schedule_once(lambda dt: self._apply_telemetry(lat, lon, speed, g_dyn), 0)
-            except socket.timeout:
-                continue
+                s.close()
             except Exception:
-                continue
+                pass
 
     def _apply_telemetry(self, lat, lon, speed_mps, g_dyn):
         self.latest_lat = lat
         self.latest_lon = lon
         self.latest_speed_mps = speed_mps
         self.latest_g_dyn = g_dyn
+        
+        # Show harsh braking warning if g_dyn > 4.0
+        if g_dyn > 4.0:
+            self.show_harsh_brake_warning = True
+            # Auto-suggest dangerous driving offense
+            for offense_text, offense_key in self._offense_text_to_key.items():
+                if offense_key == "DANGEROUS_184":
+                    self.ids.sp_offense.text = offense_text
+                    break
+            # Auto-hide warning after 5 seconds
+            Clock.schedule_once(lambda dt: setattr(self, 'show_harsh_brake_warning', False), 5.0)
+        else:
+            self.show_harsh_brake_warning = False
 
     # -------------------------------------------------------------------------
     def _popup(self, title, msg):
@@ -897,7 +1079,26 @@ class RootUI(BoxLayout):
 class SentinelXApp(App):
     def build(self):
         Builder.load_string(KV)
-        return RootUI()
+        self.root_ui = RootUI()
+        return self.root_ui
+
+    def on_pause(self):
+        """Handle app going to background"""
+        if hasattr(self, 'root_ui') and self.root_ui._preview:
+            try:
+                if hasattr(self.root_ui._preview, 'disconnect_camera'):
+                    self.root_ui._preview.disconnect_camera()
+            except Exception:
+                pass
+        return True
+
+    def on_resume(self):
+        """Handle app coming to foreground"""
+        if hasattr(self, 'root_ui') and self.root_ui._preview:
+            try:
+                Clock.schedule_once(lambda dt: self.root_ui._safe_preview_start(), 0.5)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
