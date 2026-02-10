@@ -25,7 +25,7 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp
-from kivy.properties import StringProperty, NumericProperty
+from kivy.properties import StringProperty, NumericProperty, BooleanProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
@@ -368,6 +368,24 @@ KV = r"""
                 pos: self.pos
                 size: self.size
 
+    # Dangerous driving alert banner
+    Label:
+        size_hint_y: None
+        height: dp(40) if root.show_harsh_brake_warning else 0
+        opacity: 1 if root.show_harsh_brake_warning else 0
+        text: "⚠ HARSH BRAKING DETECTED — Dangerous Driving flagged"
+        bold: True
+        font_size: "14sp"
+        halign: "center"
+        valign: "middle"
+        text_size: self.size
+        canvas.before:
+            Color:
+                rgba: (0.9, 0.1, 0.1, 1) if root.show_harsh_brake_warning else (0, 0, 0, 0)
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
     Label:
         size_hint_y: None
         height: dp(44)
@@ -444,6 +462,20 @@ KV = r"""
                 id: in_plate
                 multiline: False
                 hint_text: "e.g., MH12AB1234"
+                on_text: root.validate_plate(self.text)
+
+            Label:
+                text: ""
+                halign: "left"
+                valign: "middle"
+                text_size: self.size
+            Label:
+                text: root.plate_validation_hint
+                font_size: "11sp"
+                color: (0.9, 0.6, 0.1, 1) if root.plate_validation_hint else (1, 1, 1, 1)
+                halign: "left"
+                valign: "middle"
+                text_size: self.size
 
             Label:
                 text: "Violation Code"
@@ -545,6 +577,12 @@ class RootUI(BoxLayout):
 
     evidence_path = StringProperty("")
     cv_hint = StringProperty("")
+    
+    # Dangerous driving alert
+    show_harsh_brake_warning = BooleanProperty(False)
+    
+    # Plate validation
+    plate_validation_hint = StringProperty("")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -552,6 +590,8 @@ class RootUI(BoxLayout):
         self._udp_stop = threading.Event()
         self._preview = None
         self._analytics = AnalyticsEngine(self._app_dir())
+        # Create reverse mapping for offense key extraction
+        self._offense_text_to_key = {}
         Clock.schedule_once(self._post_build, 0)
 
     def _app_dir(self):
@@ -561,8 +601,13 @@ class RootUI(BoxLayout):
             return "."
 
     def _post_build(self, _dt):
-        # populate spinners
-        self.ids.sp_offense.values = [f"{k} — {v['label']}" for k, v in TrafficLawDB.OFFENSES.items()]
+        # populate spinners with offense text and create reverse mapping
+        offense_values = []
+        for k, v in TrafficLawDB.OFFENSES.items():
+            text = f"{k} — {v['label']}"
+            offense_values.append(text)
+            self._offense_text_to_key[text] = k
+        self.ids.sp_offense.values = offense_values
         self.ids.sp_sign_group.values = list(TrafficLawDB.SIGN_GROUPS.keys())
 
         self._setup_camera()
@@ -681,7 +726,8 @@ class RootUI(BoxLayout):
     # Form handlers
     # -------------------------------------------------------------------------
     def on_offense_selected(self, text):
-        key = (text.split("—")[0] or "").strip()
+        # Use reverse mapping for robust key extraction
+        key = self._offense_text_to_key.get(text, "")
         if key in TrafficLawDB.OFFENSES:
             v = TrafficLawDB.OFFENSES[key]
             self.section_penalty_text = f"{v['section']}\nPenalty: {v['penalty']}"
@@ -703,6 +749,26 @@ class RootUI(BoxLayout):
         self.section_penalty_text = "—"
         self.route_text = "—"
         self.evidence_path = ""
+        self.plate_validation_hint = ""
+
+    def validate_plate(self, text):
+        """Validate Indian number plate format in real-time"""
+        text = text.strip().upper()
+        if not text:
+            self.plate_validation_hint = ""
+            return
+        
+        # Common Indian plate patterns:
+        # XX00XX0000 (standard)
+        # XX00X0000 (old format)
+        # XX00XX0000XX (special cases like military/diplomatic)
+        pattern1 = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$'
+        pattern2 = r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{1,4}$'
+        
+        if re.match(pattern1, text) or re.match(pattern2, text):
+            self.plate_validation_hint = "✓ Valid format"
+        else:
+            self.plate_validation_hint = "⚠ Check format (e.g., MH12AB1234)"
 
     # -------------------------------------------------------------------------
     # Evidence capture + CLAHE
@@ -815,7 +881,7 @@ class RootUI(BoxLayout):
             return
 
         offense_text = self.ids.sp_offense.text
-        offense_key = (offense_text.split("—")[0] or "").strip()
+        offense_key = self._offense_text_to_key.get(offense_text, "")
         if offense_key not in TrafficLawDB.OFFENSES:
             self._popup("Missing violation", "Select a violation code.")
             return
@@ -886,9 +952,51 @@ class RootUI(BoxLayout):
             except TypeError:
                 plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
 
+            # Save report history as JSON audit trail
+            self._save_report_history(now, lat, lon, plate, offense_key, offense, route, anon, attachment)
+            
             self._popup("Report prepared", "Email composer opened with recipients + Good Samaritan footer.")
         except Exception as e:
             self._popup("Email failed", str(e))
+
+    def _save_report_history(self, timestamp, lat, lon, plate, offense_key, offense, route, anonymous, evidence_path):
+        try:
+            reports_dir = os.path.join(self._app_dir(), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            
+            # Create filename with timestamp
+            filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = os.path.join(reports_dir, filename)
+            
+            # Create report record
+            report = {
+                "timestamp": timestamp,
+                "gps": {"lat": lat, "lon": lon},
+                "location": {"district": self.district, "state": self.state_name},
+                "plate": plate,
+                "offense": {
+                    "key": offense_key,
+                    "label": offense["label"],
+                    "section": offense["section"],
+                    "penalty": offense["penalty"]
+                },
+                "recipients": route["recipients"],
+                "routing": {
+                    "location_code": route["loc_code"],
+                    "plate_code": route["plate_code"],
+                    "location_emails": route["loc_emails"],
+                    "plate_emails": route["plate_emails"]
+                },
+                "anonymous": anonymous,
+                "evidence_path": evidence_path if evidence_path else None,
+                "speed_kmh": self.latest_speed_mps * 3.6,
+                "g_dyn": self.latest_g_dyn
+            }
+            
+            with open(filepath, "w") as f:
+                json.dump(report, f, indent=2)
+        except Exception:
+            pass  # Silent failure for audit trail
 
     # -------------------------------------------------------------------------
     # Service integration (UDP from service.py)
@@ -951,6 +1059,19 @@ class RootUI(BoxLayout):
         self.latest_lon = lon
         self.latest_speed_mps = speed_mps
         self.latest_g_dyn = g_dyn
+        
+        # Show harsh braking warning if g_dyn > 4.0
+        if g_dyn > 4.0:
+            self.show_harsh_brake_warning = True
+            # Auto-suggest dangerous driving offense
+            for offense_text, offense_key in self._offense_text_to_key.items():
+                if offense_key == "DANGEROUS_184":
+                    self.ids.sp_offense.text = offense_text
+                    break
+            # Auto-hide warning after 5 seconds
+            Clock.schedule_once(lambda dt: setattr(self, 'show_harsh_brake_warning', False), 5.0)
+        else:
+            self.show_harsh_brake_warning = False
 
     # -------------------------------------------------------------------------
     def _popup(self, title, msg):
@@ -965,7 +1086,26 @@ class RootUI(BoxLayout):
 class SentinelXApp(App):
     def build(self):
         Builder.load_string(KV)
-        return RootUI()
+        self.root_ui = RootUI()
+        return self.root_ui
+
+    def on_pause(self):
+        """Handle app going to background"""
+        if hasattr(self, 'root_ui') and self.root_ui._preview:
+            try:
+                if hasattr(self.root_ui._preview, 'disconnect_camera'):
+                    self.root_ui._preview.disconnect_camera()
+            except Exception:
+                pass
+        return True
+
+    def on_resume(self):
+        """Handle app coming to foreground"""
+        if hasattr(self, 'root_ui') and self.root_ui._preview:
+            try:
+                Clock.schedule_once(lambda dt: self.root_ui._safe_preview_start(), 0.5)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
