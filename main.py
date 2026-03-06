@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Sentinel-X v1.0 -- Civic Enforcement (Android)
-All 7 Android blockers FIXED. Python 3.10 compatible (no backslash in f-strings).
+All 7 blockers FIXED. Python 3.10 safe. UI layout fixed for mobile.
 """
 
 import os
@@ -255,189 +255,353 @@ if Preview is not None:
     SentinelPreview = _SentinelPreview
 
 
+# =========================================================================
+# FIXED KV LAYOUT: Every row has explicit size_hint_y: None + height
+# so nothing overlaps on Android. Uses BoxLayout rows instead of GridLayout.
+# =========================================================================
 KV = """
-<RootUI>:
-    orientation: "vertical"
-    padding: dp(8)
-    spacing: dp(6)
+#:import dp kivy.metrics.dp
 
-    BoxLayout:
-        size_hint_y: None
-        height: dp(44)
-        Label:
-            text: "Sentinel-X -- Civic Enforcement"
-            bold: True
-            font_size: "18sp"
-            halign: "center"
-            valign: "middle"
-            text_size: self.size
-
-    BoxLayout:
-        id: camera_box
-        size_hint_y: None
-        height: dp(260)
-        canvas.before:
-            Color:
-                rgba: (0.08, 0.08, 0.09, 1)
-            Rectangle:
-                pos: self.pos
-                size: self.size
-
+<FormRow@BoxLayout>:
+    orientation: "horizontal"
+    size_hint_y: None
+    height: dp(48)
+    spacing: dp(8)
+    lbl: ""
     Label:
-        size_hint_y: None
-        height: dp(44)
-        text: root.status_text
-        font_size: "12sp"
+        text: root.lbl
+        size_hint_x: 0.38
+        font_size: "14sp"
         halign: "left"
         valign: "middle"
         text_size: self.size
 
+<RootUI>:
+    orientation: "vertical"
+    padding: dp(10)
+    spacing: dp(6)
+
+    # Title
+    Label:
+        text: "Sentinel-X"
+        size_hint_y: None
+        height: dp(40)
+        bold: True
+        font_size: "20sp"
+        halign: "center"
+        valign: "middle"
+        text_size: self.size
+
+    # Camera
+    BoxLayout:
+        id: camera_box
+        size_hint_y: None
+        height: dp(240)
+        canvas.before:
+            Color:
+                rgba: (0.06, 0.06, 0.08, 1)
+            Rectangle:
+                pos: self.pos
+                size: self.size
+
+    # Status bar
+    Label:
+        size_hint_y: None
+        height: dp(36)
+        text: root.status_text
+        font_size: "11sp"
+        color: (0.6, 0.8, 1, 1)
+        halign: "left"
+        valign: "middle"
+        text_size: self.size
+
+    # Scrollable form
     ScrollView:
         do_scroll_x: False
-        bar_width: dp(6)
-        GridLayout:
-            cols: 2
+        bar_width: dp(4)
+
+        BoxLayout:
+            orientation: "vertical"
             size_hint_y: None
             height: self.minimum_height
-            spacing: dp(8)
-            padding: dp(4)
+            spacing: dp(4)
+            padding: [dp(4), dp(4)]
 
-            Label:
-                text: "Submit Anonymously"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Switch:
-                id: sw_anon
-                active: True
-
-            Label:
-                text: "Night/Fog CLAHE"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Switch:
-                id: sw_clahe
-                active: False
-
-            Label:
-                text: "Live CV Assist"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Switch:
-                id: sw_cv
-                active: True
-
-            Label:
-                text: "Your Name"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            TextInput:
-                id: in_name
-                multiline: False
-                hint_text: "Name (optional)"
-
-            Label:
-                text: "Contact"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            TextInput:
-                id: in_contact
-                multiline: False
-                hint_text: "Phone/Email (optional)"
-
-            Label:
-                text: "Number Plate"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            TextInput:
-                id: in_plate
-                multiline: False
-                hint_text: "e.g. MH12AB1234"
-
-            Label:
-                text: "Violation"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Spinner:
-                id: sp_offense
-                text: "Select Violation"
-                values: []
-                on_text: root.on_offense_selected(self.text)
-
-            Label:
-                text: "Section / Penalty"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Label:
-                text: root.section_penalty
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-
-            Label:
-                text: "Sign Group"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Spinner:
-                id: sp_sign_group
-                text: "Select Sign Group"
-                values: []
-                on_text: root.on_sign_group(self.text)
-
-            Label:
-                text: "Observed Sign"
-                halign: "left"
-                valign: "middle"
-                text_size: self.size
-            Spinner:
-                id: sp_sign
-                text: "Select Sign"
-                values: []
-
-            Label:
-                text: "Notes"
-                halign: "left"
-                valign: "top"
-                text_size: self.size
-            TextInput:
-                id: in_notes
-                hint_text: "What happened?"
-                multiline: True
+            # Anonymous toggle
+            BoxLayout:
+                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(100)
+                height: dp(48)
+                Label:
+                    text: "Submit Anonymously"
+                    size_hint_x: 0.65
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                Switch:
+                    id: sw_anon
+                    active: True
+                    size_hint_x: 0.35
 
-            Label:
-                text: "Routing"
-                halign: "left"
-                valign: "top"
-                text_size: self.size
-            Label:
-                text: root.route_text
-                halign: "left"
-                valign: "top"
-                text_size: self.size
+            # CLAHE toggle
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                Label:
+                    text: "Night/Fog CLAHE"
+                    size_hint_x: 0.65
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                Switch:
+                    id: sw_clahe
+                    active: False
+                    size_hint_x: 0.35
 
+            # CV toggle
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                Label:
+                    text: "Live CV Assist"
+                    size_hint_x: 0.65
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                Switch:
+                    id: sw_cv
+                    active: True
+                    size_hint_x: 0.35
+
+            # Separator
+            Widget:
+                size_hint_y: None
+                height: dp(1)
+                canvas:
+                    Color:
+                        rgba: (0.3, 0.3, 0.3, 1)
+                    Rectangle:
+                        pos: self.pos
+                        size: self.size
+
+            # Name
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(44)
+                spacing: dp(8)
+                Label:
+                    text: "Your Name"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                TextInput:
+                    id: in_name
+                    size_hint_x: 0.65
+                    multiline: False
+                    hint_text: "Name (optional)"
+                    font_size: "14sp"
+
+            # Contact
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(44)
+                spacing: dp(8)
+                Label:
+                    text: "Contact"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                TextInput:
+                    id: in_contact
+                    size_hint_x: 0.65
+                    multiline: False
+                    hint_text: "Phone/Email (optional)"
+                    font_size: "14sp"
+
+            # Number Plate
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(44)
+                spacing: dp(8)
+                Label:
+                    text: "Number Plate"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                    bold: True
+                TextInput:
+                    id: in_plate
+                    size_hint_x: 0.65
+                    multiline: False
+                    hint_text: "e.g. MH12AB1234"
+                    font_size: "14sp"
+
+            # Violation
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                spacing: dp(8)
+                Label:
+                    text: "Violation"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                    bold: True
+                Spinner:
+                    id: sp_offense
+                    size_hint_x: 0.65
+                    text: "Select Violation"
+                    values: []
+                    font_size: "13sp"
+                    on_text: root.on_offense_selected(self.text)
+
+            # Section / Penalty
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                spacing: dp(8)
+                Label:
+                    text: "Section"
+                    size_hint_x: 0.35
+                    font_size: "13sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                    color: (0.7, 0.7, 0.7, 1)
+                Label:
+                    text: root.section_penalty
+                    size_hint_x: 0.65
+                    font_size: "12sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                    color: (1, 0.8, 0.3, 1)
+
+            # Sign Group
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                spacing: dp(8)
+                Label:
+                    text: "Sign Group"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                Spinner:
+                    id: sp_sign_group
+                    size_hint_x: 0.65
+                    text: "Select Sign Group"
+                    values: []
+                    font_size: "13sp"
+                    on_text: root.on_sign_group(self.text)
+
+            # Observed Sign
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(48)
+                spacing: dp(8)
+                Label:
+                    text: "Observed Sign"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "middle"
+                    text_size: self.size
+                Spinner:
+                    id: sp_sign
+                    size_hint_x: 0.65
+                    text: "Select Sign"
+                    values: []
+                    font_size: "13sp"
+
+            # Notes
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(90)
+                spacing: dp(8)
+                Label:
+                    text: "Notes"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "top"
+                    text_size: self.size
+                TextInput:
+                    id: in_notes
+                    size_hint_x: 0.65
+                    hint_text: "What happened?"
+                    multiline: True
+                    font_size: "14sp"
+
+            # Routing
+            BoxLayout:
+                orientation: "horizontal"
+                size_hint_y: None
+                height: dp(52)
+                spacing: dp(8)
+                Label:
+                    text: "Routing"
+                    size_hint_x: 0.35
+                    font_size: "14sp"
+                    halign: "left"
+                    valign: "top"
+                    text_size: self.size
+                    bold: True
+                Label:
+                    text: root.route_text
+                    size_hint_x: 0.65
+                    font_size: "12sp"
+                    halign: "left"
+                    valign: "top"
+                    text_size: self.size
+                    color: (0.4, 0.9, 0.4, 1)
+
+    # Bottom buttons
     BoxLayout:
         size_hint_y: None
-        height: dp(56)
-        spacing: dp(8)
+        height: dp(54)
+        spacing: dp(10)
+        padding: [0, dp(4)]
         Button:
             text: "Capture"
+            font_size: "15sp"
+            bold: True
             on_release: root.capture_evidence()
+            background_color: (0.2, 0.6, 0.9, 1)
         Button:
             text: "Send Report"
+            font_size: "15sp"
+            bold: True
             on_release: root.send_report()
+            background_color: (0.1, 0.7, 0.3, 1)
         Button:
             text: "Clear"
+            font_size: "15sp"
             on_release: root.clear_form()
+            background_color: (0.5, 0.5, 0.5, 1)
 """
 
 
@@ -483,7 +647,6 @@ class RootUI(BoxLayout):
         self._start_udp()
         self._start_service()
         Clock.schedule_interval(self._tick_geo, 1.0)
-        Clock.schedule_interval(self._tick_cv, 0.5)
 
     def _request_perms(self):
         if platform != "android" or request_permissions is None:
@@ -506,7 +669,8 @@ class RootUI(BoxLayout):
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
         if SentinelPreview is None:
-            self.ids.camera_box.add_widget(Label(text="Camera unavailable\n(camera4kivy not loaded)"))
+            self.ids.camera_box.add_widget(
+                Label(text="Camera unavailable\n(camera4kivy not loaded)", font_size="14sp"))
             return
         try:
             self._preview = SentinelPreview()
@@ -514,7 +678,7 @@ class RootUI(BoxLayout):
             self.ids.camera_box.add_widget(self._preview)
             Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
         except Exception:
-            self.ids.camera_box.add_widget(Label(text="Camera init failed"))
+            self.ids.camera_box.add_widget(Label(text="Camera init failed", font_size="14sp"))
 
     def _connect_cam(self):
         if not self._preview:
@@ -531,9 +695,6 @@ class RootUI(BoxLayout):
                 self._cam_ok = True
             except Exception:
                 pass
-
-    def _tick_cv(self, _dt):
-        pass
 
     def on_offense_selected(self, text):
         k = (text.split("--")[0] or "").strip()
@@ -720,7 +881,8 @@ class RootUI(BoxLayout):
         self.latest_g = g
 
     def _popup(self, t, m):
-        Popup(title=t, content=Label(text=m, halign="left", valign="top"), size_hint=(.9, .5)).open()
+        Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(280), None)),
+              size_hint=(.85, .4)).open()
 
 
 class SentinelXApp(App):
