@@ -614,7 +614,10 @@ class RootUI(BoxLayout):
         plate = self.ids.in_plate.text.strip()
         rt = JurisdictionEngine.route(lat, lon, plate)
         rcpts = ", ".join(rt["all"]) or "\u2014"
-        self.route_text = f"Loc: {rt['lc'] or '\u2014'} | Plate: {rt['pc'] or '\u2014'}\nTo: {rcpts}"
+        dash = "\u2014"
+        lc = rt['lc'] or dash
+        pc = rt['pc'] or dash
+        self.route_text = f"Loc: {lc} | Plate: {pc}\nTo: {rcpts}"
         kmh = self.latest_speed * 3.6
         cv = self._analytics.result if self.ids.sw_cv.active else ""
         self.status_text = (
