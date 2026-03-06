@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.0 -- Civic Enforcement (Android)
-All 7 blockers FIXED. Python 3.10 safe. UI layout fixed for mobile.
+Sentinel-X v1.0.2 -- Civic Enforcement (Android)
+Fixes: GPS, capture save, email args, dropdown truncation, keyboard overlap.
 """
 
 import os
@@ -13,6 +13,7 @@ from datetime import datetime
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.window import Window
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import StringProperty, NumericProperty
@@ -20,6 +21,9 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.utils import platform
+
+# FIX #8: keyboard doesn't cover input fields
+Window.softinput_mode = "below_target"
 
 try:
     import cv2
@@ -47,6 +51,14 @@ try:
 except Exception:
     plyer_email = None
 
+# FIX #9: Use plyer.gps directly for GPS (not just UDP from service)
+plyer_gps = None
+try:
+    from plyer import gps as _gps
+    plyer_gps = _gps
+except Exception:
+    pass
+
 Permission = None
 request_permissions = None
 try:
@@ -68,13 +80,13 @@ DASH = "--"
 
 class TrafficLawDB:
     OFFENSES = {
-        "SPEEDING_183_LMV": {"label": "Speeding (LMV)", "section": "MVA 2019 -- Section 183", "penalty": "Rs.1,000"},
-        "SPEEDING_183_HMV": {"label": "Speeding (HMV)", "section": "MVA 2019 -- Section 183", "penalty": "Rs.2,000"},
-        "DANGEROUS_184":    {"label": "Dangerous Driving", "section": "MVA 2019 -- Section 184", "penalty": "Rs.1,000-Rs.5,000"},
-        "SEATBELT_194B":    {"label": "No Safety Belt", "section": "MVA 2019 -- Section 194B", "penalty": "Rs.1,000"},
-        "TRIPLE_194C":      {"label": "Triple Riding", "section": "MVA 2019 -- Section 194C", "penalty": "Rs.1,000 + Disq."},
-        "HELMET_194D":      {"label": "No Helmet", "section": "MVA 2019 -- Section 194D", "penalty": "Rs.1,000 + Disq."},
-        "EMERGENCY_194E":   {"label": "Blocking Emergency Vehicle", "section": "MVA 2019 -- Section 194E", "penalty": "Rs.10,000"},
+        "SPEEDING_LMV": {"label": "Speeding (LMV)", "section": "MVA 2019 -- S.183", "penalty": "Rs.1,000"},
+        "SPEEDING_HMV": {"label": "Speeding (HMV)", "section": "MVA 2019 -- S.183", "penalty": "Rs.2,000"},
+        "DANGEROUS":    {"label": "Dangerous Driving", "section": "MVA 2019 -- S.184", "penalty": "Rs.1,000-5,000"},
+        "SEATBELT":     {"label": "No Safety Belt", "section": "MVA 2019 -- S.194B", "penalty": "Rs.1,000"},
+        "TRIPLE":       {"label": "Triple Riding", "section": "MVA 2019 -- S.194C", "penalty": "Rs.1,000+Disq"},
+        "HELMET":       {"label": "No Helmet", "section": "MVA 2019 -- S.194D", "penalty": "Rs.1,000+Disq"},
+        "EMERGENCY":    {"label": "Block Emergency", "section": "MVA 2019 -- S.194E", "penalty": "Rs.10,000"},
     }
     SIGN_GROUPS = {
         "Mandatory (IRC:67-2022)": [
@@ -175,21 +187,8 @@ class JurisdictionEngine:
 class AnalyticsEngine:
     def __init__(self, app_dir):
         self.app_dir = app_dir
-        self.model_path = os.path.join(app_dir, "models", "detector.onnx")
-        self.model = None
-        self._tried = False
         self.result = ""
         self._skip = 0
-
-    def try_load_model(self):
-        if self._tried:
-            return
-        self._tried = True
-        if cv2 and os.path.isfile(self.model_path):
-            try:
-                self.model = cv2.dnn.readNetFromONNX(self.model_path)
-            except Exception:
-                self.model = None
 
     @staticmethod
     def clahe(img):
@@ -223,7 +222,7 @@ class AnalyticsEngine:
 
     def analyze_frame(self, pixels, image_size, image_pos=None, scale=None, mirror=False):
         if cv2 is None or np is None:
-            self.result = "CV: OpenCV unavailable"
+            self.result = "CV: unavailable"
             return
         self._skip += 1
         if self._skip % 3 != 0:
@@ -238,7 +237,7 @@ class AnalyticsEngine:
                 s = 640.0 / w
                 bgr = cv2.resize(bgr, (640, int(h * s)))
             boxes = self.find_plates(bgr)
-            self.result = "CV: Plate region(s): %d" % len(boxes) if boxes else "CV: No cues"
+            self.result = "CV: Plates:%d" % len(boxes) if boxes else "CV: --"
         except Exception as exc:
             self.result = "CV: %s" % type(exc).__name__
 
@@ -247,56 +246,34 @@ SentinelPreview = None
 if Preview is not None:
     class _SentinelPreview(Preview):
         _analytics = None
-
         def analyze_pixels_callback(self, pixels, image_size, image_pos, scale, mirror):
             if self._analytics:
                 self._analytics.analyze_frame(pixels, image_size, image_pos, scale, mirror)
-
     SentinelPreview = _SentinelPreview
 
 
-# =========================================================================
-# FIXED KV LAYOUT: Every row has explicit size_hint_y: None + height
-# so nothing overlaps on Android. Uses BoxLayout rows instead of GridLayout.
-# =========================================================================
 KV = """
 #:import dp kivy.metrics.dp
-
-<FormRow@BoxLayout>:
-    orientation: "horizontal"
-    size_hint_y: None
-    height: dp(48)
-    spacing: dp(8)
-    lbl: ""
-    Label:
-        text: root.lbl
-        size_hint_x: 0.38
-        font_size: "14sp"
-        halign: "left"
-        valign: "middle"
-        text_size: self.size
 
 <RootUI>:
     orientation: "vertical"
     padding: dp(10)
-    spacing: dp(6)
+    spacing: dp(4)
 
-    # Title
     Label:
         text: "Sentinel-X"
         size_hint_y: None
-        height: dp(40)
+        height: dp(38)
         bold: True
         font_size: "20sp"
         halign: "center"
         valign: "middle"
         text_size: self.size
 
-    # Camera
     BoxLayout:
         id: camera_box
         size_hint_y: None
-        height: dp(240)
+        height: dp(220)
         canvas.before:
             Color:
                 rgba: (0.06, 0.06, 0.08, 1)
@@ -304,287 +281,247 @@ KV = """
                 pos: self.pos
                 size: self.size
 
-    # Status bar
     Label:
         size_hint_y: None
-        height: dp(36)
+        height: dp(32)
         text: root.status_text
-        font_size: "11sp"
-        color: (0.6, 0.8, 1, 1)
+        font_size: "10sp"
+        color: (0.5, 0.8, 1, 1)
         halign: "left"
         valign: "middle"
         text_size: self.size
 
-    # Scrollable form
     ScrollView:
         do_scroll_x: False
         bar_width: dp(4)
-
         BoxLayout:
             orientation: "vertical"
             size_hint_y: None
             height: self.minimum_height
-            spacing: dp(4)
-            padding: [dp(4), dp(4)]
+            spacing: dp(2)
+            padding: [dp(2), dp(2)]
 
-            # Anonymous toggle
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
+                height: dp(42)
                 Label:
-                    text: "Submit Anonymously"
-                    size_hint_x: 0.65
+                    text: "Anonymous"
+                    size_hint_x: 0.55
                     font_size: "14sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 Switch:
                     id: sw_anon
                     active: True
-                    size_hint_x: 0.35
+                    size_hint_x: 0.45
 
-            # CLAHE toggle
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
+                height: dp(42)
                 Label:
-                    text: "Night/Fog CLAHE"
-                    size_hint_x: 0.65
+                    text: "CLAHE Night"
+                    size_hint_x: 0.55
                     font_size: "14sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 Switch:
                     id: sw_clahe
                     active: False
-                    size_hint_x: 0.35
+                    size_hint_x: 0.45
 
-            # CV toggle
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
+                height: dp(42)
                 Label:
-                    text: "Live CV Assist"
-                    size_hint_x: 0.65
+                    text: "CV Assist"
+                    size_hint_x: 0.55
                     font_size: "14sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 Switch:
                     id: sw_cv
                     active: True
-                    size_hint_x: 0.35
+                    size_hint_x: 0.45
 
-            # Separator
             Widget:
                 size_hint_y: None
                 height: dp(1)
                 canvas:
                     Color:
-                        rgba: (0.3, 0.3, 0.3, 1)
+                        rgba: (0.25, 0.25, 0.25, 1)
                     Rectangle:
                         pos: self.pos
                         size: self.size
 
-            # Name
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(44)
-                spacing: dp(8)
+                height: dp(42)
+                spacing: dp(6)
                 Label:
-                    text: "Your Name"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    text: "Name"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 TextInput:
                     id: in_name
-                    size_hint_x: 0.65
+                    size_hint_x: 0.72
                     multiline: False
-                    hint_text: "Name (optional)"
+                    hint_text: "Optional"
                     font_size: "14sp"
 
-            # Contact
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(44)
-                spacing: dp(8)
+                height: dp(42)
+                spacing: dp(6)
                 Label:
                     text: "Contact"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 TextInput:
                     id: in_contact
-                    size_hint_x: 0.65
+                    size_hint_x: 0.72
                     multiline: False
-                    hint_text: "Phone/Email (optional)"
+                    hint_text: "Phone/Email"
                     font_size: "14sp"
 
-            # Number Plate
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(44)
-                spacing: dp(8)
+                height: dp(42)
+                spacing: dp(6)
                 Label:
-                    text: "Number Plate"
-                    size_hint_x: 0.35
+                    text: "Plate"
+                    size_hint_x: 0.28
                     font_size: "14sp"
-                    halign: "left"
-                    valign: "middle"
-                    text_size: self.size
                     bold: True
+                    halign: "left"
+                    text_size: self.size
                 TextInput:
                     id: in_plate
-                    size_hint_x: 0.65
+                    size_hint_x: 0.72
                     multiline: False
-                    hint_text: "e.g. MH12AB1234"
+                    hint_text: "MH12AB1234"
                     font_size: "14sp"
 
-            # Violation
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
-                spacing: dp(8)
+                height: dp(46)
+                spacing: dp(6)
                 Label:
                     text: "Violation"
-                    size_hint_x: 0.35
+                    size_hint_x: 0.28
                     font_size: "14sp"
-                    halign: "left"
-                    valign: "middle"
-                    text_size: self.size
                     bold: True
+                    halign: "left"
+                    text_size: self.size
                 Spinner:
                     id: sp_offense
-                    size_hint_x: 0.65
-                    text: "Select Violation"
+                    size_hint_x: 0.72
+                    text: "Select"
                     values: []
-                    font_size: "13sp"
+                    font_size: "12sp"
                     on_text: root.on_offense_selected(self.text)
 
-            # Section / Penalty
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
-                spacing: dp(8)
+                height: dp(42)
+                spacing: dp(6)
                 Label:
-                    text: "Section"
-                    size_hint_x: 0.35
-                    font_size: "13sp"
-                    halign: "left"
-                    valign: "middle"
-                    text_size: self.size
-                    color: (0.7, 0.7, 0.7, 1)
-                Label:
-                    text: root.section_penalty
-                    size_hint_x: 0.65
+                    text: "Penalty"
+                    size_hint_x: 0.28
                     font_size: "12sp"
                     halign: "left"
-                    valign: "middle"
+                    text_size: self.size
+                    color: (0.6, 0.6, 0.6, 1)
+                Label:
+                    text: root.section_penalty
+                    size_hint_x: 0.72
+                    font_size: "12sp"
+                    halign: "left"
                     text_size: self.size
                     color: (1, 0.8, 0.3, 1)
 
-            # Sign Group
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
-                spacing: dp(8)
+                height: dp(46)
+                spacing: dp(6)
                 Label:
-                    text: "Sign Group"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    text: "Sign Grp"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 Spinner:
                     id: sp_sign_group
-                    size_hint_x: 0.65
-                    text: "Select Sign Group"
+                    size_hint_x: 0.72
+                    text: "Select"
                     values: []
-                    font_size: "13sp"
+                    font_size: "12sp"
                     on_text: root.on_sign_group(self.text)
 
-            # Observed Sign
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(48)
-                spacing: dp(8)
+                height: dp(46)
+                spacing: dp(6)
                 Label:
-                    text: "Observed Sign"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    text: "Sign"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
                     halign: "left"
-                    valign: "middle"
                     text_size: self.size
                 Spinner:
                     id: sp_sign
-                    size_hint_x: 0.65
-                    text: "Select Sign"
+                    size_hint_x: 0.72
+                    text: "Select"
                     values: []
-                    font_size: "13sp"
+                    font_size: "12sp"
 
-            # Notes
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(90)
-                spacing: dp(8)
+                height: dp(80)
+                spacing: dp(6)
                 Label:
                     text: "Notes"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
                     halign: "left"
                     valign: "top"
                     text_size: self.size
                 TextInput:
                     id: in_notes
-                    size_hint_x: 0.65
-                    hint_text: "What happened?"
+                    size_hint_x: 0.72
+                    hint_text: "Details"
                     multiline: True
                     font_size: "14sp"
 
-            # Routing
             BoxLayout:
-                orientation: "horizontal"
                 size_hint_y: None
-                height: dp(52)
-                spacing: dp(8)
+                height: dp(48)
+                spacing: dp(6)
                 Label:
-                    text: "Routing"
-                    size_hint_x: 0.35
-                    font_size: "14sp"
+                    text: "Route"
+                    size_hint_x: 0.28
+                    font_size: "13sp"
+                    bold: True
                     halign: "left"
                     valign: "top"
                     text_size: self.size
-                    bold: True
                 Label:
                     text: root.route_text
-                    size_hint_x: 0.65
-                    font_size: "12sp"
+                    size_hint_x: 0.72
+                    font_size: "11sp"
                     halign: "left"
                     valign: "top"
                     text_size: self.size
                     color: (0.4, 0.9, 0.4, 1)
 
-    # Bottom buttons
     BoxLayout:
         size_hint_y: None
-        height: dp(54)
-        spacing: dp(10)
-        padding: [0, dp(4)]
+        height: dp(52)
+        spacing: dp(8)
+        padding: [0, dp(3)]
         Button:
             text: "Capture"
             font_size: "15sp"
@@ -606,7 +543,7 @@ KV = """
 
 
 class RootUI(BoxLayout):
-    status_text = StringProperty("GPS: -- | Speed: -- | G: --")
+    status_text = StringProperty("GPS: -- | -- | 0km/h | G:0 | CV:--")
     section_penalty = StringProperty(DASH)
     route_text = StringProperty(DASH)
     latest_lat = NumericProperty(0.0)
@@ -638,16 +575,42 @@ class RootUI(BoxLayout):
         return d
 
     def _boot(self, _dt):
+        # FIX #10: shorter dropdown labels so they don't truncate
         vals = []
         for k, v in TrafficLawDB.OFFENSES.items():
-            vals.append("%s -- %s" % (k, v["label"]))
+            vals.append("%s: %s" % (k, v["label"]))
         self.ids.sp_offense.values = vals
         self.ids.sp_sign_group.values = list(TrafficLawDB.SIGN_GROUPS.keys())
         self._request_perms()
         self._start_udp()
         self._start_service()
+        self._start_gps()
         Clock.schedule_interval(self._tick_geo, 1.0)
 
+    # ── GPS via plyer (FIX #9) ───────────────────────────────────────────
+    def _start_gps(self):
+        if plyer_gps is None:
+            return
+        try:
+            plyer_gps.configure(on_location=self._on_gps_location, on_status=self._on_gps_status)
+            plyer_gps.start(minTime=1000, minDistance=1)
+        except Exception:
+            pass
+
+    def _on_gps_location(self, **kwargs):
+        lat = kwargs.get("lat", 0.0)
+        lon = kwargs.get("lon", 0.0)
+        speed = kwargs.get("speed", 0.0)
+        if lat and lon:
+            self.latest_lat = float(lat)
+            self.latest_lon = float(lon)
+            if speed:
+                self.latest_speed = float(speed)
+
+    def _on_gps_status(self, **kwargs):
+        pass
+
+    # ── Permissions ──────────────────────────────────────────────────────
     def _request_perms(self):
         if platform != "android" or request_permissions is None:
             self._setup_camera()
@@ -666,11 +629,12 @@ class RootUI(BoxLayout):
         except Exception:
             Clock.schedule_once(lambda dt: self._setup_camera(), 1.0)
 
+    # ── Camera ───────────────────────────────────────────────────────────
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
         if SentinelPreview is None:
             self.ids.camera_box.add_widget(
-                Label(text="Camera unavailable\n(camera4kivy not loaded)", font_size="14sp"))
+                Label(text="Camera unavailable", font_size="14sp"))
             return
         try:
             self._preview = SentinelPreview()
@@ -696,61 +660,93 @@ class RootUI(BoxLayout):
             except Exception:
                 pass
 
+    # ── Form ─────────────────────────────────────────────────────────────
     def on_offense_selected(self, text):
-        k = (text.split("--")[0] or "").strip()
+        k = (text.split(":")[0] or "").strip()
         if k in TrafficLawDB.OFFENSES:
             o = TrafficLawDB.OFFENSES[k]
-            self.section_penalty = "%s\nPenalty: %s" % (o["section"], o["penalty"])
+            self.section_penalty = "%s\n%s" % (o["section"], o["penalty"])
         else:
             self.section_penalty = DASH
 
     def on_sign_group(self, g):
         self.ids.sp_sign.values = TrafficLawDB.SIGN_GROUPS.get(g, [])
-        self.ids.sp_sign.text = "Select Sign"
+        self.ids.sp_sign.text = "Select"
 
     def clear_form(self):
         for w in ("in_name", "in_contact", "in_plate", "in_notes"):
             self.ids[w].text = ""
-        self.ids.sp_offense.text = "Select Violation"
-        self.ids.sp_sign_group.text = "Select Sign Group"
-        self.ids.sp_sign.text = "Select Sign"
+        self.ids.sp_offense.text = "Select"
+        self.ids.sp_sign_group.text = "Select"
+        self.ids.sp_sign.text = "Select"
         self.section_penalty = DASH
         self.route_text = DASH
         self.evidence_path = ""
 
+    # ── Capture (FIX #11: use screenshot fallback + proper path) ─────────
     def capture_evidence(self):
         if not self._preview or not self._cam_ok:
-            self._popup("Camera not ready", "Wait for camera to connect.")
+            self._popup("Not ready", "Camera not connected yet.")
             return
+        edir = self._evidence_dir()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        p = os.path.join(self._evidence_dir(), "evidence_%s.jpg" % ts)
+        fname = "evidence_%s" % ts
+        fpath = os.path.join(edir, fname + ".jpg")
+
         try:
+            # camera4kivy capture_photo uses location + subdir + name
             if hasattr(self._preview, "capture_photo"):
-                self._preview.capture_photo(p, self._after_capture)
+                self._preview.capture_photo(
+                    location=edir,
+                    subdir="",
+                    name=fname,
+                )
+                # capture is async; check for file after a delay
+                Clock.schedule_once(lambda dt: self._check_captured(edir, fname), 1.5)
             else:
-                self._preview.export_to_png(p)
-                self._after_capture(p)
-        except Exception:
-            self._popup("Capture failed", "Could not save image.")
+                # fallback: screenshot
+                png_path = os.path.join(edir, fname + ".png")
+                self._preview.export_to_png(png_path)
+                self.evidence_path = png_path
+                self._popup("Saved", os.path.basename(png_path))
+        except Exception as e:
+            # last resort: take screenshot of the preview widget
+            try:
+                png_path = os.path.join(edir, fname + ".png")
+                self._preview.export_to_png(png_path)
+                if os.path.isfile(png_path):
+                    self.evidence_path = png_path
+                    self._popup("Saved (screenshot)", os.path.basename(png_path))
+                    return
+            except Exception:
+                pass
+            self._popup("Capture failed", str(e))
 
-    def _after_capture(self, path):
-        try:
-            p = str(path[0]) if isinstance(path, (tuple, list)) and path else str(path)
-            if not os.path.isfile(p):
-                self._popup("Error", "File not saved.")
+    def _check_captured(self, edir, fname):
+        # camera4kivy saves as .jpg
+        for ext in (".jpg", ".jpeg", ".png"):
+            p = os.path.join(edir, fname + ext)
+            if os.path.isfile(p):
+                if self.ids.sw_clahe.active and cv2:
+                    try:
+                        img = cv2.imread(p)
+                        if img is not None:
+                            cv2.imwrite(p, AnalyticsEngine.clahe(img))
+                    except Exception:
+                        pass
+                self.evidence_path = p
+                self._popup("Saved", os.path.basename(p))
                 return
-            if self.ids.sw_clahe.active and cv2:
-                try:
-                    img = cv2.imread(p)
-                    if img is not None:
-                        cv2.imwrite(p, AnalyticsEngine.clahe(img))
-                except Exception:
-                    pass
-            self.evidence_path = p
-            self._popup("Saved", os.path.basename(p))
-        except Exception:
-            self._popup("Error", "Capture callback failed.")
+        # file might take longer, try again
+        for ext in (".jpg", ".jpeg", ".png"):
+            p = os.path.join(edir, fname + ext)
+            if os.path.isfile(p):
+                self.evidence_path = p
+                self._popup("Saved", os.path.basename(p))
+                return
+        self._popup("Capture failed", "File not found after capture.")
 
+    # ── Geocode + routing ────────────────────────────────────────────────
     def _tick_geo(self, _dt):
         lat = float(self.latest_lat)
         lon = float(self.latest_lon)
@@ -760,13 +756,14 @@ class RootUI(BoxLayout):
         rcpts = ", ".join(rt["all"]) or DASH
         lc = rt["lc"] or DASH
         pc = rt["pc"] or DASH
-        self.route_text = "Loc: %s | Plate: %s\nTo: %s" % (lc, pc, rcpts)
+        self.route_text = "Loc:%s Plate:%s\n%s" % (lc, pc, rcpts)
         kmh = self.latest_speed * 3.6
         cv = self._analytics.result if self.ids.sw_cv.active else ""
-        self.status_text = "GPS: %.5f,%.5f | %s,%s | %.1fkm/h | G:%.2f | %s" % (
-            lat, lon, self.district, self.state_name, kmh, self.latest_g, cv
+        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s" % (
+            lat, lon, self.state_name or DASH, kmh, self.latest_g, cv
         )
 
+    # ── Email (FIX #12: Android plyer uses different arg names) ──────────
     def send_report(self):
         if plyer_email is None:
             self._popup("Unavailable", "Email not available.")
@@ -775,7 +772,7 @@ class RootUI(BoxLayout):
         if not plate:
             self._popup("Missing", "Enter plate number.")
             return
-        okey = (self.ids.sp_offense.text.split("--")[0] or "").strip()
+        okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
         if okey not in TrafficLawDB.OFFENSES:
             self._popup("Missing", "Select a violation.")
             return
@@ -792,55 +789,77 @@ class RootUI(BoxLayout):
         reporter_name = self.ids.in_name.text.strip() or DASH
         reporter_contact = self.ids.in_contact.text.strip() or DASH
         reporter_label = "ANONYMOUS" if anon else reporter_name
-        sign_group_text = self.ids.sp_sign_group.text
-        sign_text = self.ids.sp_sign.text
-        notes_text = self.ids.in_notes.text.strip() or DASH
-        loc_code = rt["lc"] or DASH
-        plate_code = rt["pc"] or DASH
 
         lines = [
-            "SENTINEL-X -- CIVIC ENFORCEMENT REPORT",
-            "Time: %s" % now,
-            "",
+            "SENTINEL-X CIVIC ENFORCEMENT REPORT",
+            "Time: %s" % now, "",
             "GPS: %.6f, %.6f" % (lat, lon),
             "Location: %s, %s" % (self.district, self.state_name),
             "Speed: %.1f km/h" % (self.latest_speed * 3.6),
-            "G_dyn: %.2f m/s2" % self.latest_g,
-            "",
+            "G_dyn: %.2f m/s2" % self.latest_g, "",
             "Plate: %s" % plate,
-            "Offense: %s -- %s" % (okey, o["label"]),
+            "Offense: %s - %s" % (okey, o["label"]),
             "Section: %s" % o["section"],
-            "Penalty: %s" % o["penalty"],
-            "",
-            "Sign: %s / %s" % (sign_group_text, sign_text),
-            "",
+            "Penalty: %s" % o["penalty"], "",
+            "Sign: %s / %s" % (self.ids.sp_sign_group.text, self.ids.sp_sign.text), "",
             "Reporter: %s" % reporter_label,
         ]
         if not anon:
             lines.append("Contact: %s" % reporter_contact)
         lines += [
-            "",
-            "Notes: %s" % notes_text,
-            "",
-            "Routing: Loc=%s Plate=%s" % (loc_code, plate_code),
-            "",
-            TrafficLawDB.GOOD_SAMARITAN_FOOTER,
+            "", "Notes: %s" % (self.ids.in_notes.text.strip() or DASH),
+            "", "Routing: Loc=%s Plate=%s" % (rt["lc"] or DASH, rt["pc"] or DASH),
+            "", TrafficLawDB.GOOD_SAMARITAN_FOOTER,
         ]
-        subj = "[Sentinel-X] %s -- %s" % (plate, o["label"])
+        subj = "[Sentinel-X] %s - %s" % (plate, o["label"])
         body = "\n".join(lines)
-        att = self.evidence_path if self.evidence_path and os.path.isfile(self.evidence_path) else None
-        try:
-            try:
-                plyer_email.send(recipients=rt["all"], subject=subj, text=body, attachment=att)
-            except TypeError:
-                kw = {"recipients": rt["all"], "subject": subj, "text": body}
-                if att:
-                    kw["file_path"] = att
-                plyer_email.send(**kw)
-            self._popup("Ready", "Email composer opened.")
-        except Exception as e:
-            self._popup("Failed", str(e))
+        to_list = rt["all"]
 
+        # FIX #12: Try multiple plyer email API variants
+        # Android plyer uses: recipient (singular list), create_chooser
+        # Desktop plyer uses: recipients (plural)
+        sent = False
+        # Attempt 1: Android-style (recipient singular)
+        if not sent:
+            try:
+                plyer_email.send(
+                    recipient=to_list,
+                    subject=subj,
+                    text=body,
+                    create_chooser=True
+                )
+                sent = True
+            except Exception:
+                pass
+        # Attempt 2: recipients plural
+        if not sent:
+            try:
+                plyer_email.send(
+                    recipients=to_list,
+                    subject=subj,
+                    text=body
+                )
+                sent = True
+            except Exception:
+                pass
+        # Attempt 3: recipient as semicolon string
+        if not sent:
+            try:
+                plyer_email.send(
+                    recipient=";".join(to_list),
+                    subject=subj,
+                    text=body,
+                    create_chooser=True
+                )
+                sent = True
+            except Exception as e:
+                self._popup("Failed", str(e))
+                return
+
+        if sent:
+            self._popup("Ready", "Email composer opened.")
+
+    # ── Service + UDP ────────────────────────────────────────────────────
     def _start_service(self):
         if platform != "android":
             return
@@ -875,14 +894,16 @@ class RootUI(BoxLayout):
                 continue
 
     def _telem(self, lat, lon, spd, g):
-        self.latest_lat = lat
-        self.latest_lon = lon
-        self.latest_speed = spd
+        if lat and lon:
+            self.latest_lat = lat
+            self.latest_lon = lon
+        if spd:
+            self.latest_speed = spd
         self.latest_g = g
 
     def _popup(self, t, m):
-        Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(280), None)),
-              size_hint=(.85, .4)).open()
+        Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(260), None)),
+              size_hint=(.85, .35)).open()
 
 
 class SentinelXApp(App):
@@ -895,6 +916,11 @@ class SentinelXApp(App):
         if r and r._preview and r._cam_ok:
             try:
                 r._preview.disconnect_camera()
+            except Exception:
+                pass
+        if plyer_gps:
+            try:
+                plyer_gps.stop()
             except Exception:
                 pass
 
