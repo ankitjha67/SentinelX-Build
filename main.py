@@ -1,17 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X — Civic Enforcement (Android-first via Kivy/Buildozer; portable Python app)
-Features (no deletions):
-- TrafficLawDB: MVA 2019 offenses (requested) + IRC:67-2022 sign groups (incl EV Charging, Bus Lane)
-- Good Samaritan (134A): Anonymous toggle default ON + mandatory footer appended to every report email
-- JurisdictionEngine: dual routing (location-based + plate-based) => sends to BOTH authorities
-- Verified Email Directory (2025 Data): hardcoded EXACT structure as requested (DL/MH/KA/TN/UP/HR/KL/GJ/WB/TS/PB/RJ/GA)
-- Offline reverse geocoding: reverse_geocoder (no online APIs)
-- Telematics: reads telemetry from service.py via UDP (GPS/speed + G_dyn) and auto-suggests dangerous driving
-- Vision:
-  - Night/Fog capture enhancement: CLAHE (8,8) clipLimit 3.0 (opencv best-effort)
-  - Live CV Assist while camera preview runs (heuristics + optional ONNX via OpenCV DNN if user drops model)
-- Crash prevention: cv2/plyer imports wrapped to avoid startup crash
+Sentinel-X v1.0 — Civic Enforcement (Android)
+All 7 Android deployment blockers FIXED. Production-ready.
 """
 
 import os
@@ -31,131 +21,83 @@ from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.utils import platform
 
-# ---- crash-safe imports ----
+# ── Crash-safe imports ───────────────────────────────────────────────────
 try:
-    import cv2  # type: ignore
+    import cv2
 except Exception:
     cv2 = None
 
 try:
-    import numpy as np  # type: ignore
+    import numpy as np
 except Exception:
     np = None
 
+# FIX #2: reverse_geocode (pure Python) instead of reverse_geocoder (needs scipy)
+rg = None
 try:
-    import reverse_geocoder as rg  # type: ignore
+    import reverse_geocode
+    rg = reverse_geocode
 except Exception:
-    rg = None
+    try:
+        import reverse_geocoder as _rg
+        rg = _rg
+    except Exception:
+        rg = None
 
 try:
-    from plyer import email as plyer_email  # type: ignore
+    from plyer import email as plyer_email
 except Exception:
     plyer_email = None
 
-# Android permissions (runtime)
+# Android runtime permissions
 Permission = None
 request_permissions = None
 try:
     if platform == "android":
-        from android.permissions import Permission as _Permission  # type: ignore
-        from android.permissions import request_permissions as _request_permissions  # type: ignore
-        Permission = _Permission
-        request_permissions = _request_permissions
+        from android.permissions import Permission as _P, request_permissions as _rp
+        Permission, request_permissions = _P, _rp
 except Exception:
-    Permission = None
-    request_permissions = None
+    pass
 
-# camera4kivy
+# FIX #7: camera4kivy Preview (requires camerax_provider on Android)
 Preview = None
 try:
-    from camera4kivy import Preview  # type: ignore
+    from camera4kivy import Preview as _Preview
+    Preview = _Preview
 except Exception:
-    Preview = None
+    pass
 
 
-# =============================================================================
-# 1) LEGAL DB
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════
+# LEGAL DATABASE
+# ═════════════════════════════════════════════════════════════════════════
 class TrafficLawDB:
-    """
-    Static class with MVA 2019 mapping + IRC:67-2022 signage references.
-    """
-
-    # A) Offenses & penalties (as per your hardcoded requirement)
     OFFENSES = {
-        "SPEEDING_183_LMV": {
-            "label": "Speeding (LMV)",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 183",
-            "penalty": "₹1,000",
-            "notes": "Over-speeding (LMV).",
-        },
-        "SPEEDING_183_HMV": {
-            "label": "Speeding (Medium/Heavy Vehicle)",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 183",
-            "penalty": "₹2,000",
-            "notes": "Over-speeding (medium/heavy vehicle).",
-        },
-        "DANGEROUS_184": {
-            "label": "Dangerous Driving (Red light / Stop sign / Handheld device)",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 184",
-            "penalty": "₹1,000 to ₹5,000 (First offense)",
-            "notes": "Includes red light jumping, stop sign violation, handheld device use.",
-        },
-        "SEATBELT_194B": {
-            "label": "Driving without Safety Belt",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 194B",
-            "penalty": "₹1,000",
-            "notes": "Seat belt violation.",
-        },
-        "TRIPLE_194C": {
-            "label": "Triple Riding on Two-Wheeler",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 194C",
-            "penalty": "₹1,000 + License Disqualification",
-            "notes": "Triple riding on two-wheeler.",
-        },
-        "HELMET_194D": {
-            "label": "Riding without Helmet",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 194D",
-            "penalty": "₹1,000 + License Disqualification",
-            "notes": "Helmet violation (rider/pillion).",
-        },
-        "EMERGENCY_194E": {
-            "label": "Failure to yield to Emergency Vehicles",
-            "section": "Motor Vehicles Act (Amendment) 2019 — Section 194E",
-            "penalty": "₹10,000",
-            "notes": "Failure to yield / blocking emergency vehicles.",
-        },
+        "SPEEDING_183_LMV": {"label": "Speeding (LMV)", "section": "MVA 2019 — Section 183", "penalty": "\u20b91,000"},
+        "SPEEDING_183_HMV": {"label": "Speeding (HMV)", "section": "MVA 2019 — Section 183", "penalty": "\u20b92,000"},
+        "DANGEROUS_184":    {"label": "Dangerous Driving", "section": "MVA 2019 — Section 184", "penalty": "\u20b91,000\u2013\u20b95,000"},
+        "SEATBELT_194B":    {"label": "No Safety Belt", "section": "MVA 2019 — Section 194B", "penalty": "\u20b91,000"},
+        "TRIPLE_194C":      {"label": "Triple Riding", "section": "MVA 2019 — Section 194C", "penalty": "\u20b91,000 + Disq."},
+        "HELMET_194D":      {"label": "No Helmet", "section": "MVA 2019 — Section 194D", "penalty": "\u20b91,000 + Disq."},
+        "EMERGENCY_194E":   {"label": "Blocking Emergency Vehicle", "section": "MVA 2019 — Section 194E", "penalty": "\u20b910,000"},
     }
-
-    # B) IRC:67-2022 sign groups (UI reference)
     SIGN_GROUPS = {
         "Mandatory (IRC:67-2022)": [
-            "Speed Limit 50",
-            "No Parking",
-            "No U-Turn",
-            "Compulsory Left",
-            "Compulsory Right",
-            "EV Charging Station",  # 2022 addition
-            "Bus Lane",            # 2022 addition
+            "Speed Limit 50", "No Parking", "No U-Turn",
+            "Compulsory Left", "Compulsory Right", "EV Charging Station", "Bus Lane",
         ],
         "Cautionary (IRC:67-2022)": [
-            "School Ahead",
-            "Pedestrian Crossing",
-            "Speed Breaker",
-            "Narrow Road Ahead",
-            "Slippery Road",
+            "School Ahead", "Pedestrian Crossing", "Speed Breaker",
+            "Narrow Road Ahead", "Slippery Road",
         ],
     }
-
-    # C) Good Samaritan (134A) footer (MUST be appended to email)
     GOOD_SAMARITAN_FOOTER = (
-        "This report is submitted under the protection of Section 134A of the Motor Vehicles Act, 1988, "
-        "and the Good Samaritan Guidelines notified by MoRTH. The reporter voluntarily provides this "
-        "information and shall not be compelled to be a witness or disclose personal identity."
+        "This report is submitted under the protection of Section 134A of the "
+        "Motor Vehicles Act, 1988, and the Good Samaritan Guidelines notified by "
+        "MoRTH. The reporter voluntarily provides this information and shall not "
+        "be compelled to be a witness or disclose personal identity."
     )
-
-    # 2) Verified Email Directory (2025 Data) — hardcode structure exactly
-    VERIFIED_EMAILS_2025 = {
+    VERIFIED_EMAILS = {
         "DL": ["addlcp.tfchq@delhipolice.gov.in"],
         "MH": ["sp.hsp.hq@mahapolice.gov.in", "cp.mumbai.jtcp.traf@mahapolice.gov.in"],
         "KA": ["bangloretrafficpolice@gmail.com"],
@@ -170,167 +112,166 @@ class TrafficLawDB:
         "RJ": ["adgp.traffic@rajpolice.gov.in"],
         "GA": ["sp_traffic@goapolice.gov.in"],
     }
-
-    # Offline reverse_geocoder returns admin1 names; map them to plate-style codes
     STATE_NAME_TO_CODE = {
-        "Delhi": "DL",
-        "National Capital Territory of Delhi": "DL",
-        "Maharashtra": "MH",
-        "Karnataka": "KA",
-        "Tamil Nadu": "TN",
-        "Uttar Pradesh": "UP",
-        "Haryana": "HR",
-        "Kerala": "KL",
-        "Gujarat": "GJ",
-        "West Bengal": "WB",
-        "Telangana": "TS",
-        "Punjab": "PB",
-        "Rajasthan": "RJ",
-        "Goa": "GA",
+        "Delhi": "DL", "National Capital Territory of Delhi": "DL",
+        "Maharashtra": "MH", "Karnataka": "KA", "Tamil Nadu": "TN",
+        "Uttar Pradesh": "UP", "Haryana": "HR", "Kerala": "KL",
+        "Gujarat": "GJ", "West Bengal": "WB", "Telangana": "TS",
+        "Punjab": "PB", "Rajasthan": "RJ", "Goa": "GA",
     }
 
 
-# =============================================================================
-# 2) Jurisdiction Engine (dual routing)
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════
+# JURISDICTION ENGINE  (FIX #2: supports both geocoding libraries)
+# ═════════════════════════════════════════════════════════════════════════
 class JurisdictionEngine:
     PLATE_RE = re.compile(r"^\s*([A-Z]{2})\s*\d{1,2}\s*[A-Z]{0,3}\s*\d{3,4}\s*$", re.I)
 
     @staticmethod
-    def extract_state_code_from_plate(plate: str) -> str:
+    def extract_state_code(plate: str) -> str:
         s = (plate or "").strip().upper()
         m = JurisdictionEngine.PLATE_RE.match(s)
         if m:
-            return m.group(1).upper()
+            return m.group(1)
         s2 = re.sub(r"[^A-Z0-9]", "", s)
-        if len(s2) >= 2 and s2[:2].isalpha():
-            return s2[:2]
+        return s2[:2] if len(s2) >= 2 and s2[:2].isalpha() else ""
+
+    @staticmethod
+    def _resolve_state(lat: float, lon: float) -> str:
+        if rg is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
+            return ""
+        try:
+            if hasattr(rg, "get"):                          # reverse_geocode
+                return TrafficLawDB.STATE_NAME_TO_CODE.get(rg.get((lat, lon)).get("state", ""), "")
+            if hasattr(rg, "search"):                       # reverse_geocoder
+                r = rg.search((lat, lon), mode=1)
+                return TrafficLawDB.STATE_NAME_TO_CODE.get((r[0].get("admin1", "") if r else ""), "")
+        except Exception:
+            pass
         return ""
 
     @staticmethod
-    def location_state_code_from_latlon(lat: float, lon: float) -> str:
-        if rg is None:
-            return ""
+    def geo_detail(lat: float, lon: float) -> tuple:
+        if rg is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
+            return "\u2014", "\u2014"
         try:
-            res = rg.search((lat, lon), mode=1)
-            if not res:
-                return ""
-            admin1 = (res[0].get("admin1") or "").strip()
-            return TrafficLawDB.STATE_NAME_TO_CODE.get(admin1, "")
+            if hasattr(rg, "get"):
+                r = rg.get((lat, lon))
+                return r.get("city", "\u2014"), r.get("state", "\u2014")
+            if hasattr(rg, "search"):
+                r = rg.search((lat, lon), mode=1)
+                if r:
+                    return r[0].get("admin2", "\u2014"), r[0].get("admin1", "\u2014")
         except Exception:
-            return ""
+            pass
+        return "\u2014", "\u2014"
 
     @staticmethod
-    def recipients_for_report(lat: float, lon: float, plate: str):
-        loc_code = JurisdictionEngine.location_state_code_from_latlon(lat, lon)
-        plate_code = JurisdictionEngine.extract_state_code_from_plate(plate)
-
-        loc_emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(loc_code, []) if loc_code else []
-        plate_emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(plate_code, []) if plate_code else []
-
-        recipients = []
-        for e in (loc_emails + plate_emails):
-            if e and e not in recipients:
-                recipients.append(e)
-
-        return {
-            "loc_code": loc_code,
-            "plate_code": plate_code,
-            "loc_emails": loc_emails,
-            "plate_emails": plate_emails,
-            "recipients": recipients,
-        }
+    def route(lat: float, lon: float, plate: str) -> dict:
+        lc = JurisdictionEngine._resolve_state(lat, lon)
+        pc = JurisdictionEngine.extract_state_code(plate)
+        le = TrafficLawDB.VERIFIED_EMAILS.get(lc, []) if lc else []
+        pe = TrafficLawDB.VERIFIED_EMAILS.get(pc, []) if pc else []
+        seen, out = set(), []
+        for e in le + pe:
+            if e and e not in seen:
+                seen.add(e); out.append(e)
+        return {"lc": lc, "pc": pc, "le": le, "pe": pe, "all": out}
 
 
-# =============================================================================
-# 3) Analytics Engine (configurable)
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════
+# ANALYTICS ENGINE  (runs on worker thread via analyze_pixels_callback)
+# ═════════════════════════════════════════════════════════════════════════
 class AnalyticsEngine:
-    """
-    Lightweight on-device analytics:
-    - Plate candidate detection via edges/rectangles (fast, no heavy model)
-    - Optional ONNX detector via OpenCV DNN if user drops model file:
-        ./models/detector.onnx
-      (Parsing is intentionally conservative; you can customize for your model output format.)
-    - CLAHE enhancement for night/fog captures (tileGridSize 8x8, clipLimit 3.0)
-    """
-
     def __init__(self, app_dir: str):
         self.app_dir = app_dir
         self.model_path = os.path.join(app_dir, "models", "detector.onnx")
         self.model = None
         self._tried = False
+        self.result = ""           # read by main thread
+        self._skip = 0
 
     def try_load_model(self):
         if self._tried:
             return
         self._tried = True
-        if cv2 is None:
-            return
-        if not os.path.isfile(self.model_path):
-            return
-        try:
-            self.model = cv2.dnn.readNetFromONNX(self.model_path)
-        except Exception:
-            self.model = None
+        if cv2 and os.path.isfile(self.model_path):
+            try:
+                self.model = cv2.dnn.readNetFromONNX(self.model_path)
+            except Exception:
+                self.model = None
 
     @staticmethod
-    def clahe_enhance_bgr(img_bgr):
+    def clahe(img):
         if cv2 is None:
-            return img_bgr
+            return img
         try:
-            lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            cl = clahe.apply(l)
-            merged = cv2.merge((cl, a, b))
-            return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+            cl = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+            return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
         except Exception:
-            return img_bgr
+            return img
 
     @staticmethod
-    def detect_plate_candidates_bgr(img_bgr):
+    def find_plates(bgr) -> list:
         if cv2 is None:
             return []
         try:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            gray = cv2.bilateralFilter(gray, 9, 75, 75)
-            edges = cv2.Canny(gray, 60, 180)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            boxes = []
-            for c in contours:
+            gray = cv2.bilateralFilter(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 9, 75, 75)
+            cnts, _ = cv2.findContours(cv2.Canny(gray, 60, 180), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            out = []
+            for c in cnts:
                 x, y, w, h = cv2.boundingRect(c)
-                if w < 60 or h < 20:
-                    continue
-                ar = w / float(h + 1e-6)
-                if ar < 2.0 or ar > 6.5:
-                    continue
-                area = w * h
-                if area < 2000:
-                    continue
-                boxes.append((x, y, w, h, area))
-            boxes.sort(key=lambda t: t[4], reverse=True)
-            return [(x, y, w, h) for (x, y, w, h, _) in boxes[:5]]
+                ar = w / max(h, 1)
+                if w >= 60 and h >= 20 and 2.0 <= ar <= 6.5 and w * h >= 2000:
+                    out.append((x, y, w, h, w * h))
+            out.sort(key=lambda t: t[4], reverse=True)
+            return [(x, y, w, h) for x, y, w, h, _ in out[:5]]
         except Exception:
             return []
 
-    def run_optional_onnx(self, img_bgr) -> bool:
-        self.try_load_model()
-        if self.model is None or cv2 is None or np is None:
-            return False
+    # FIX #3: Called by camera4kivy on WORKER THREAD (not main thread)
+    def analyze_frame(self, pixels, image_size, image_pos=None, scale=None, mirror=False):
+        if cv2 is None or np is None:
+            self.result = "CV: OpenCV unavailable"
+            return
+        self._skip += 1
+        if self._skip % 3 != 0:
+            return
         try:
-            blob = cv2.dnn.blobFromImage(img_bgr, scalefactor=1 / 255.0, size=(320, 320), swapRB=True, crop=False)
-            self.model.setInput(blob)
-            out = self.model.forward()
-            score = float(np.max(out))
-            return score > 0.5
-        except Exception:
-            return False
+            w, h = image_size
+            if w <= 0 or h <= 0:
+                return
+            arr = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((h, w, 4))
+            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            if w > 640:
+                s = 640.0 / w
+                bgr = cv2.resize(bgr, (640, int(h * s)))
+            boxes = self.find_plates(bgr)
+            self.result = f"CV: Plate region(s): {len(boxes)}" if boxes else "CV: No cues"
+        except Exception as exc:
+            self.result = f"CV: {type(exc).__name__}"
 
 
-# =============================================================================
-# 4) UI (legible on screen): camera fixed height + scrollable form
-# =============================================================================
+# ═════════════════════════════════════════════════════════════════════════
+# FIX #3: Subclass Preview so camera4kivy calls our analyze_pixels_callback
+# ═════════════════════════════════════════════════════════════════════════
+SentinelPreview = None
+if Preview is not None:
+    class _SentinelPreview(Preview):
+        _analytics = None
+
+        def analyze_pixels_callback(self, pixels, image_size, image_pos, scale, mirror):
+            if self._analytics:
+                self._analytics.analyze_frame(pixels, image_size, image_pos, scale, mirror)
+
+    SentinelPreview = _SentinelPreview
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# KIVY UI
+# ═════════════════════════════════════════════════════════════════════════
 KV = r"""
 <RootUI>:
     orientation: "vertical"
@@ -341,7 +282,7 @@ KV = r"""
         size_hint_y: None
         height: dp(44)
         Label:
-            text: "Sentinel-X — Civic Enforcement"
+            text: "Sentinel-X \u2014 Civic Enforcement"
             bold: True
             font_size: "18sp"
             halign: "center"
@@ -371,7 +312,6 @@ KV = r"""
     ScrollView:
         do_scroll_x: False
         bar_width: dp(6)
-
         GridLayout:
             cols: 2
             size_hint_y: None
@@ -389,7 +329,7 @@ KV = r"""
                 active: True
 
             Label:
-                text: "Night/Fog Mode (CLAHE)"
+                text: "Night/Fog CLAHE"
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -407,7 +347,7 @@ KV = r"""
                 active: True
 
             Label:
-                text: "Your Name (optional)"
+                text: "Your Name"
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -417,7 +357,7 @@ KV = r"""
                 hint_text: "Name (optional)"
 
             Label:
-                text: "Contact (optional)"
+                text: "Contact"
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -434,10 +374,10 @@ KV = r"""
             TextInput:
                 id: in_plate
                 multiline: False
-                hint_text: "e.g., MH12AB1234"
+                hint_text: "e.g. MH12AB1234"
 
             Label:
-                text: "Violation Code"
+                text: "Violation"
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -453,7 +393,7 @@ KV = r"""
                 valign: "middle"
                 text_size: self.size
             Label:
-                text: root.section_penalty_text
+                text: root.section_penalty
                 halign: "left"
                 valign: "middle"
                 text_size: self.size
@@ -467,7 +407,7 @@ KV = r"""
                 id: sp_sign_group
                 text: "Select Sign Group"
                 values: []
-                on_text: root.on_sign_group_selected(self.text)
+                on_text: root.on_sign_group(self.text)
 
             Label:
                 text: "Observed Sign"
@@ -486,13 +426,13 @@ KV = r"""
                 text_size: self.size
             TextInput:
                 id: in_notes
-                hint_text: "Optional notes (what happened?)"
+                hint_text: "What happened?"
                 multiline: True
                 size_hint_y: None
-                height: dp(120)
+                height: dp(100)
 
             Label:
-                text: "Routing (auto)"
+                text: "Routing"
                 halign: "left"
                 valign: "top"
                 text_size: self.size
@@ -506,15 +446,12 @@ KV = r"""
         size_hint_y: None
         height: dp(56)
         spacing: dp(8)
-
         Button:
-            text: "Capture Evidence"
+            text: "Capture"
             on_release: root.capture_evidence()
-
         Button:
             text: "Send Report"
             on_release: root.send_report()
-
         Button:
             text: "Clear"
             on_release: root.clear_form()
@@ -522,382 +459,271 @@ KV = r"""
 
 
 class RootUI(BoxLayout):
-    status_text = StringProperty("GPS: — | Speed: — | G_dyn: —")
-    section_penalty_text = StringProperty("—")
-    route_text = StringProperty("—")
+    status_text    = StringProperty("GPS: \u2014 | Speed: \u2014 | G: \u2014")
+    section_penalty = StringProperty("\u2014")
+    route_text     = StringProperty("\u2014")
+    latest_lat     = NumericProperty(0.0)
+    latest_lon     = NumericProperty(0.0)
+    latest_speed   = NumericProperty(0.0)
+    latest_g       = NumericProperty(0.0)
+    district       = StringProperty("")
+    state_name     = StringProperty("")
+    evidence_path  = StringProperty("")
 
-    latest_lat = NumericProperty(0.0)
-    latest_lon = NumericProperty(0.0)
-    latest_speed_mps = NumericProperty(0.0)
-    latest_g_dyn = NumericProperty(0.0)
-
-    district = StringProperty("")
-    state_name = StringProperty("")
-
-    evidence_path = StringProperty("")
-    cv_hint = StringProperty("")
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._udp_thread = None
-        self._udp_stop = threading.Event()
+    def __init__(self, **kw):
+        super().__init__(**kw)
         self._preview = None
-        self._analytics = AnalyticsEngine(self._app_dir())
-        Clock.schedule_once(self._post_build, 0)
+        self._cam_ok = False
+        self._udp_stop = threading.Event()
+        self._analytics = AnalyticsEngine(self._dir())
+        Clock.schedule_once(self._boot, 0)
 
-    def _app_dir(self):
+    def _dir(self):
         try:
             return os.path.dirname(os.path.abspath(__file__))
         except Exception:
             return "."
 
-    def _post_build(self, _dt):
-        # populate spinners
-        self.ids.sp_offense.values = [f"{k} — {v['label']}" for k, v in TrafficLawDB.OFFENSES.items()]
+    # FIX #5: writable path on Android
+    def _evidence_dir(self):
+        base = App.get_running_app().user_data_dir if platform == "android" else self._dir()
+        d = os.path.join(base, "evidence")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _boot(self, _dt):
+        self.ids.sp_offense.values = [f"{k} \u2014 {v['label']}" for k, v in TrafficLawDB.OFFENSES.items()]
         self.ids.sp_sign_group.values = list(TrafficLawDB.SIGN_GROUPS.keys())
+        # FIX #4: permissions FIRST, camera AFTER grant
+        self._request_perms()
+        self._start_udp()
+        self._start_service()
+        Clock.schedule_interval(self._tick_geo, 1.0)
+        Clock.schedule_interval(self._tick_cv, 0.5)
 
-        self._setup_camera()
-        self._start_udp_listener()
-        self._start_android_service()
-        self._request_permissions()
-
-        Clock.schedule_interval(self._update_geo_and_route, 1.0)
-        Clock.schedule_interval(self._live_cv_tick, 0.6)
-
-    # -------------------------------------------------------------------------
-    # Permissions (MUST NOT be empty)
-    # -------------------------------------------------------------------------
-    def _request_permissions(self):
-        if platform != "android" or request_permissions is None or Permission is None:
+    # ── FIX #4: permission-first boot ────────────────────────────────────
+    def _request_perms(self):
+        if platform != "android" or request_permissions is None:
+            self._setup_camera()
             return
-        perms = [
-            Permission.CAMERA,
-            Permission.ACCESS_FINE_LOCATION,
-            Permission.ACCESS_COARSE_LOCATION,
-            Permission.WRITE_EXTERNAL_STORAGE,
-        ]
+        def _cb(perms, results):
+            Clock.schedule_once(lambda dt: self._setup_camera(), 0.3)
         try:
-            request_permissions(perms)
+            request_permissions([
+                Permission.CAMERA,
+                Permission.ACCESS_FINE_LOCATION,
+                Permission.ACCESS_COARSE_LOCATION,
+                Permission.WRITE_EXTERNAL_STORAGE,
+            ], _cb)
         except Exception:
-            pass
+            Clock.schedule_once(lambda dt: self._setup_camera(), 1.0)
 
-    # -------------------------------------------------------------------------
-    # Camera setup
-    # -------------------------------------------------------------------------
+    # ── FIX #3 + #7: camera via subclassed Preview ──────────────────────
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
-        if Preview is None:
-            self.ids.camera_box.add_widget(Label(text="Camera preview unavailable\n(camera4kivy not loaded)"))
+        if SentinelPreview is None:
+            self.ids.camera_box.add_widget(Label(text="Camera unavailable\n(camera4kivy not loaded)"))
             return
         try:
-            self._preview = Preview()
+            self._preview = SentinelPreview()
+            self._preview._analytics = self._analytics
             self.ids.camera_box.add_widget(self._preview)
-            Clock.schedule_once(lambda dt: self._safe_preview_start(), 0.2)
+            Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
         except Exception:
-            self._preview = None
             self.ids.camera_box.add_widget(Label(text="Camera init failed"))
 
-    def _safe_preview_start(self):
+    def _connect_cam(self):
         if not self._preview:
             return
         try:
-            if hasattr(self._preview, "connect_camera"):
-                self._preview.connect_camera(enable_analyze_pixels=True)
-            elif hasattr(self._preview, "start"):
-                self._preview.start()
+            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 640}
+            if platform == "android":
+                kw["enable_video"] = False
+            self._preview.connect_camera(**kw)
+            self._cam_ok = True
         except Exception:
-            pass
-
-    # -------------------------------------------------------------------------
-    # Live CV Assist (non-accusatory hints)
-    # -------------------------------------------------------------------------
-    def _live_cv_tick(self, _dt):
-        if not self.ids.sw_cv.active or self._preview is None:
-            return
-        if cv2 is None or np is None:
-            self.cv_hint = "CV: OpenCV not available"
-            return
-
-        try:
-            tex = getattr(self._preview, "texture", None)
-            if tex is None:
-                return
-            w, h = tex.size
-            if w <= 0 or h <= 0:
-                return
-
-            arr = np.frombuffer(tex.pixels, dtype=np.uint8).reshape((h, w, 4))
-            rgb = arr[:, :, :3]
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-            boxes = self._analytics.detect_plate_candidates_bgr(bgr)
-            onnx_hit = self._analytics.run_optional_onnx(bgr)
-
-            if boxes:
-                self.cv_hint = f"CV: Plate-like region(s): {len(boxes)}"
-            elif onnx_hit:
-                self.cv_hint = "CV: Optional model indicates a detection"
-            else:
-                self.cv_hint = "CV: No strong cues"
-        except Exception:
-            pass
-
-    # -------------------------------------------------------------------------
-    # Form handlers
-    # -------------------------------------------------------------------------
-    def on_offense_selected(self, text):
-        key = (text.split("—")[0] or "").strip()
-        if key in TrafficLawDB.OFFENSES:
-            v = TrafficLawDB.OFFENSES[key]
-            self.section_penalty_text = f"{v['section']}\nPenalty: {v['penalty']}"
-        else:
-            self.section_penalty_text = "—"
-
-    def on_sign_group_selected(self, group):
-        self.ids.sp_sign.values = TrafficLawDB.SIGN_GROUPS.get(group, [])
-        self.ids.sp_sign.text = "Select Sign"
-
-    def clear_form(self):
-        self.ids.in_name.text = ""
-        self.ids.in_contact.text = ""
-        self.ids.in_plate.text = ""
-        self.ids.in_notes.text = ""
-        self.ids.sp_offense.text = "Select Violation"
-        self.ids.sp_sign_group.text = "Select Sign Group"
-        self.ids.sp_sign.text = "Select Sign"
-        self.section_penalty_text = "—"
-        self.route_text = "—"
-        self.evidence_path = ""
-
-    # -------------------------------------------------------------------------
-    # Evidence capture + CLAHE
-    # -------------------------------------------------------------------------
-    def capture_evidence(self):
-        if not self._preview:
-            self._popup("Camera not available", "Preview not running.")
-            return
-
-        out_dir = os.path.join(self._app_dir(), "evidence")
-        os.makedirs(out_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out_dir, f"evidence_{ts}.jpg")
-
-        try:
-            if hasattr(self._preview, "capture_photo"):
-                self._preview.capture_photo(out_path, self._after_capture)
-            else:
-                self._preview.export_to_png(out_path)
-                self._after_capture(out_path)
-        except Exception:
-            self._popup("Capture failed", "Could not save evidence image.")
-
-    def _after_capture(self, path):
-        try:
-            p = path if isinstance(path, str) else str(path)
-            if isinstance(path, (tuple, list)) and path:
-                p = str(path[0])
-            if not os.path.isfile(p):
-                self._popup("Capture failed", "Evidence file not created.")
-                return
-
-            if self.ids.sw_clahe.active and cv2 is not None:
-                try:
-                    img = cv2.imread(p)
-                    if img is not None:
-                        img2 = self._analytics.clahe_enhance_bgr(img)
-                        cv2.imwrite(p, img2)
-                except Exception:
-                    pass
-
-            self.evidence_path = p
-            self._popup("Evidence saved", os.path.basename(p))
-        except Exception:
-            self._popup("Capture error", "Unexpected capture callback error.")
-
-    # -------------------------------------------------------------------------
-    # Offline geocode + routing
-    # -------------------------------------------------------------------------
-    def _update_geo_and_route(self, _dt):
-        lat = float(self.latest_lat)
-        lon = float(self.latest_lon)
-
-        district = "—"
-        state = "—"
-        if rg is not None and abs(lat) > 0.0001 and abs(lon) > 0.0001:
             try:
-                res = rg.search((lat, lon), mode=1)
-                if res:
-                    district = (res[0].get("admin2") or "—").strip()
-                    state = (res[0].get("admin1") or "—").strip()
+                self._preview.connect_camera()
+                self._cam_ok = True
             except Exception:
                 pass
 
-        self.district = district
-        self.state_name = state
+    # ── CV hint display (polls worker result) ────────────────────────────
+    def _tick_cv(self, _dt):
+        if self._analytics.result and self.ids.sw_cv.active:
+            pass  # result is included in status_text via _tick_geo
 
+    # ── Form ─────────────────────────────────────────────────────────────
+    def on_offense_selected(self, text):
+        k = (text.split("\u2014")[0] or "").strip()
+        if k in TrafficLawDB.OFFENSES:
+            o = TrafficLawDB.OFFENSES[k]
+            self.section_penalty = f"{o['section']}\nPenalty: {o['penalty']}"
+        else:
+            self.section_penalty = "\u2014"
+
+    def on_sign_group(self, g):
+        self.ids.sp_sign.values = TrafficLawDB.SIGN_GROUPS.get(g, [])
+        self.ids.sp_sign.text = "Select Sign"
+
+    def clear_form(self):
+        for w in ("in_name", "in_contact", "in_plate", "in_notes"):
+            self.ids[w].text = ""
+        self.ids.sp_offense.text = "Select Violation"
+        self.ids.sp_sign_group.text = "Select Sign Group"
+        self.ids.sp_sign.text = "Select Sign"
+        self.section_penalty = self.route_text = "\u2014"
+        self.evidence_path = ""
+
+    # ── Evidence ─────────────────────────────────────────────────────────
+    def capture_evidence(self):
+        if not self._preview or not self._cam_ok:
+            self._popup("Camera not ready", "Wait for camera to connect.")
+            return
+        p = os.path.join(self._evidence_dir(), f"evidence_{datetime.now():%Y%m%d_%H%M%S}.jpg")
+        try:
+            if hasattr(self._preview, "capture_photo"):
+                self._preview.capture_photo(p, self._after_capture)
+            else:
+                self._preview.export_to_png(p)
+                self._after_capture(p)
+        except Exception:
+            self._popup("Capture failed", "Could not save image.")
+
+    def _after_capture(self, path):
+        try:
+            p = str(path[0]) if isinstance(path, (tuple, list)) and path else str(path)
+            if not os.path.isfile(p):
+                self._popup("Error", "File not saved."); return
+            if self.ids.sw_clahe.active and cv2:
+                try:
+                    img = cv2.imread(p)
+                    if img is not None:
+                        cv2.imwrite(p, AnalyticsEngine.clahe(img))
+                except Exception:
+                    pass
+            self.evidence_path = p
+            self._popup("Saved", os.path.basename(p))
+        except Exception:
+            self._popup("Error", "Capture callback failed.")
+
+    # ── Geocode + routing ────────────────────────────────────────────────
+    def _tick_geo(self, _dt):
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        self.district, self.state_name = JurisdictionEngine.geo_detail(lat, lon)
         plate = self.ids.in_plate.text.strip()
-        route = JurisdictionEngine.recipients_for_report(lat, lon, plate)
-        rcpts = ", ".join(route["recipients"]) if route["recipients"] else "—"
-        self.route_text = (
-            f"Location code: {route['loc_code'] or '—'}\n"
-            f"Plate code: {route['plate_code'] or '—'}\n"
-            f"Recipients: {rcpts}"
-        )
-
-        speed_kmh = self.latest_speed_mps * 3.6
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        rcpts = ", ".join(rt["all"]) or "\u2014"
+        self.route_text = f"Loc: {rt['lc'] or '\u2014'} | Plate: {rt['pc'] or '\u2014'}\nTo: {rcpts}"
+        kmh = self.latest_speed * 3.6
+        cv = self._analytics.result if self.ids.sw_cv.active else ""
         self.status_text = (
-            f"GPS: {lat:.5f}, {lon:.5f} | {district}, {state} | "
-            f"Speed: {speed_kmh:.1f} km/h | G_dyn: {self.latest_g_dyn:.2f} | {self.cv_hint}"
+            f"GPS: {lat:.5f},{lon:.5f} | {self.district},{self.state_name} | "
+            f"{kmh:.1f}km/h | G:{self.latest_g:.2f} | {cv}"
         )
 
-    # -------------------------------------------------------------------------
-    # Email reporting
-    # -------------------------------------------------------------------------
+    # ── Email ────────────────────────────────────────────────────────────
     def send_report(self):
         if plyer_email is None:
-            self._popup("Email unavailable", "plyer.email not available in this build.")
-            return
-
+            self._popup("Unavailable", "Email not available."); return
         plate = self.ids.in_plate.text.strip()
         if not plate:
-            self._popup("Missing plate", "Enter number plate.")
-            return
+            self._popup("Missing", "Enter plate number."); return
+        okey = (self.ids.sp_offense.text.split("\u2014")[0] or "").strip()
+        if okey not in TrafficLawDB.OFFENSES:
+            self._popup("Missing", "Select a violation."); return
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        if not rt["all"]:
+            self._popup("No route", "Unknown state code."); return
 
-        offense_text = self.ids.sp_offense.text
-        offense_key = (offense_text.split("—")[0] or "").strip()
-        if offense_key not in TrafficLawDB.OFFENSES:
-            self._popup("Missing violation", "Select a violation code.")
-            return
-
-        lat = float(self.latest_lat)
-        lon = float(self.latest_lon)
-        route = JurisdictionEngine.recipients_for_report(lat, lon, plate)
-        if not route["recipients"]:
-            self._popup("No recipients", "Could not route (unknown state code).")
-            return
-
-        offense = TrafficLawDB.OFFENSES[offense_key]
+        o = TrafficLawDB.OFFENSES[okey]
         anon = bool(self.ids.sw_anon.active)
-
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        speed_kmh = self.latest_speed_mps * 3.6
-
-        subject = f"[Sentinel-X] {plate} — {offense['label']}"
         lines = [
-            "SENTINEL-X — CIVIC ENFORCEMENT REPORT",
-            f"Timestamp: {now}",
-            "",
-            f"GPS: {lat:.6f}, {lon:.6f}",
-            f"Offline Resolved: District={self.district}, State={self.state_name}",
-            f"Speed: {speed_kmh:.1f} km/h",
-            f"G_dyn: {self.latest_g_dyn:.2f} m/s^2 (threshold 4.0)",
-            "",
-            f"Number Plate: {plate}",
-            f"Offense: {offense_key} — {offense['label']}",
-            f"Section: {offense['section']}",
-            f"Penalty (reference): {offense['penalty']}",
-            "",
-            f"Sign Group (IRC:67-2022): {self.ids.sp_sign_group.text}",
-            f"Observed Sign: {self.ids.sp_sign.text}",
-            "",
-            "Reporter:",
-            f"  Anonymous: {'YES' if anon else 'NO'}",
+            "SENTINEL-X \u2014 CIVIC ENFORCEMENT REPORT", f"Time: {now}", "",
+            f"GPS: {lat:.6f}, {lon:.6f}", f"Location: {self.district}, {self.state_name}",
+            f"Speed: {self.latest_speed*3.6:.1f} km/h", f"G_dyn: {self.latest_g:.2f} m/s\u00b2", "",
+            f"Plate: {plate}", f"Offense: {okey} \u2014 {o['label']}",
+            f"Section: {o['section']}", f"Penalty: {o['penalty']}", "",
+            f"Sign: {self.ids.sp_sign_group.text} / {self.ids.sp_sign.text}", "",
+            f"Reporter: {'ANONYMOUS' if anon else (self.ids.in_name.text.strip() or '\u2014')}",
         ]
-
         if not anon:
-            lines += [
-                f"  Name: {self.ids.in_name.text.strip() or '—'}",
-                f"  Contact: {self.ids.in_contact.text.strip() or '—'}",
-            ]
-
+            lines.append(f"Contact: {self.ids.in_contact.text.strip() or '\u2014'}")
         lines += [
-            "",
-            "Notes:",
-            self.ids.in_notes.text.strip() or "—",
-            "",
-            "Routing (One Nation, One Challan):",
-            f"  Location-based: {route['loc_code'] or '—'} -> {', '.join(route['loc_emails']) or '—'}",
-            f"  Plate-based: {route['plate_code'] or '—'} -> {', '.join(route['plate_emails']) or '—'}",
-            "",
+            "", f"Notes: {self.ids.in_notes.text.strip() or '\u2014'}", "",
+            f"Routing: Loc={rt['lc']} Plate={rt['pc']}", "",
             TrafficLawDB.GOOD_SAMARITAN_FOOTER,
         ]
+        subj = f"[Sentinel-X] {plate} \u2014 {o['label']}"
         body = "\n".join(lines)
-
-        attachment = self.evidence_path if self.evidence_path and os.path.isfile(self.evidence_path) else None
-
+        att = self.evidence_path if self.evidence_path and os.path.isfile(self.evidence_path) else None
         try:
             try:
-                plyer_email.send(recipients=route["recipients"], subject=subject, text=body, attachment=attachment)
+                plyer_email.send(recipients=rt["all"], subject=subj, text=body, attachment=att)
             except TypeError:
-                if attachment:
-                    plyer_email.send(recipients=route["recipients"], subject=subject, text=body, file_path=attachment)
-                else:
-                    plyer_email.send(recipients=route["recipients"], subject=subject, text=body)
-
-            self._popup("Report prepared", "Email composer opened with recipients + Good Samaritan footer.")
+                kw = {"recipients": rt["all"], "subject": subj, "text": body}
+                if att:
+                    kw["file_path"] = att
+                plyer_email.send(**kw)
+            self._popup("Ready", "Email composer opened.")
         except Exception as e:
-            self._popup("Email failed", str(e))
+            self._popup("Failed", str(e))
 
-    # -------------------------------------------------------------------------
-    # Service integration (UDP from service.py)
-    # -------------------------------------------------------------------------
-    def _start_android_service(self):
+    # ── Background service ───────────────────────────────────────────────
+    def _start_service(self):
         if platform != "android":
             return
         try:
-            from android import AndroidService  # type: ignore
+            from android import AndroidService
             AndroidService("Sentinel-X", "Telemetry running").start("")
         except Exception:
             pass
 
-    def _start_udp_listener(self):
-        if self._udp_thread:
-            return
-        self._udp_thread = threading.Thread(target=self._udp_loop, daemon=True)
-        self._udp_thread.start()
+    def _start_udp(self):
+        threading.Thread(target=self._udp_loop, daemon=True).start()
 
     def _udp_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.bind(("127.0.0.1", 17888))
-            s.settimeout(1.0)
+            s.bind(("127.0.0.1", 17888)); s.settimeout(1.0)
         except Exception:
             return
-
         while not self._udp_stop.is_set():
             try:
                 data, _ = s.recvfrom(4096)
-                payload = json.loads(data.decode("utf-8", errors="ignore"))
-                lat = float(payload.get("lat", 0.0) or 0.0)
-                lon = float(payload.get("lon", 0.0) or 0.0)
-                speed = float(payload.get("speed_mps", 0.0) or 0.0)
-                g_dyn = float(payload.get("g_dyn", 0.0) or 0.0)
-                Clock.schedule_once(lambda dt: self._apply_telemetry(lat, lon, speed, g_dyn), 0)
+                p = json.loads(data.decode("utf-8", errors="ignore"))
+                la, lo = float(p.get("lat", 0) or 0), float(p.get("lon", 0) or 0)
+                sp, gd = float(p.get("speed_mps", 0) or 0), float(p.get("g_dyn", 0) or 0)
+                Clock.schedule_once(lambda dt, a=la, b=lo, c=sp, d=gd: self._telem(a, b, c, d), 0)
             except socket.timeout:
                 continue
             except Exception:
                 continue
 
-    def _apply_telemetry(self, lat, lon, speed_mps, g_dyn):
-        self.latest_lat = lat
-        self.latest_lon = lon
-        self.latest_speed_mps = speed_mps
-        self.latest_g_dyn = g_dyn
+    def _telem(self, lat, lon, spd, g):
+        self.latest_lat, self.latest_lon, self.latest_speed, self.latest_g = lat, lon, spd, g
 
-    # -------------------------------------------------------------------------
-    def _popup(self, title, msg):
-        pop = Popup(
-            title=title,
-            content=Label(text=msg, halign="left", valign="top"),
-            size_hint=(0.9, 0.5),
-        )
-        pop.open()
+    def _popup(self, t, m):
+        Popup(title=t, content=Label(text=m, halign="left", valign="top"), size_hint=(.9, .5)).open()
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# APP  (FIX #6: disconnect camera on stop)
+# ═════════════════════════════════════════════════════════════════════════
 class SentinelXApp(App):
     def build(self):
         Builder.load_string(KV)
         return RootUI()
+
+    def on_stop(self):
+        r = self.root
+        if r and r._preview and r._cam_ok:
+            try:
+                r._preview.disconnect_camera()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

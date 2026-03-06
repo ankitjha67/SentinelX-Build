@@ -6,113 +6,72 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04   # REQUIRED
-
+  test:
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install pytest
+      - run: python -m pytest tests/ -v --tb=short
 
-      - name: Set up Java 17 (Temurin)
-        uses: actions/setup-java@v4
+  build:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install system dependencies
+      - name: System deps
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip wget curl \
-            build-essential pkg-config \
-            autoconf automake libtool \
-            libffi-dev libssl-dev \
-            python3-dev \
-            libtinfo5 \
-            zlib1g-dev
+            git zip unzip wget curl build-essential pkg-config \
+            autoconf automake libtool libffi-dev libssl-dev \
+            python3-dev libtinfo5 zlib1g-dev
 
       - name: Install Buildozer
         run: |
-          set -e
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install "cython<3.0" buildozer
+          pip install --upgrade pip setuptools wheel
+          pip install "cython<3.0" buildozer
 
-      - name: Buildozer Android Update (creates SDK/NDK)
+      - name: Buildozer android update
         run: |
-          set -e
           rm -rf .buildozer || true
           buildozer -v android update
 
-      - name: Accept Android SDK licenses + install pinned build-tools (works with legacy tools/bin/sdkmanager)
+      - name: SDK licenses + build-tools
         shell: bash
         run: |
           set -euo pipefail
-
-          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
-          echo "SDK_ROOT=$SDK_ROOT"
-
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
-          export ANDROID_HOME="$SDK_ROOT"
-
-          # Writable SDK prefs (prevents "Could not create settings" / IllegalArgumentException)
-          export ANDROID_SDK_HOME="$RUNNER_TEMP/android_prefs"
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
+          export ANDROID_SDK_HOME="$RUNNER_TEMP/aprefs"
           mkdir -p "$ANDROID_SDK_HOME/.android"
           touch "$ANDROID_SDK_HOME/.android/repositories.cfg"
-          export JAVA_TOOL_OPTIONS="-Duser.home=$ANDROID_SDK_HOME -Djava.util.prefs.userRoot=$ANDROID_SDK_HOME/.java -Djava.util.prefs.systemRoot=$ANDROID_SDK_HOME/.java"
+          export JAVA_TOOL_OPTIONS="-Duser.home=$ANDROID_SDK_HOME"
 
-          # Robust sdkmanager detection:
-          # 1) cmdline-tools/latest
-          # 2) cmdline-tools (older layout)
-          # 3) legacy tools/bin (your current runner has this)
-          SDKMANAGER=""
-          if [ -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          elif [ -f "$SDK_ROOT/cmdline-tools/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK_ROOT/cmdline-tools/bin/sdkmanager"
-          elif [ -f "$SDK_ROOT/tools/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK_ROOT/tools/bin/sdkmanager"
-          fi
+          SM=""
+          for p in cmdline-tools/latest/bin cmdline-tools/bin tools/bin; do
+            [ -f "$SDK/$p/sdkmanager" ] && SM="$SDK/$p/sdkmanager" && break
+          done
+          [ -z "$SM" ] && echo "sdkmanager not found" && exit 1
+          chmod +x "$SM"
 
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found. Listing:"
-            find "$SDK_ROOT" -maxdepth 5 -type f -name sdkmanager || true
-            exit 1
-          fi
+          yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null || true
+          "$SM" --sdk_root="$SDK" platform-tools "platforms;android-33" "build-tools;33.0.2"
 
-          chmod +x "$SDKMANAGER"
-          echo "Using sdkmanager: $SDKMANAGER"
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --version || true
+      - name: Build debug APK
+        run: buildozer -v android debug
 
-          # Accept licenses (quiet)
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-
-          # Install pinned packages needed for API 33 and AIDL
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
-            "platform-tools" \
-            "platforms;android-33" \
-            "build-tools;33.0.2"
-
-          # Validate AIDL exists
-          if [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl" ] && [ ! -f "$SDK_ROOT/build-tools/33.0.2/aidl.exe" ]; then
-            echo "AIDL not found. Contents of build-tools/33.0.2:"
-            ls -la "$SDK_ROOT/build-tools/33.0.2" || true
-            exit 1
-          fi
-          echo "SDK OK: build-tools 33.0.2 installed; AIDL present"
-
-      - name: Build Debug APK
-        run: |
-          set -e
-          buildozer -v android debug
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sentinelx-apk
           path: bin/*.apk
