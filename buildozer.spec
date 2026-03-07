@@ -5,13 +5,13 @@ package.domain = org.sentinelx
 source.dir = .
 source.include_exts = py,png,jpg,kv,json,txt,onnx
 
-version = 1.0.3
+version = 1.0.4
 orientation = portrait
 fullscreen = 0
 
 icon.filename = %(source.dir)s/icon.png
 
-requirements = python3,kivy,camera4kivy,gestures4kivy,plyer,numpy,android,opencv,reverse_geocode
+requirements = python3,kivy,camera4kivy,gestures4kivy,plyer,numpy,android,opencv,reverse_geocode,pyjnius
 
 services = service:service.py
 

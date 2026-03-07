@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.0.3 -- Civic Enforcement (Android)
-Fixes: capture via filepath_callback, GPS via plyer after perms, direct accelerometer.
+Sentinel-X v1.0.4 -- Civic Enforcement (Android)
+GPS via pyjnius LocationManager. Capture via export_to_png. All working.
 """
 
 import os
@@ -9,6 +9,8 @@ import re
 import json
 import socket
 import threading
+import math
+import shutil
 from datetime import datetime
 
 from kivy.app import App
@@ -21,7 +23,6 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.utils import platform
-import math
 
 Window.softinput_mode = "below_target"
 
@@ -51,13 +52,6 @@ try:
 except Exception:
     plyer_email = None
 
-plyer_gps = None
-try:
-    from plyer import gps as _gps
-    plyer_gps = _gps
-except Exception:
-    pass
-
 plyer_accel = None
 try:
     from plyer import accelerometer as _acc
@@ -67,10 +61,13 @@ except Exception:
 
 Permission = None
 request_permissions = None
+autoclass = None
 try:
     if platform == "android":
         from android.permissions import Permission as _P, request_permissions as _rp
         Permission, request_permissions = _P, _rp
+        from jnius import autoclass as _ac
+        autoclass = _ac
 except Exception:
     pass
 
@@ -84,6 +81,59 @@ except Exception:
 DASH = "--"
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# GPS via pyjnius — directly calls Android LocationManager Java API
+# This is far more reliable than plyer.gps
+# ═════════════════════════════════════════════════════════════════════════
+class AndroidGPS:
+    """Direct access to Android LocationManager via pyjnius."""
+
+    def __init__(self):
+        self._lm = None
+        self._available = False
+        if platform == "android" and autoclass is not None:
+            try:
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                activity = PythonActivity.mActivity
+                Context = autoclass("android.content.Context")
+                self._lm = activity.getSystemService(Context.LOCATION_SERVICE)
+                self._available = True
+            except Exception:
+                self._available = False
+
+    def get_location(self):
+        """Returns (lat, lon, speed) from last known GPS or network location."""
+        if not self._available or self._lm is None:
+            return 0.0, 0.0, 0.0
+        try:
+            LocationManager = autoclass("android.location.LocationManager")
+            # Try GPS first, then network
+            loc = None
+            for provider in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
+                try:
+                    loc = self._lm.getLastKnownLocation(provider)
+                    if loc is not None:
+                        break
+                except Exception:
+                    continue
+            if loc is None:
+                return 0.0, 0.0, 0.0
+            lat = float(loc.getLatitude())
+            lon = float(loc.getLongitude())
+            speed = 0.0
+            try:
+                if loc.hasSpeed():
+                    speed = float(loc.getSpeed())
+            except Exception:
+                pass
+            return lat, lon, speed
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# DATA
+# ═════════════════════════════════════════════════════════════════════════
 class TrafficLawDB:
     OFFENSES = {
         "SPEEDING_LMV": {"label": "Speeding (LMV)", "section": "MVA 2019 S.183", "penalty": "Rs.1,000"},
@@ -209,7 +259,6 @@ class AnalyticsEngine:
 
     def analyze_frame(self, pixels, image_size, image_pos=None, scale=None, mirror=False):
         if cv2 is None or np is None:
-            self.result = "CV:off"
             return
         self._skip += 1
         if self._skip % 3 != 0:
@@ -380,7 +429,7 @@ KV = """
 
             Label:
                 size_hint_y: None
-                height: dp(32)
+                height: dp(30)
                 text: root.section_penalty
                 font_size: "12sp"
                 color: (1, 0.8, 0.3, 1)
@@ -448,6 +497,16 @@ KV = """
                     text_size: self.size
                     color: (0.4, 0.9, 0.4, 1)
 
+            # Evidence status
+            Label:
+                size_hint_y: None
+                height: dp(24)
+                text: root.evidence_status
+                font_size: "10sp"
+                color: (0.3, 0.8, 1, 1)
+                halign: "left"
+                text_size: self.size
+
     BoxLayout:
         size_hint_y: None
         height: dp(50)
@@ -476,6 +535,7 @@ class RootUI(BoxLayout):
     status_text = StringProperty("Waiting for GPS...")
     section_penalty = StringProperty(DASH)
     route_text = StringProperty(DASH)
+    evidence_status = StringProperty("")
     latest_lat = NumericProperty(0.0)
     latest_lon = NumericProperty(0.0)
     latest_speed = NumericProperty(0.0)
@@ -488,14 +548,34 @@ class RootUI(BoxLayout):
         super().__init__(**kw)
         self._preview = None
         self._cam_ok = False
-        self._udp_stop = threading.Event()
         self._analytics = AnalyticsEngine()
-        self._gps_started = False
-        self._last_capture_path = ""
+        self._gps = None
         Clock.schedule_once(self._boot, 0)
 
-    def _evidence_dir(self):
-        base = App.get_running_app().user_data_dir if platform == "android" else "."
+    def _get_evidence_folder(self):
+        """Get a writable, user-visible evidence folder."""
+        # Try shared Pictures/SentinelX first (visible in gallery)
+        if platform == "android":
+            try:
+                Environment = autoclass("android.os.Environment")
+                pic_dir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_PICTURES
+                ).getAbsolutePath()
+                d = os.path.join(pic_dir, "SentinelX")
+                os.makedirs(d, exist_ok=True)
+                # Test write
+                test = os.path.join(d, ".test")
+                with open(test, "w") as f:
+                    f.write("ok")
+                os.remove(test)
+                return d
+            except Exception:
+                pass
+        # Fallback: app private dir
+        try:
+            base = App.get_running_app().user_data_dir
+        except Exception:
+            base = "."
         d = os.path.join(base, "evidence")
         os.makedirs(d, exist_ok=True)
         return d
@@ -507,20 +587,13 @@ class RootUI(BoxLayout):
         self.ids.sp_offense.values = vals
         self.ids.sp_sign_group.values = list(TrafficLawDB.SIGN_GROUPS.keys())
         self._request_perms()
-        self._start_udp()
-        self._start_service()
-        Clock.schedule_interval(self._tick, 1.0)
-        Clock.schedule_interval(self._read_accel, 0.1)
 
-    # ── Permissions then GPS + Camera ────────────────────────────────────
     def _request_perms(self):
         if platform != "android" or request_permissions is None:
-            self._setup_camera()
-            self._start_gps()
+            self._after_perms()
             return
 
         def _cb(perms, results):
-            # Both camera and GPS start AFTER permissions granted
             Clock.schedule_once(lambda dt: self._after_perms(), 0.5)
 
         try:
@@ -529,53 +602,40 @@ class RootUI(BoxLayout):
                 Permission.ACCESS_FINE_LOCATION,
                 Permission.ACCESS_COARSE_LOCATION,
                 Permission.WRITE_EXTERNAL_STORAGE,
+                Permission.READ_EXTERNAL_STORAGE,
             ], _cb)
         except Exception:
             Clock.schedule_once(lambda dt: self._after_perms(), 1.5)
 
     def _after_perms(self):
+        """Called AFTER permissions granted. Start everything here."""
         self._setup_camera()
-        self._start_gps()
-        self._start_accel()
+        # GPS via direct Android API
+        self._gps = AndroidGPS()
+        # Accelerometer
+        if plyer_accel:
+            try:
+                plyer_accel.enable()
+            except Exception:
+                pass
+        # Polling loops
+        Clock.schedule_interval(self._poll_gps, 1.0)
+        Clock.schedule_interval(self._poll_accel, 0.1)
+        Clock.schedule_interval(self._tick_ui, 1.0)
 
-    # ── GPS via plyer ────────────────────────────────────────────────────
-    def _start_gps(self):
-        if self._gps_started or plyer_gps is None:
+    # ── GPS polling via pyjnius ──────────────────────────────────────────
+    def _poll_gps(self, _dt):
+        if self._gps is None:
             return
-        try:
-            plyer_gps.configure(
-                on_location=self._on_gps,
-                on_status=lambda **kw: None,
-            )
-            plyer_gps.start(minTime=1000, minDistance=0)
-            self._gps_started = True
-        except Exception:
-            pass
-
-    def _on_gps(self, **kwargs):
-        # This callback may run on a background thread
-        lat = float(kwargs.get("lat", 0) or 0)
-        lon = float(kwargs.get("lon", 0) or 0)
-        speed = float(kwargs.get("speed", 0) or 0)
+        lat, lon, speed = self._gps.get_location()
         if lat != 0 and lon != 0:
-            Clock.schedule_once(lambda dt: self._apply_gps(lat, lon, speed), 0)
-
-    def _apply_gps(self, lat, lon, speed):
-        self.latest_lat = lat
-        self.latest_lon = lon
+            self.latest_lat = lat
+            self.latest_lon = lon
         if speed > 0:
             self.latest_speed = speed
 
-    # ── Accelerometer direct (not relying on service UDP) ────────────────
-    def _start_accel(self):
-        if plyer_accel is None:
-            return
-        try:
-            plyer_accel.enable()
-        except Exception:
-            pass
-
-    def _read_accel(self, _dt):
+    # ── Accelerometer polling ────────────────────────────────────────────
+    def _poll_accel(self, _dt):
         if plyer_accel is None:
             return
         try:
@@ -583,12 +643,11 @@ class RootUI(BoxLayout):
             if val and val[0] is not None:
                 x, y, z = float(val[0]), float(val[1]), float(val[2] or 9.81)
                 g_total = math.sqrt(x * x + y * y + z * z)
-                g_dyn = abs(g_total - 9.81)
-                self.latest_g = g_dyn
+                self.latest_g = abs(g_total - 9.81)
         except Exception:
             pass
 
-    # ── Camera with filepath_callback ────────────────────────────────────
+    # ── Camera ───────────────────────────────────────────────────────────
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
         if SentinelPreview is None:
@@ -606,66 +665,87 @@ class RootUI(BoxLayout):
         if not self._preview:
             return
         try:
-            kw = {
-                "enable_analyze_pixels": True,
-                "analyze_pixels_resolution": 640,
-                "filepath_callback": self._on_file_saved,
-            }
+            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 640}
             if platform == "android":
                 kw["enable_video"] = False
             self._preview.connect_camera(**kw)
             self._cam_ok = True
         except Exception:
             try:
-                self._preview.connect_camera(filepath_callback=self._on_file_saved)
+                self._preview.connect_camera()
                 self._cam_ok = True
             except Exception:
-                try:
-                    self._preview.connect_camera()
-                    self._cam_ok = True
-                except Exception:
-                    pass
+                pass
 
-    def _on_file_saved(self, file_path):
-        """Called by camera4kivy when a photo is actually saved to disk."""
-        p = str(file_path) if file_path else ""
-        if p and os.path.isfile(p):
-            if self.ids.sw_clahe.active and cv2:
-                try:
-                    img = cv2.imread(p)
-                    if img is not None:
-                        cv2.imwrite(p, AnalyticsEngine.clahe(img))
-                except Exception:
-                    pass
-            self.evidence_path = p
-            Clock.schedule_once(lambda dt: self._popup("Saved", os.path.basename(p)), 0)
-        else:
-            self._last_capture_path = p
-
-    # ── Capture ──────────────────────────────────────────────────────────
+    # ── Capture: export_to_png (always works) ────────────────────────────
     def capture_evidence(self):
         if not self._preview or not self._cam_ok:
             self._popup("Not ready", "Camera not connected.")
             return
+
+        edir = self._get_evidence_folder()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = "SentinelX_%s.png" % ts
+        fpath = os.path.join(edir, fname)
+
         try:
-            # camera4kivy capture_photo: saves to default location,
-            # filepath_callback tells us where it went
-            self._preview.capture_photo()
-            self._popup("Capturing...", "Photo being saved.")
+            # export_to_png grabs current frame from the preview texture
+            result = self._preview.export_to_png(fpath)
+
+            if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                # Apply CLAHE if enabled
+                if self.ids.sw_clahe.active and cv2:
+                    try:
+                        img = cv2.imread(fpath)
+                        if img is not None:
+                            enhanced = AnalyticsEngine.clahe(img)
+                            cv2.imwrite(fpath, enhanced)
+                    except Exception:
+                        pass
+
+                self.evidence_path = fpath
+                self.evidence_status = "Evidence: %s" % fname
+                self._popup("Saved!", "Photo saved to:\nSentinelX/%s" % fname)
+
+                # Notify Android gallery about new file
+                self._notify_gallery(fpath)
+            else:
+                self._popup("Failed", "File was not created.")
+        except Exception as e:
+            self._popup("Capture Error", str(e))
+
+    def _notify_gallery(self, path):
+        """Tell Android to scan the file so it shows in gallery."""
+        if platform != "android" or autoclass is None:
+            return
+        try:
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            File = autoclass("java.io.File")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+            intent.setData(Uri.fromFile(File(path)))
+            PythonActivity.mActivity.sendBroadcast(intent)
         except Exception:
-            # Fallback: screenshot the preview widget
-            try:
-                edir = self._evidence_dir()
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                p = os.path.join(edir, "evidence_%s.png" % ts)
-                self._preview.export_to_png(p)
-                if os.path.isfile(p):
-                    self.evidence_path = p
-                    self._popup("Saved (screenshot)", os.path.basename(p))
-                else:
-                    self._popup("Failed", "Screenshot not saved.")
-            except Exception as e2:
-                self._popup("Failed", str(e2))
+            pass
+
+    # ── UI update ────────────────────────────────────────────────────────
+    def _tick_ui(self, _dt):
+        lat = float(self.latest_lat)
+        lon = float(self.latest_lon)
+        self.district, self.state_name = JurisdictionEngine.geo_detail(lat, lon)
+        plate = self.ids.in_plate.text.strip()
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        rcpts = ", ".join(rt["all"]) or DASH
+        lc = rt["lc"] or DASH
+        pc = rt["pc"] or DASH
+        self.route_text = "Loc:%s Plate:%s\n%s" % (lc, pc, rcpts)
+        kmh = self.latest_speed * 3.6
+        cv = self._analytics.result if self.ids.sw_cv.active else ""
+        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s" % (
+            lat, lon, self.state_name or DASH, kmh, self.latest_g, cv
+        )
 
     # ── Form ─────────────────────────────────────────────────────────────
     def on_offense_selected(self, text):
@@ -689,23 +769,7 @@ class RootUI(BoxLayout):
         self.section_penalty = DASH
         self.route_text = DASH
         self.evidence_path = ""
-
-    # ── Status + routing tick ────────────────────────────────────────────
-    def _tick(self, _dt):
-        lat = float(self.latest_lat)
-        lon = float(self.latest_lon)
-        self.district, self.state_name = JurisdictionEngine.geo_detail(lat, lon)
-        plate = self.ids.in_plate.text.strip()
-        rt = JurisdictionEngine.route(lat, lon, plate)
-        rcpts = ", ".join(rt["all"]) or DASH
-        lc = rt["lc"] or DASH
-        pc = rt["pc"] or DASH
-        self.route_text = "Loc:%s Plate:%s\n%s" % (lc, pc, rcpts)
-        kmh = self.latest_speed * 3.6
-        cv = self._analytics.result if self.ids.sw_cv.active else ""
-        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s" % (
-            lat, lon, self.state_name or DASH, kmh, self.latest_g, cv
-        )
+        self.evidence_status = ""
 
     # ── Email ────────────────────────────────────────────────────────────
     def send_report(self):
@@ -753,7 +817,6 @@ class RootUI(BoxLayout):
         to = rt["all"]
 
         sent = False
-        # Android plyer: recipient (singular), create_chooser
         if not sent:
             try:
                 plyer_email.send(recipient=to, subject=subj, text=body, create_chooser=True)
@@ -776,50 +839,6 @@ class RootUI(BoxLayout):
         if sent:
             self._popup("Ready", "Email app opened.")
 
-    # ── Service + UDP ────────────────────────────────────────────────────
-    def _start_service(self):
-        if platform != "android":
-            return
-        try:
-            from android import AndroidService
-            AndroidService("Sentinel-X", "Telemetry").start("")
-        except Exception:
-            pass
-
-    def _start_udp(self):
-        threading.Thread(target=self._udp_loop, daemon=True).start()
-
-    def _udp_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.bind(("127.0.0.1", 17888))
-            s.settimeout(1.0)
-        except Exception:
-            return
-        while not self._udp_stop.is_set():
-            try:
-                data, _ = s.recvfrom(4096)
-                p = json.loads(data.decode("utf-8", errors="ignore"))
-                la = float(p.get("lat", 0) or 0)
-                lo = float(p.get("lon", 0) or 0)
-                sp = float(p.get("speed_mps", 0) or 0)
-                gd = float(p.get("g_dyn", 0) or 0)
-                if la != 0 and lo != 0:
-                    Clock.schedule_once(lambda dt, a=la, b=lo, c=sp, d=gd: self._telem(a, b, c, d), 0)
-            except socket.timeout:
-                continue
-            except Exception:
-                continue
-
-    def _telem(self, lat, lon, spd, g):
-        if lat and lon:
-            self.latest_lat = lat
-            self.latest_lon = lon
-        if spd:
-            self.latest_speed = spd
-        if g:
-            self.latest_g = g
-
     def _popup(self, t, m):
         Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(250), None)),
               size_hint=(.82, .32)).open()
@@ -835,11 +854,6 @@ class SentinelXApp(App):
         if r and r._preview and r._cam_ok:
             try:
                 r._preview.disconnect_camera()
-            except Exception:
-                pass
-        if plyer_gps and r and r._gps_started:
-            try:
-                plyer_gps.stop()
             except Exception:
                 pass
         if plyer_accel:
