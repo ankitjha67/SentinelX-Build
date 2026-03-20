@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.0.4 -- Civic Enforcement (Android)
-GPS via pyjnius LocationManager. Capture via export_to_png. All working.
+Sentinel-X v1.1.0 -- Civic Enforcement (Android)
+Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
 """
 
 import os
@@ -9,8 +9,10 @@ import re
 import json
 import socket
 import threading
+import time
 import math
 import shutil
+import collections
 from datetime import datetime
 
 from kivy.app import App
@@ -285,13 +287,312 @@ class AnalyticsEngine:
             self.result = "CV:err"
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 1 — Memory-bounded ring buffer
+# ═════════════════════════════════════════════════════════════════════════
+class FrameRingBuffer:
+    """Thread-safe fixed-capacity ring buffer for camera frames.
+
+    Prevents OOM by dropping oldest frames when full.
+    """
+
+    def __init__(self, max_frames=30):
+        self._buf = collections.deque(maxlen=max_frames)
+        self._lock = threading.Lock()
+        self._dropped = 0
+
+    def push(self, timestamp, pixels, image_size):
+        with self._lock:
+            if len(self._buf) == self._buf.maxlen:
+                self._dropped += 1
+            self._buf.append((timestamp, pixels, image_size))
+
+    def pop(self):
+        with self._lock:
+            if self._buf:
+                return self._buf.popleft()
+            return None
+
+    def latest(self):
+        with self._lock:
+            if self._buf:
+                return self._buf[-1]
+            return None
+
+    @property
+    def dropped_count(self):
+        return self._dropped
+
+    def __len__(self):
+        with self._lock:
+            return len(self._buf)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 1 — Threaded frame analysis worker
+# ═════════════════════════════════════════════════════════════════════════
+class FrameAnalysisWorker:
+    """Daemon thread that pops frames from a FrameRingBuffer and analyzes.
+
+    Skips to the latest frame when falling behind (load-shedding).
+    """
+
+    def __init__(self, frame_buffer, analytics):
+        self._buffer = frame_buffer
+        self._analytics = analytics
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _run(self):
+        while self._running:
+            frame = self._buffer.pop()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            # Skip to latest if behind
+            latest = self._buffer.latest()
+            if latest is not None:
+                frame = latest
+                # Drain intermediate frames
+                while self._buffer.pop() is not None:
+                    pass
+            _ts, pixels, image_size = frame
+            try:
+                self._analytics.analyze_frame(pixels, image_size)
+            except Exception:
+                pass
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 1 — Camera crash recovery watchdog
+# ═════════════════════════════════════════════════════════════════════════
+class CameraWatchdog:
+    """Detects camera stalls and reconnects with exponential backoff."""
+
+    def __init__(self, reconnect_cb):
+        self._last_frame_ts = time.time()
+        self._reconnect_cb = reconnect_cb
+        self._backoff = 2.0
+        self._max_backoff = 30.0
+        self._reconnecting = False
+        self._check_event = None
+
+    def start(self):
+        self._check_event = Clock.schedule_interval(self._check, 3.0)
+
+    def stop(self):
+        if self._check_event:
+            self._check_event.cancel()
+            self._check_event = None
+
+    def frame_received(self):
+        self._last_frame_ts = time.time()
+        if self._reconnecting:
+            self._reconnecting = False
+            self._backoff = 2.0
+
+    def _check(self, _dt):
+        if self._reconnecting:
+            return
+        elapsed = time.time() - self._last_frame_ts
+        if elapsed > 5.0:
+            self._reconnecting = True
+            Clock.schedule_once(lambda dt: self._do_reconnect(), self._backoff)
+            self._backoff = min(self._backoff * 2, self._max_backoff)
+
+    def _do_reconnect(self):
+        try:
+            self._reconnect_cb()
+        except Exception:
+            pass
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 1 — Dashcam-style continuous recorder
+# ═════════════════════════════════════════════════════════════════════════
+class DashcamRecorder:
+    """Saves JPEG frames in time-stamped segment directories.
+
+    Maintains a ring of N segments and auto-deletes the oldest.
+    """
+
+    SEGMENT_DURATION = 120   # seconds per segment
+    MAX_SEGMENTS = 5         # keep at most 5 segments (~10 min)
+    FRAME_INTERVAL = 1.0     # save 1 frame per second
+
+    def __init__(self, frame_buffer, base_dir):
+        self._buffer = frame_buffer
+        self._base_dir = base_dir
+        self._running = False
+        self._thread = None
+        self._current_segment_dir = None
+        self._segment_start = 0
+        self._last_save_ts = 0
+        self._recording = False
+        self._frame_count = 0
+
+    def start(self):
+        self._running = True
+        self._recording = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._recording = False
+        if self._thread:
+            self._thread.join(timeout=3.0)
+
+    @property
+    def recording(self):
+        return self._recording
+
+    @recording.setter
+    def recording(self, val):
+        self._recording = bool(val)
+
+    @property
+    def frame_count(self):
+        return self._frame_count
+
+    def _run(self):
+        while self._running:
+            if not self._recording:
+                time.sleep(0.5)
+                continue
+            frame = self._buffer.latest()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            now = time.time()
+            if now - self._last_save_ts < self.FRAME_INTERVAL:
+                time.sleep(0.05)
+                continue
+            # Rotate segment if needed
+            if (self._current_segment_dir is None or
+                    now - self._segment_start >= self.SEGMENT_DURATION):
+                self._new_segment()
+            self._save_frame(frame)
+            self._last_save_ts = now
+
+    def _new_segment(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dashcam_dir = os.path.join(self._base_dir, "dashcam")
+        seg_dir = os.path.join(dashcam_dir, "seg_%s" % ts)
+        os.makedirs(seg_dir, exist_ok=True)
+        self._current_segment_dir = seg_dir
+        self._segment_start = time.time()
+        self._prune_old_segments()
+
+    def _prune_old_segments(self):
+        dashcam_dir = os.path.join(self._base_dir, "dashcam")
+        try:
+            segments = sorted(os.listdir(dashcam_dir))
+            while len(segments) > self.MAX_SEGMENTS:
+                oldest = segments.pop(0)
+                shutil.rmtree(
+                    os.path.join(dashcam_dir, oldest), ignore_errors=True
+                )
+        except Exception:
+            pass
+
+    def _save_frame(self, frame):
+        if cv2 is None or np is None:
+            return
+        try:
+            _ts, pixels, image_size = frame
+            w, h = image_size
+            arr = np.frombuffer(pixels, dtype=np.uint8).reshape((h, w, 4))
+            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            fname = "f_%s.jpg" % datetime.now().strftime("%H%M%S_%f")
+            fpath = os.path.join(self._current_segment_dir, fname)
+            cv2.imencode(
+                ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70]
+            )[1].tofile(fpath)
+            self._frame_count += 1
+        except Exception:
+            pass
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 1 — Telemetry receiver (consume service.py UDP broadcasts)
+# ═════════════════════════════════════════════════════════════════════════
+class TelemetryReceiver:
+    """Listens on UDP for telemetry packets from the background service."""
+
+    def __init__(self, host="0.0.0.0", port=17888):
+        self._host = host
+        self._port = port
+        self._sock = None
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self._latest = {}
+
+    def start(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((self._host, self._port))
+            self._sock.settimeout(1.0)
+        except Exception:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _run(self):
+        while self._running:
+            try:
+                data, _addr = self._sock.recvfrom(4096)
+                pkt = json.loads(data.decode("utf-8"))
+                with self._lock:
+                    self._latest = pkt
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+    @property
+    def latest(self):
+        with self._lock:
+            return dict(self._latest)
+
+
 SentinelPreview = None
 if Preview is not None:
     class _SentinelPreview(Preview):
         _analytics = None
+        _frame_buffer = None
+        _watchdog = None
+
         def analyze_pixels_callback(self, pixels, image_size, image_pos, scale, mirror):
-            if self._analytics:
-                self._analytics.analyze_frame(pixels, image_size, image_pos, scale, mirror)
+            if self._watchdog:
+                self._watchdog.frame_received()
+            if self._frame_buffer:
+                self._frame_buffer.push(time.time(), bytes(pixels), image_size)
+            elif self._analytics:
+                self._analytics.analyze_frame(pixels, image_size)
     SentinelPreview = _SentinelPreview
 
 
@@ -550,6 +851,11 @@ class RootUI(BoxLayout):
         self._cam_ok = False
         self._analytics = AnalyticsEngine()
         self._gps = None
+        self._frame_buffer = None
+        self._analysis_worker = None
+        self._watchdog = None
+        self._dashcam = None
+        self._telemetry = None
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -618,13 +924,46 @@ class RootUI(BoxLayout):
                 plyer_accel.enable()
             except Exception:
                 pass
+        # Phase 1: Frame buffer + threaded analysis
+        self._frame_buffer = FrameRingBuffer(max_frames=30)
+        self._analysis_worker = FrameAnalysisWorker(
+            self._frame_buffer, self._analytics
+        )
+        if self._preview:
+            self._preview._frame_buffer = self._frame_buffer
+        self._analysis_worker.start()
+        # Phase 1: Dashcam recorder
+        edir = self._get_evidence_folder()
+        self._dashcam = DashcamRecorder(self._frame_buffer, edir)
+        self._dashcam.start()
+        # Phase 1: Telemetry receiver (service.py UDP)
+        self._telemetry = TelemetryReceiver()
+        self._telemetry.start()
+        # Phase 1: Start background service on Android
+        if platform == "android" and autoclass is not None:
+            try:
+                svc = autoclass("org.sentinelx.ServiceService")
+                mActivity = autoclass(
+                    "org.kivy.android.PythonActivity"
+                ).mActivity
+                svc.start(mActivity, "")
+            except Exception:
+                pass
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
 
-    # ── GPS polling via pyjnius ──────────────────────────────────────────
+    # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
+        t = self._telemetry.latest if self._telemetry else {}
+        if t.get("lat", 0) != 0 and t.get("lon", 0) != 0:
+            self.latest_lat = t["lat"]
+            self.latest_lon = t["lon"]
+            if t.get("speed_mps", 0) > 0:
+                self.latest_speed = t["speed_mps"]
+            return
+        # Fallback to direct GPS
         if self._gps is None:
             return
         lat, lon, speed = self._gps.get_location()
@@ -634,8 +973,13 @@ class RootUI(BoxLayout):
         if speed > 0:
             self.latest_speed = speed
 
-    # ── Accelerometer polling ────────────────────────────────────────────
+    # ── Accelerometer polling (prefer service telemetry) ──────────────
     def _poll_accel(self, _dt):
+        t = self._telemetry.latest if self._telemetry else {}
+        if "g_dyn" in t:
+            self.latest_g = t["g_dyn"]
+            return
+        # Fallback to direct plyer
         if plyer_accel is None:
             return
         try:
@@ -676,6 +1020,23 @@ class RootUI(BoxLayout):
                 self._cam_ok = True
             except Exception:
                 pass
+        # Phase 1: Start watchdog after camera connects
+        if self._cam_ok:
+            if self._watchdog:
+                self._watchdog.stop()
+            self._watchdog = CameraWatchdog(self._reconnect_camera)
+            self._preview._watchdog = self._watchdog
+            self._watchdog.start()
+
+    def _reconnect_camera(self):
+        """Called by CameraWatchdog to recover from stalls."""
+        if not self._preview:
+            return
+        try:
+            self._preview.disconnect_camera()
+        except Exception:
+            pass
+        Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
 
     # ── Capture: export_to_png (always works) ────────────────────────────
     def capture_evidence(self):
@@ -851,11 +1212,33 @@ class SentinelXApp(App):
 
     def on_stop(self):
         r = self.root
-        if r and r._preview and r._cam_ok:
-            try:
-                r._preview.disconnect_camera()
-            except Exception:
-                pass
+        if r:
+            # Phase 1: Stop subsystems
+            if r._watchdog:
+                try:
+                    r._watchdog.stop()
+                except Exception:
+                    pass
+            if r._analysis_worker:
+                try:
+                    r._analysis_worker.stop()
+                except Exception:
+                    pass
+            if r._dashcam:
+                try:
+                    r._dashcam.stop()
+                except Exception:
+                    pass
+            if r._telemetry:
+                try:
+                    r._telemetry.stop()
+                except Exception:
+                    pass
+            if r._preview and r._cam_ok:
+                try:
+                    r._preview.disconnect_camera()
+                except Exception:
+                    pass
         if plyer_accel:
             try:
                 plyer_accel.disable()
