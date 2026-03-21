@@ -10,9 +10,13 @@ AI-powered traffic violation reporting app for Android. Captures evidence, detec
 ## Features
 
 - **Camera** — Live preview via CameraX, photo capture with evidence timestamping
+- **Dashcam Recording** — Continuous JPEG capture in 2-minute segments with auto-pruning (ring buffer keeps ~10 min)
+- **Camera Crash Recovery** — Watchdog detects stalls >5s and reconnects with exponential backoff
 - **Night Vision** — CLAHE enhancement for low-light/fog number plate visibility
-- **CV Assist** — Real-time contour detection for plate-like regions (worker thread)
+- **CV Assist** — Real-time contour detection for plate-like regions (dedicated worker thread with load-shedding)
 - **Harsh Braking** — Background 10Hz accelerometer monitoring (G_dyn > 4.0 m/s² threshold)
+- **Service Telemetry** — Main app consumes GPS/accelerometer from background service via UDP (port 17888)
+- **Memory Safety** — Bounded frame ring buffer (30 frames max) prevents OOM on continuous use
 - **Dual Routing** — Reports sent to BOTH location-based AND plate-based police authorities
 - **Offline Geocoding** — GPS to state/district without internet
 - **Good Samaritan** — Anonymous reporting with §134A legal protection in every email
@@ -51,7 +55,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-All 69 tests must pass before building.
+All 97 tests must pass before building.
 
 ### Step 3: Install Buildozer
 
@@ -129,19 +133,50 @@ If you don't want to install anything locally:
 SentinelX/
 ├── camerax_provider/          ← Android CameraX bindings (cloned by setup.sh)
 │   └── gradle_options.py      ← p4a hook — camera won't work without this
-├── main.py                    ← App (all 7 fixes applied)
-├── service.py                 ← Background GPS + accelerometer service
+├── main.py                    ← App (Phase 1: continuous recording + crash recovery)
+├── service.py                 ← Background GPS + accelerometer service (UDP broadcast)
 ├── buildozer.spec             ← Android build config
 ├── setup.sh                   ← One-time setup script
 ├── tests/
 │   ├── conftest.py
-│   └── test_sentinelx.py      ← 69 unit tests
+│   └── test_sentinelx.py      ← 97 unit tests
 ├── .github/workflows/
 │   └── build.yml              ← CI: test → build APK
 ├── .gitignore
 ├── models/                    ← Drop a detector.onnx here (optional)
 └── evidence/                  ← Captured photos (auto-created, gitignored)
 ```
+
+---
+
+## Architecture — Phase 1 Subsystems
+
+```
+Camera Frame Flow:
+  camera4kivy ──► analyze_pixels_callback ──► FrameRingBuffer (30 frames max)
+                         │                         │              │
+                   watchdog.frame_received()       │              │
+                                          FrameAnalysisWorker   DashcamRecorder
+                                          (daemon thread)       (daemon thread)
+                                          pops & analyzes       peeks & saves JPEG
+                                          skips if behind       1 FPS, 2-min segments
+
+Telemetry Flow:
+  service.py (background) ──UDP:17888──► TelemetryReceiver ──► _poll_gps / _poll_accel
+                                         (daemon thread)       (prefer telemetry,
+                                                                fallback to direct sensors)
+
+Crash Recovery:
+  CameraWatchdog ──(no frame >5s)──► disconnect + reconnect (2s, 4s, 8s, 16s, 30s backoff)
+```
+
+| Subsystem | Class | Thread | Purpose |
+|-----------|-------|--------|---------|
+| Frame Buffer | `FrameRingBuffer` | shared | Bounded deque, prevents OOM |
+| Analysis | `FrameAnalysisWorker` | daemon | CV processing off main thread |
+| Watchdog | `CameraWatchdog` | Kivy Clock | Detects camera stalls, auto-reconnects |
+| Recording | `DashcamRecorder` | daemon | Continuous JPEG segments, auto-prune |
+| Telemetry | `TelemetryReceiver` | daemon | Consumes service.py UDP broadcasts |
 
 ---
 
