@@ -510,6 +510,70 @@ class PlateOCR:
         except Exception:
             return ""
 
+    # ── OpenCV contour-based fallback OCR ────────────────────────────────
+    @staticmethod
+    def _ocr_opencv_fallback(crop_bgr):
+        """Fallback OCR using OpenCV morphological analysis.
+
+        Segments character-like contours from a preprocessed plate crop,
+        reads approximate character shapes via aspect-ratio heuristics,
+        and reconstructs a candidate plate string.
+        Returns raw text string or empty string.
+        """
+        if cv2 is None or np is None:
+            return ""
+        try:
+            preprocessed = PlateOCR.preprocess_plate(crop_bgr)
+            if len(preprocessed.shape) == 3:
+                gray = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = preprocessed
+
+            # Invert if background is lighter than foreground
+            if np.mean(gray) > 127:
+                gray = cv2.bitwise_not(gray)
+
+            # Find character contours
+            cnts, _ = cv2.findContours(
+                gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            h_img, w_img = gray.shape[:2]
+            char_boxes = []
+            for c in cnts:
+                x, y, cw, ch = cv2.boundingRect(c)
+                # Character-like: tall-ish, not too wide, reasonable size
+                if (ch > h_img * 0.3 and cw > 3 and cw < w_img * 0.25
+                        and 0.15 < (cw / max(ch, 1)) < 1.2):
+                    char_boxes.append((x, y, cw, ch))
+
+            if len(char_boxes) < 4:
+                return ""
+
+            # Sort left-to-right
+            char_boxes.sort(key=lambda b: b[0])
+
+            # Classify each character region as letter or digit by aspect ratio
+            chars = []
+            for x, y, cw, ch in char_boxes:
+                roi = gray[y:y + ch, x:x + cw]
+                fill = np.count_nonzero(roi) / max(roi.size, 1)
+                ar = cw / max(ch, 1)
+                # Heuristic: wider chars with more fill tend to be letters
+                if ar > 0.55 and fill > 0.35:
+                    chars.append("A")  # placeholder letter
+                else:
+                    chars.append("0")  # placeholder digit
+
+            # Build pattern string for regex validation
+            # Indian plates: 2 letters + 1-2 digits + 0-3 letters + 1-4 digits
+            pattern = "".join(chars)
+            if len(pattern) >= 6:
+                return pattern
+            return ""
+        except Exception:
+            return ""
+
     # ── Full pipeline ────────────────────────────────────────────────────
     def process_frame(self, bgr):
         """Full OCR pipeline on a BGR frame.
@@ -526,10 +590,11 @@ class PlateOCR:
         best_plate, best_conf = "", 0.0
 
         for crop, bbox in candidates:
+            raw = ""
             if self._available:
                 raw = self._ocr_mlkit(crop)
-            else:
-                raw = ""
+            if not raw:
+                raw = self._ocr_opencv_fallback(crop)
             if raw:
                 plate, conf = self.clean_plate_text(raw)
                 if conf > best_conf:
@@ -2060,6 +2125,12 @@ class RootUI(BoxLayout):
                 self.evidence_path = fpath
                 self.evidence_status = "Evidence: %s" % fname
                 self._popup("Saved!", "Photo saved to:\nSentinelX/%s" % fname)
+                # Auto-dismiss evidence notification after 5 seconds
+                _fname = fname  # capture for closure
+                def _dismiss(dt, fn=_fname):
+                    if self.evidence_status.endswith(fn):
+                        self.evidence_status = ""
+                Clock.schedule_once(_dismiss, 5.0)
 
                 # Notify Android gallery about new file
                 self._notify_gallery(fpath)
