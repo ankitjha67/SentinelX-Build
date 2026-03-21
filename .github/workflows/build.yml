@@ -2,9 +2,6 @@ name: build
 
 on:
   push:
-    branches: ["main", "claude/*"]
-  pull_request:
-    branches: ["main"]
   workflow_dispatch: {}
 
 jobs:
@@ -78,6 +75,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: sentinelx-apk
+          name: sentinelx-apk-${{ github.sha }}
           path: bin/*.apk
           retention-days: 30
