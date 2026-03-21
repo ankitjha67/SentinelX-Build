@@ -502,7 +502,8 @@ class PlateOCR:
             bitmap.copyPixelsFromBuffer(buf)
 
             image = InputImage.fromBitmap(bitmap, 0)
-            result = Tasks.await(self._recognizer.process(image))
+            tasks_await = getattr(Tasks, "await")
+            result = tasks_await(self._recognizer.process(image))
             raw = result.getText() if result else ""
             bitmap.recycle()
             return raw
