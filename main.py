@@ -24,12 +24,15 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
-from kivy.metrics import dp
-from kivy.properties import StringProperty, NumericProperty
+from kivy.metrics import dp, sp
+from kivy.properties import StringProperty, NumericProperty, ColorProperty
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
+from kivy.uix.modalview import ModalView
 from kivy.utils import platform
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Line
 
 Window.softinput_mode = "below_target"
 
@@ -1306,261 +1309,459 @@ if Preview is not None:
 
 KV = """
 #:import dp kivy.metrics.dp
+#:import sp kivy.metrics.sp
+#:import C kivy.utils.get_color_from_hex
 
+# ─── Color Palette ───────────────────────────────────────────────────────
+# bg_primary:     #0B0E17   deep space navy
+# bg_card:        #141929   card surfaces
+# bg_card_alt:    #1A2035   elevated card
+# accent_cyan:    #00E5FF   primary accent
+# accent_green:   #00E676   success / send
+# accent_amber:   #FFD740   warning / penalty
+# accent_red:     #FF5252   error / alert
+# text_primary:   #E8EAF0   main text
+# text_secondary: #8892A8   muted text
+# border:         #253050   subtle borders
+
+# ─── Reusable Card Widget ────────────────────────────────────────────────
+<Card@BoxLayout>:
+    orientation: "vertical"
+    size_hint_y: None
+    padding: dp(12), dp(8)
+    spacing: dp(4)
+    canvas.before:
+        Color:
+            rgba: C("#141929")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: C("#253050")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(12))
+            width: 0.8
+
+# ─── Styled Toggle Row ──────────────────────────────────────────────────
+<ToggleRow@BoxLayout>:
+    size_hint_y: None
+    height: dp(36)
+    padding: dp(4), 0
+
+# ─── Section Header Label ───────────────────────────────────────────────
+<SectionLabel@Label>:
+    size_hint_y: None
+    height: dp(22)
+    font_size: "11sp"
+    bold: True
+    color: C("#00E5FF")
+    halign: "left"
+    valign: "middle"
+    text_size: self.size
+
+# ─── Styled Text Input ──────────────────────────────────────────────────
+<StyledInput@TextInput>:
+    background_color: (0, 0, 0, 0)
+    foreground_color: C("#E8EAF0")
+    cursor_color: C("#00E5FF")
+    hint_text_color: (0.45, 0.5, 0.6, 0.7)
+    padding: [dp(10), dp(8)]
+    canvas.before:
+        Color:
+            rgba: C("#1A2035")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+        Color:
+            rgba: C("#253050") if not self.focus else C("#00E5FF")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(8))
+            width: 1.2 if self.focus else 0.7
+
+# ─── Styled Spinner ─────────────────────────────────────────────────────
+<StyledSpinner@Spinner>:
+    background_color: (0, 0, 0, 0)
+    color: C("#E8EAF0")
+    option_cls: "SpinnerOption"
+    canvas.before:
+        Color:
+            rgba: C("#1A2035")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+        Color:
+            rgba: C("#253050")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(8))
+            width: 0.7
+
+# ─── Action Button ──────────────────────────────────────────────────────
+<ActionBtn@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: (0, 0, 0, 0)
+    color: C("#E8EAF0")
+    bold: True
+    font_size: "14sp"
+    size_hint_y: None
+    height: dp(48)
+    _bg: [0.2, 0.6, 0.9, 1]
+    canvas.before:
+        Color:
+            rgba: self._bg if self.state == "normal" else [self._bg[0]*0.7, self._bg[1]*0.7, self._bg[2]*0.7, 1]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(10)]
+
+# ═════════════════════════════════════════════════════════════════════════
+# ROOT LAYOUT
+# ═════════════════════════════════════════════════════════════════════════
 <RootUI>:
     orientation: "vertical"
-    padding: dp(10)
-    spacing: dp(4)
+    padding: 0
+    spacing: 0
+    canvas.before:
+        Color:
+            rgba: C("#0B0E17")
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
-    Label:
-        text: "Sentinel-X"
-        size_hint_y: None
-        height: dp(36)
-        bold: True
-        font_size: "20sp"
-
+    # ── Header Bar ───────────────────────────────────────────────────────
     BoxLayout:
-        id: camera_box
         size_hint_y: None
-        height: dp(220)
+        height: dp(48)
+        padding: dp(14), dp(8)
         canvas.before:
             Color:
-                rgba: (0.05, 0.05, 0.07, 1)
+                rgba: C("#0D1120")
             Rectangle:
                 pos: self.pos
                 size: self.size
+            # Bottom accent line
+            Color:
+                rgba: C("#00E5FF")
+            Rectangle:
+                pos: self.pos
+                size: (self.width, dp(1.5))
+        Label:
+            text: "SENTINEL-X"
+            font_size: "18sp"
+            bold: True
+            color: C("#00E5FF")
+            halign: "left"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.6
+        Label:
+            text: "v1.5"
+            font_size: "11sp"
+            color: C("#4A5270")
+            halign: "right"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.4
 
-    Label:
+    # ── Camera Viewport ──────────────────────────────────────────────────
+    BoxLayout:
+        id: camera_box
         size_hint_y: None
-        height: dp(28)
-        text: root.status_text
-        font_size: "10sp"
-        color: (0.5, 0.8, 1, 1)
-        halign: "left"
-        text_size: self.size
+        height: dp(210)
+        padding: dp(10), dp(6)
+        canvas.before:
+            Color:
+                rgba: C("#050810")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+            # Subtle inner border
+            Color:
+                rgba: C("#1A2035")
+            Line:
+                rectangle: (self.x + dp(9), self.y + dp(5), self.width - dp(18), self.height - dp(10))
+                width: 0.8
 
+    # ── Telemetry Strip ──────────────────────────────────────────────────
+    BoxLayout:
+        size_hint_y: None
+        height: dp(38)
+        padding: dp(12), dp(2)
+        canvas.before:
+            Color:
+                rgba: C("#0D1120")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: root.status_text
+            font_size: "9sp"
+            color: C("#5A8CC8")
+            halign: "left"
+            valign: "middle"
+            text_size: self.size
+            markup: True
+
+    # ── Scrollable Content ───────────────────────────────────────────────
     ScrollView:
         do_scroll_x: False
+        bar_color: C("#00E5FF")
+        bar_inactive_color: C("#253050")
+        bar_width: dp(3)
+
         BoxLayout:
             orientation: "vertical"
             size_hint_y: None
             height: self.minimum_height
-            spacing: dp(2)
+            padding: dp(10), dp(6)
+            spacing: dp(8)
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+            # ── OCR Detection Card ───────────────────────────────────────
+            Card:
+                height: dp(34) if not root.ocr_suggest_text else dp(50)
                 Label:
-                    text: "Anonymous"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    id: lbl_ocr_suggest
+                    size_hint_y: None
+                    height: dp(16) if not root.ocr_suggest_text else dp(32)
+                    text: root.ocr_suggest_text if root.ocr_suggest_text else "Plate OCR: standby"
+                    font_size: "11sp"
+                    color: C("#00E676") if root.ocr_suggest_text else C("#4A5270")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_anon
-                    active: True
-                    size_hint_x: 0.5
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+            # ── Settings Card ────────────────────────────────────────────
+            Card:
+                height: dp(178)
+
+                SectionLabel:
+                    text: "SETTINGS"
+
+                ToggleRow:
+                    Label:
+                        text: "Anonymous Reporter"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_anon
+                        active: True
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "CLAHE Night Mode"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_clahe
+                        active: False
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "CV Assist"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_cv
+                        active: True
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "Plate OCR"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_ocr
+                        active: True
+                        size_hint_x: 0.35
+
+            # ── Report Form Card ─────────────────────────────────────────
+            Card:
+                height: dp(310)
+
+                SectionLabel:
+                    text: "VIOLATION REPORT"
+
+                # Plate input
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
+                    Label:
+                        text: "Plate"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        bold: True
+                        color: C("#00E5FF")
+                        halign: "left"
+                        text_size: self.size
+                    StyledInput:
+                        id: in_plate
+                        size_hint_x: 0.82
+                        multiline: False
+                        hint_text: "MH12AB1234"
+                        font_size: "15sp"
+
+                # Offense spinner
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
+                    Label:
+                        text: "Offense"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        bold: True
+                        color: C("#00E5FF")
+                        halign: "left"
+                        text_size: self.size
+                    StyledSpinner:
+                        id: sp_offense
+                        size_hint_x: 0.82
+                        text: "Select violation..."
+                        values: []
+                        font_size: "12sp"
+                        on_text: root.on_offense_selected(self.text)
+
+                # Section + Penalty display
                 Label:
-                    text: "CLAHE Night"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    size_hint_y: None
+                    height: dp(26)
+                    text: root.section_penalty
+                    font_size: "11sp"
+                    color: C("#FFD740")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_clahe
-                    active: False
-                    size_hint_x: 0.5
+                    padding: dp(4), 0
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+                # Sign selectors
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(6)
+                    Label:
+                        text: "Sign"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        color: C("#8892A8")
+                        halign: "left"
+                        text_size: self.size
+                    StyledSpinner:
+                        id: sp_sign_group
+                        size_hint_x: 0.41
+                        text: "Group"
+                        values: []
+                        font_size: "11sp"
+                        on_text: root.on_sign_group(self.text)
+                    StyledSpinner:
+                        id: sp_sign
+                        size_hint_x: 0.41
+                        text: "Sign"
+                        values: []
+                        font_size: "11sp"
+
+                # Notes
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(62)
+                    spacing: dp(8)
+                    Label:
+                        text: "Notes"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        color: C("#8892A8")
+                        halign: "left"
+                        valign: "top"
+                        text_size: self.size
+                    StyledInput:
+                        id: in_notes
+                        size_hint_x: 0.82
+                        hint_text: "Additional details..."
+                        multiline: True
+                        font_size: "13sp"
+
+                # Evidence status
                 Label:
-                    text: "CV Assist"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    size_hint_y: None
+                    height: dp(20)
+                    text: root.evidence_status
+                    font_size: "10sp"
+                    color: C("#00E5FF")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_cv
-                    active: True
-                    size_hint_x: 0.5
+                    padding: dp(4), 0
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+            # ── Routing Card ─────────────────────────────────────────────
+            Card:
+                height: dp(72)
+
+                SectionLabel:
+                    text: "JURISDICTION ROUTING"
+
                 Label:
-                    text: "Plate OCR"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    size_hint_y: None
+                    height: dp(32)
+                    text: root.route_text
+                    font_size: "11sp"
+                    color: C("#00E676")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_ocr
-                    active: True
-                    size_hint_x: 0.5
+                    markup: True
 
-            Label:
-                id: lbl_ocr_suggest
-                size_hint_y: None
-                height: dp(28)
-                text: root.ocr_suggest_text
-                font_size: "11sp"
-                color: (0.2, 1, 0.6, 1)
-                halign: "left"
-                text_size: self.size
-
+            # Bottom spacer for scroll
             Widget:
                 size_hint_y: None
-                height: dp(1)
-                canvas:
-                    Color:
-                        rgba: (0.25, 0.25, 0.25, 1)
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
+                height: dp(4)
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(42)
-                spacing: dp(6)
-                Label:
-                    text: "Plate"
-                    size_hint_x: 0.22
-                    font_size: "14sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                TextInput:
-                    id: in_plate
-                    size_hint_x: 0.78
-                    multiline: False
-                    hint_text: "MH12AB1234"
-                    font_size: "15sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(46)
-                spacing: dp(6)
-                Label:
-                    text: "Offense"
-                    size_hint_x: 0.22
-                    font_size: "14sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                Spinner:
-                    id: sp_offense
-                    size_hint_x: 0.78
-                    text: "Select"
-                    values: []
-                    font_size: "13sp"
-                    on_text: root.on_offense_selected(self.text)
-
-            Label:
-                size_hint_y: None
-                height: dp(30)
-                text: root.section_penalty
-                font_size: "12sp"
-                color: (1, 0.8, 0.3, 1)
-                halign: "left"
-                text_size: self.size
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(46)
-                spacing: dp(6)
-                Label:
-                    text: "Sign"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    halign: "left"
-                    text_size: self.size
-                Spinner:
-                    id: sp_sign_group
-                    size_hint_x: 0.39
-                    text: "Group"
-                    values: []
-                    font_size: "11sp"
-                    on_text: root.on_sign_group(self.text)
-                Spinner:
-                    id: sp_sign
-                    size_hint_x: 0.39
-                    text: "Sign"
-                    values: []
-                    font_size: "11sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(70)
-                spacing: dp(6)
-                Label:
-                    text: "Notes"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    halign: "left"
-                    valign: "top"
-                    text_size: self.size
-                TextInput:
-                    id: in_notes
-                    size_hint_x: 0.78
-                    hint_text: "Details"
-                    multiline: True
-                    font_size: "14sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(42)
-                spacing: dp(6)
-                Label:
-                    text: "Route"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                Label:
-                    text: root.route_text
-                    size_hint_x: 0.78
-                    font_size: "11sp"
-                    halign: "left"
-                    text_size: self.size
-                    color: (0.4, 0.9, 0.4, 1)
-
-            # Evidence status
-            Label:
-                size_hint_y: None
-                height: dp(24)
-                text: root.evidence_status
-                font_size: "10sp"
-                color: (0.3, 0.8, 1, 1)
-                halign: "left"
-                text_size: self.size
-
+    # ── Action Bar ───────────────────────────────────────────────────────
     BoxLayout:
         size_hint_y: None
-        height: dp(50)
+        height: dp(62)
+        padding: dp(10), dp(7)
         spacing: dp(8)
-        Button:
-            text: "Capture"
-            font_size: "15sp"
-            bold: True
+        canvas.before:
+            Color:
+                rgba: C("#0D1120")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+            # Top accent line
+            Color:
+                rgba: C("#1A2035")
+            Rectangle:
+                pos: (self.x, self.top - dp(1))
+                size: (self.width, dp(1))
+
+        ActionBtn:
+            text: "CAPTURE"
+            _bg: C("#0078D4")
             on_release: root.capture_evidence()
-            background_color: (0.2, 0.6, 0.9, 1)
-        Button:
-            text: "Send Report"
-            font_size: "15sp"
-            bold: True
+
+        ActionBtn:
+            text: "SEND"
+            _bg: C("#00C853")
             on_release: root.send_report()
-            background_color: (0.1, 0.7, 0.3, 1)
-        Button:
-            text: "Clear"
-            font_size: "14sp"
+
+        ActionBtn:
+            text: "CLEAR"
+            _bg: C("#37474F")
             on_release: root.clear_form()
-            background_color: (0.4, 0.4, 0.4, 1)
 """
 
 
@@ -1772,7 +1973,10 @@ class RootUI(BoxLayout):
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
         if SentinelPreview is None:
-            self.ids.camera_box.add_widget(Label(text="No camera", font_size="14sp"))
+            self.ids.camera_box.add_widget(Label(
+                text="Camera unavailable", font_size="13sp",
+                color=(0.35, 0.4, 0.52, 1),
+            ))
             return
         try:
             self._preview = SentinelPreview()
@@ -1780,7 +1984,10 @@ class RootUI(BoxLayout):
             self.ids.camera_box.add_widget(self._preview)
             Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
         except Exception:
-            self.ids.camera_box.add_widget(Label(text="Camera failed", font_size="14sp"))
+            self.ids.camera_box.add_widget(Label(
+                text="Camera initialization failed", font_size="13sp",
+                color=(1, 0.32, 0.32, 1),
+            ))
 
     def _connect_cam(self):
         if not self._preview:
@@ -2096,12 +2303,38 @@ class RootUI(BoxLayout):
             return False
 
     def _popup(self, t, m):
-        Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(250), None)),
-              size_hint=(.82, .32)).open()
+        # Determine accent color based on popup type
+        if t in ("Saved!", "Ready"):
+            accent = (0, 0.78, 0.33, 1)       # green
+        elif t in ("Failed", "Capture Error", "No route"):
+            accent = (1, 0.32, 0.32, 1)        # red
+        elif t in ("Queued",):
+            accent = (1, 0.84, 0.25, 1)        # amber
+        else:
+            accent = (0, 0.9, 1, 1)            # cyan
+
+        content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        lbl = Label(
+            text=m, halign="left", valign="top",
+            text_size=(dp(240), None), font_size="13sp",
+            color=(0.82, 0.84, 0.88, 1),
+        )
+        content.add_widget(lbl)
+
+        p = Popup(
+            title=t, content=content,
+            size_hint=(0.82, 0.28),
+            title_size="15sp",
+            title_color=accent,
+            separator_color=accent,
+            background_color=(0.08, 0.09, 0.15, 0.95),
+        )
+        p.open()
 
 
 class SentinelXApp(App):
     def build(self):
+        Window.clearcolor = (0.043, 0.055, 0.09, 1)  # #0B0E17
         Builder.load_string(KV)
         return RootUI()
 
