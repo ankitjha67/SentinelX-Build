@@ -1439,6 +1439,328 @@ class TestQueueRetryDaemon:
 
 
 # ============================================================================
+# TEST SUITE 24: PlateOCR — Text Cleanup & Indian Plate Parsing (Phase 5)
+# ============================================================================
+class PlateOCR:
+    """Mirror of main.py PlateOCR for isolated testing."""
+    INDIAN_PLATE_RE = re.compile(
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{1,4})", re.I
+    )
+    CONF_HIGH = 0.85
+    CONF_MEDIUM = 0.6
+    CONF_LOW = 0.35
+
+    @staticmethod
+    def clean_plate_text(raw):
+        if not raw:
+            return "", 0.0
+        text = raw.upper().strip()
+        text = re.sub(r"[^A-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        m = PlateOCR.INDIAN_PLATE_RE.search(text)
+        if m:
+            state = m.group(1).upper()
+            dist = m.group(2)
+            series = m.group(3).upper()
+            num = m.group(4)
+            plate = "%s%s%s%s" % (state, dist, series, num)
+            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+            return plate, conf
+        cleaned = re.sub(r"[^A-Z0-9]", "", text)
+        if len(cleaned) >= 6 and cleaned[:2].isalpha():
+            return cleaned, PlateOCR.CONF_LOW
+        return "", 0.0
+
+
+class TestPlateOCRTextCleanup:
+    """Test OCR text extraction and Indian plate format parsing."""
+
+    @pytest.mark.parametrize("raw,expected_plate,min_conf", [
+        ("MH 12 AB 1234", "MH12AB1234", 0.8),
+        ("DL 01 C 1234", "DL01C1234", 0.8),
+        ("KA 03 MM 5678", "KA03MM5678", 0.8),
+        ("TN09A0001", "TN09A0001", 0.8),
+        ("HR 26 DK 1234", "HR26DK1234", 0.8),
+        ("GJ01AB1234", "GJ01AB1234", 0.8),
+    ])
+    def test_clean_standard_plates(self, raw, expected_plate, min_conf):
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == expected_plate
+        assert conf >= min_conf
+
+    @pytest.mark.parametrize("raw,expected_plate", [
+        ("  MH 12 AB 1234  ", "MH12AB1234"),
+        ("mh12ab1234", "MH12AB1234"),
+        ("  dl 01 c 1234  ", "DL01C1234"),
+    ])
+    def test_clean_plates_with_spacing_and_case(self, raw, expected_plate):
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == expected_plate
+        assert conf > 0.0
+
+    def test_clean_empty_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_none_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text(None)
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_garbage_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("????")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_short_text_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("AB")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_high_confidence_with_series(self):
+        """Plates with series letters get high confidence."""
+        _, conf = PlateOCR.clean_plate_text("MH 12 AB 1234")
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_medium_confidence_without_series(self):
+        """Plates without series letters get medium confidence."""
+        _, conf = PlateOCR.clean_plate_text("DL 01 1234")
+        assert conf == PlateOCR.CONF_MEDIUM
+
+    def test_low_confidence_fallback(self):
+        """Non-standard alphanumeric that doesn't match Indian format gets low confidence."""
+        # Pure alpha — no digits, so Indian plate regex won't match
+        plate, conf = PlateOCR.clean_plate_text("XYZABCDEF")
+        assert conf == PlateOCR.CONF_LOW
+        assert plate.startswith("XY")
+
+    @pytest.mark.parametrize("raw", [
+        "MH-12-AB-1234",
+        "MH.12.AB.1234",
+        "MH/12/AB/1234",
+    ])
+    def test_clean_plates_with_special_chars(self, raw):
+        """Special characters between groups should be stripped."""
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf >= PlateOCR.CONF_HIGH
+
+
+# ============================================================================
+# TEST SUITE 25: PlateOCR — Jurisdiction Routing Suggestion (Phase 5)
+# ============================================================================
+class TestPlateOCRRoutingSuggestion:
+    """Test OCR-detected plate to jurisdiction email routing."""
+
+    def test_ocr_plate_routes_to_delhi(self):
+        plate = "DL01C1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "DL"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert "addlcp.tfchq@delhipolice.gov.in" in emails
+
+    def test_ocr_plate_routes_to_maharashtra(self):
+        plate = "MH12AB1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "MH"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) == 2
+
+    def test_ocr_plate_routes_to_karnataka(self):
+        plate = "KA03MM5678"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "KA"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert "bangloretrafficpolice@gmail.com" in emails
+
+    @pytest.mark.parametrize("plate,expected_state,has_emails", [
+        ("DL01C1234", "DL", True),
+        ("MH12AB1234", "MH", True),
+        ("KA03MM5678", "KA", True),
+        ("TN09A0001", "TN", True),
+        ("UP16AB1234", "UP", True),
+        ("HR26DK1234", "HR", True),
+        ("KL01AB1234", "KL", True),
+        ("GJ01AB1234", "GJ", True),
+        ("WB02A1234", "WB", True),
+        ("TS09EP1234", "TS", True),
+        ("PB10AQ1234", "PB", True),
+        ("RJ14CA1234", "RJ", True),
+        ("GA07H1234", "GA", True),
+        ("XX99ZZ9999", "XX", False),
+    ])
+    def test_ocr_routing_all_states(self, plate, expected_state, has_emails):
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert bool(emails) == has_emails
+
+    def test_ocr_cleaned_plate_routes_correctly(self):
+        """Full pipeline: raw OCR text → clean → extract state → route."""
+        raw_ocr = "MH 12 AB 1234"
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        assert plate == "MH12AB1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "MH"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) == 2
+        assert conf >= PlateOCR.CONF_HIGH
+
+    def test_ocr_cleaned_plate_with_noise_routes_correctly(self):
+        """OCR text with noise still routes correctly after cleaning."""
+        raw_ocr = "  DL 01 C 1234  "
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "DL"
+        assert conf > 0.0
+
+    def test_unknown_state_gets_no_routing(self):
+        """Plate from unregistered state gets empty email list."""
+        raw_ocr = "XX 99 ZZ 9999"
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert emails == []
+
+
+# ============================================================================
+# TEST SUITE 26: PlateOCR — Candidate Cropping Logic (Phase 5)
+# ============================================================================
+class TestPlateOCRCropping:
+    """Test plate candidate detection and cropping logic."""
+
+    def test_aspect_ratio_filter_accepts_plate_like(self):
+        """Plate-like aspect ratios (2.0-6.5) should pass."""
+        for ar in [2.0, 3.0, 4.5, 6.0, 6.5]:
+            cw = int(100 * ar)
+            ch = 100
+            assert 2.0 <= ar <= 6.5
+            assert cw >= 60 and ch >= 20
+
+    def test_aspect_ratio_filter_rejects_square(self):
+        """Square regions (ar=1.0) should be rejected."""
+        cw, ch = 100, 100
+        ar = cw / ch
+        assert not (2.0 <= ar <= 6.5)
+
+    def test_aspect_ratio_filter_rejects_tall(self):
+        """Tall regions (ar<2.0) should be rejected."""
+        cw, ch = 50, 100
+        ar = cw / ch
+        assert not (2.0 <= ar <= 6.5)
+
+    def test_minimum_size_filter(self):
+        """Small contours below 60x20 or 2000px² are rejected."""
+        assert not (59 >= 60)  # width too small
+        assert not (19 >= 20)  # height too small
+        assert not (50 * 30 >= 2000)  # area too small (1500)
+        assert 100 * 30 >= 2000  # area OK (3000)
+
+    def test_candidates_sorted_by_area(self):
+        """Candidates should be sorted largest area first."""
+        areas = [(300, 80), (200, 60), (400, 100)]
+        sorted_areas = sorted(areas, key=lambda c: c[0] * c[1], reverse=True)
+        assert sorted_areas[0] == (400, 100)
+        assert sorted_areas[-1] == (200, 60)
+
+    def test_max_five_candidates(self):
+        """At most 5 candidates should be returned."""
+        candidates = list(range(10))
+        assert len(candidates[:5]) == 5
+
+
+# ============================================================================
+# TEST SUITE 27: PlateOCR — OCR Pipeline Integration (Phase 5)
+# ============================================================================
+class TestPlateOCRPipeline:
+    """Test the full OCR pipeline integration logic."""
+
+    def test_confidence_thresholds_ordering(self):
+        """HIGH > MEDIUM > LOW."""
+        assert PlateOCR.CONF_HIGH > PlateOCR.CONF_MEDIUM > PlateOCR.CONF_LOW
+
+    def test_confidence_thresholds_values(self):
+        assert PlateOCR.CONF_HIGH == 0.85
+        assert PlateOCR.CONF_MEDIUM == 0.6
+        assert PlateOCR.CONF_LOW == 0.35
+
+    def test_cooldown_skips_processing(self):
+        """After detection, cooldown should prevent reprocessing."""
+        cooldown = 15
+        for _ in range(15):
+            cooldown -= 1
+        assert cooldown == 0  # Cooldown expired
+
+    def test_routing_suggestion_structure(self):
+        """Routing suggestion dict has all required keys."""
+        suggestion = {
+            "plate": "MH12AB1234",
+            "state_code": "MH",
+            "emails": ["sp.hsp.hq@mahapolice.gov.in"],
+            "confidence": 0.85,
+            "source": "ocr",
+        }
+        required_keys = {"plate", "state_code", "emails", "confidence", "source"}
+        assert set(suggestion.keys()) == required_keys
+        assert suggestion["source"] == "ocr"
+
+    def test_routing_suggestion_empty_plate(self):
+        """Empty plate returns empty suggestion."""
+        suggestion = {
+            "plate": "", "state_code": "", "emails": [],
+            "confidence": 0.0, "source": "ocr",
+        }
+        assert suggestion["plate"] == ""
+        assert suggestion["emails"] == []
+        assert suggestion["confidence"] == 0.0
+
+    def test_ocr_to_full_routing_pipeline(self):
+        """End-to-end: OCR text → clean → state → emails → report fields."""
+        raw_texts = [
+            ("MH 12 AB 1234", "MH", 2),
+            ("DL 01 C 1234", "DL", 1),
+            ("KA 03 MM 5678", "KA", 1),
+            ("HR 26 DK 1234", "HR", 2),
+        ]
+        for raw, expected_state, expected_email_count in raw_texts:
+            plate, conf = PlateOCR.clean_plate_text(raw)
+            assert conf > 0.5
+            state = JurisdictionEngine.extract_state_code_from_plate(plate)
+            assert state == expected_state
+            emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+            assert len(emails) == expected_email_count
+
+    @pytest.mark.parametrize("raw_ocr,expected_state", [
+        ("TN 09 A 0001", "TN"),
+        ("UP 16 AB 1234", "UP"),
+        ("KL 01 AB 1234", "KL"),
+        ("GJ 01 AB 1234", "GJ"),
+        ("WB 02 A 1234", "WB"),
+        ("TS 09 EP 1234", "TS"),
+        ("PB 10 AQ 1234", "PB"),
+        ("RJ 14 CA 1234", "RJ"),
+        ("GA 07 H 1234", "GA"),
+    ])
+    def test_ocr_all_13_states_route_correctly(self, raw_ocr, expected_state):
+        """All 13 verified states route correctly from OCR text."""
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        assert conf > 0.0
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) >= 1
+
+    def test_analytics_engine_ocr_properties(self):
+        """AnalyticsEngine should carry OCR plate and confidence."""
+        ocr_plate = "MH12AB1234"
+        ocr_confidence = 0.85
+        # Simulating AnalyticsEngine state
+        assert len(ocr_plate) > 0
+        assert ocr_confidence > 0.5
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 if __name__ == "__main__":

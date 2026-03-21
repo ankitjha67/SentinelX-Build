@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.4.0 -- Civic Enforcement (Android)
+Sentinel-X v1.5.0 -- Civic Enforcement (Android)
 Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
 Phase 2: Evidence integrity — SHA-256 hashing, metadata watermark, report log.
 Phase 3: Offline resilience — report queue, connectivity detection, auto-retry.
 Phase 4: Enhanced detection — ONNX model loader, speed zones, subsystem status.
+Phase 5: Automatic plate OCR — ML Kit text recognition, auto-fill, jurisdiction routing.
 """
 
 import os
@@ -250,6 +251,13 @@ class AnalyticsEngine:
     def __init__(self):
         self.result = ""
         self._skip = 0
+        self._plate_ocr = None
+        self.ocr_plate = ""
+        self.ocr_confidence = 0.0
+
+    def set_plate_ocr(self, ocr):
+        """Attach a PlateOCR instance for automatic plate recognition."""
+        self._plate_ocr = ocr
 
     @staticmethod
     def clahe(img):
@@ -287,8 +295,267 @@ class AnalyticsEngine:
                 if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
                     count += 1
             self.result = "CV:%d" % count if count else "CV:--"
+            # Phase 5: Run OCR on detected plate regions
+            if self._plate_ocr and count > 0:
+                try:
+                    plate, conf = self._plate_ocr.process_frame(bgr)
+                    if conf > 0.5:
+                        self.ocr_plate = plate
+                        self.ocr_confidence = conf
+                except Exception:
+                    pass
         except Exception:
             self.result = "CV:err"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 5 — Automatic Plate OCR (ML Kit + OpenCV fallback)
+# ═════════════════════════════════════════════════════════════════════════
+class PlateOCR:
+    """Automatic number plate recognition via OpenCV crop + ML Kit OCR.
+
+    Pipeline: contour detection → crop plate candidates → preprocess →
+    ML Kit text recognition (Android) → regex cleanup to Indian plate format →
+    auto-suggest jurisdiction routing.
+    """
+
+    INDIAN_PLATE_RE = re.compile(
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{1,4})", re.I
+    )
+    # Confidence thresholds
+    CONF_HIGH = 0.85   # Strong regex match with all groups
+    CONF_MEDIUM = 0.6  # Partial match
+    CONF_LOW = 0.35    # Alphanumeric fallback
+
+    def __init__(self):
+        self._recognizer = None
+        self._available = False
+        self._last_plate = ""
+        self._last_confidence = 0.0
+        self._cooldown = 0
+        self._lock = threading.Lock()
+        self._init_mlkit()
+
+    def _init_mlkit(self):
+        """Initialize Google ML Kit TextRecognizer on Android."""
+        if platform != "android" or autoclass is None:
+            return
+        try:
+            TextRecognition = autoclass(
+                "com.google.mlkit.vision.text.TextRecognition"
+            )
+            LatinOptions = autoclass(
+                "com.google.mlkit.vision.text.latin.TextRecognizerOptions"
+            )
+            self._recognizer = TextRecognition.getClient(
+                LatinOptions.Builder().build()
+            )
+            self._available = True
+        except Exception:
+            pass
+
+    @property
+    def available(self):
+        return self._available
+
+    @property
+    def last_plate(self):
+        with self._lock:
+            return self._last_plate
+
+    @property
+    def last_confidence(self):
+        with self._lock:
+            return self._last_confidence
+
+    def reset(self):
+        """Clear last detection state."""
+        with self._lock:
+            self._last_plate = ""
+            self._last_confidence = 0.0
+            self._cooldown = 0
+
+    # ── Plate candidate cropping ─────────────────────────────────────────
+    @staticmethod
+    def crop_plate_candidates(bgr):
+        """Find and crop plate-like regions from a BGR image.
+
+        Returns list of (cropped_bgr, (x, y, w, h)) sorted by area descending.
+        """
+        if cv2 is None or np is None:
+            return []
+        candidates = []
+        try:
+            gray = cv2.bilateralFilter(
+                cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 9, 75, 75
+            )
+            edges = cv2.Canny(gray, 60, 180)
+            cnts, _ = cv2.findContours(
+                edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            h_img, w_img = bgr.shape[:2]
+            for c in cnts:
+                x, y, cw, ch = cv2.boundingRect(c)
+                ar = cw / max(ch, 1)
+                if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
+                    pad = 5
+                    x1, y1 = max(0, x - pad), max(0, y - pad)
+                    x2, y2 = min(w_img, x + cw + pad), min(h_img, y + ch + pad)
+                    crop = bgr[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        candidates.append((crop, (x, y, cw, ch)))
+            candidates.sort(key=lambda c: c[1][2] * c[1][3], reverse=True)
+        except Exception:
+            pass
+        return candidates[:5]
+
+    # ── Preprocessing for OCR ────────────────────────────────────────────
+    @staticmethod
+    def preprocess_plate(crop):
+        """Enhance a plate crop for better OCR accuracy."""
+        if cv2 is None or np is None:
+            return crop
+        try:
+            h, w = crop.shape[:2]
+            if h == 0 or w == 0:
+                return crop
+            target_h = 64
+            scale = target_h / h
+            resized = cv2.resize(crop, (int(w * scale), target_h))
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+            enhanced = clahe.apply(gray)
+            _, thresh = cv2.threshold(
+                enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            return thresh
+        except Exception:
+            return crop
+
+    # ── Text cleanup ─────────────────────────────────────────────────────
+    @staticmethod
+    def clean_plate_text(raw):
+        """Extract Indian plate format from raw OCR text.
+
+        Returns (plate_string, confidence).
+        Indian format: SS DD AAA DDDD  (state, district, series, number)
+        """
+        if not raw:
+            return "", 0.0
+        text = raw.upper().strip()
+        # Common OCR substitutions
+        text = text.replace("O", "0").replace("I", "1").replace("S", "5")
+        # Revert letter positions back (first 2 must be alpha)
+        chars = list(text)
+        cleaned_alpha = re.sub(r"[^A-Z0-9]", "", raw.upper().strip())
+        if len(cleaned_alpha) >= 2:
+            # Restore first 2 as letters
+            first2 = raw.upper().strip()[:6]
+            first2_alpha = re.sub(r"[^A-Z]", "", first2)
+            if len(first2_alpha) >= 2:
+                pass  # Keep original logic below
+
+        text = raw.upper().strip()
+        text = re.sub(r"[^A-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        m = PlateOCR.INDIAN_PLATE_RE.search(text)
+        if m:
+            state = m.group(1).upper()
+            dist = m.group(2)
+            series = m.group(3).upper()
+            num = m.group(4)
+            plate = "%s%s%s%s" % (state, dist, series, num)
+            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+            return plate, conf
+
+        # Fallback: strip all non-alphanum
+        cleaned = re.sub(r"[^A-Z0-9]", "", text)
+        if len(cleaned) >= 6 and cleaned[:2].isalpha():
+            return cleaned, PlateOCR.CONF_LOW
+        return "", 0.0
+
+    # ── ML Kit OCR (Android) ─────────────────────────────────────────────
+    def _ocr_mlkit(self, crop_bgr):
+        """Run Google ML Kit text recognition on a BGR crop.
+
+        Returns raw text string or empty string on failure.
+        """
+        if not self._available or autoclass is None:
+            return ""
+        try:
+            Bitmap = autoclass("android.graphics.Bitmap")
+            BitmapConfig = autoclass("android.graphics.Bitmap$Config")
+            InputImage = autoclass(
+                "com.google.mlkit.vision.common.InputImage"
+            )
+            Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+
+            h, w = crop_bgr.shape[:2]
+            rgba = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGBA)
+            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
+            ByteBuffer = autoclass("java.nio.ByteBuffer")
+            buf = ByteBuffer.wrap(rgba.tobytes())
+            bitmap.copyPixelsFromBuffer(buf)
+
+            image = InputImage.fromBitmap(bitmap, 0)
+            result = Tasks.await(self._recognizer.process(image))
+            raw = result.getText() if result else ""
+            bitmap.recycle()
+            return raw
+        except Exception:
+            return ""
+
+    # ── Full pipeline ────────────────────────────────────────────────────
+    def process_frame(self, bgr):
+        """Full OCR pipeline on a BGR frame.
+
+        Returns (plate_text, confidence). Applies cooldown to avoid
+        redundant processing after a successful detection.
+        """
+        with self._lock:
+            if self._cooldown > 0:
+                self._cooldown -= 1
+                return self._last_plate, self._last_confidence
+
+        candidates = self.crop_plate_candidates(bgr)
+        best_plate, best_conf = "", 0.0
+
+        for crop, bbox in candidates:
+            if self._available:
+                raw = self._ocr_mlkit(crop)
+            else:
+                raw = ""
+            if raw:
+                plate, conf = self.clean_plate_text(raw)
+                if conf > best_conf:
+                    best_plate, best_conf = plate, conf
+                    if conf >= self.CONF_HIGH:
+                        break  # Good enough, stop early
+
+        with self._lock:
+            if best_conf > 0.5:
+                self._last_plate = best_plate
+                self._last_confidence = best_conf
+                self._cooldown = 15  # ~5s cooldown at 3fps analysis rate
+            return best_plate, best_conf
+
+    def suggest_routing(self, plate, lat=0.0, lon=0.0):
+        """Given an OCR-detected plate, suggest jurisdiction email routing.
+
+        Returns dict with state_code, emails, and confidence.
+        """
+        if not plate:
+            return {"plate": "", "state_code": "", "emails": [],
+                    "confidence": 0.0, "source": "ocr"}
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        return {
+            "plate": plate,
+            "state_code": rt["pc"],
+            "emails": rt["all"],
+            "confidence": self._last_confidence,
+            "source": "ocr",
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1122,6 +1389,30 @@ KV = """
                     active: True
                     size_hint_x: 0.5
 
+            BoxLayout:
+                size_hint_y: None
+                height: dp(40)
+                Label:
+                    text: "Plate OCR"
+                    size_hint_x: 0.5
+                    font_size: "14sp"
+                    halign: "left"
+                    text_size: self.size
+                Switch:
+                    id: sw_ocr
+                    active: True
+                    size_hint_x: 0.5
+
+            Label:
+                id: lbl_ocr_suggest
+                size_hint_y: None
+                height: dp(28)
+                text: root.ocr_suggest_text
+                font_size: "11sp"
+                color: (0.2, 1, 0.6, 1)
+                halign: "left"
+                text_size: self.size
+
             Widget:
                 size_hint_y: None
                 height: dp(1)
@@ -1278,6 +1569,7 @@ class RootUI(BoxLayout):
     section_penalty = StringProperty(DASH)
     route_text = StringProperty(DASH)
     evidence_status = StringProperty("")
+    ocr_suggest_text = StringProperty("")
     latest_lat = NumericProperty(0.0)
     latest_lon = NumericProperty(0.0)
     latest_speed = NumericProperty(0.0)
@@ -1308,6 +1600,9 @@ class RootUI(BoxLayout):
         self._subsystem_status = SubsystemStatus()
         self._harsh_brake_log = None
         self._last_harsh_brake_ts = 0
+        # Phase 5
+        self._plate_ocr = None
+        self._ocr_accepted_plate = ""
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -1419,6 +1714,9 @@ class RootUI(BoxLayout):
         self._onnx = ONNXDetector(models_dir)
         # Phase 4: Harsh braking event log
         self._harsh_brake_log = HarshBrakeLog(edir)
+        # Phase 5: Plate OCR
+        self._plate_ocr = PlateOCR()
+        self._analytics.set_plate_ocr(self._plate_ocr)
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
@@ -1614,6 +1912,44 @@ class RootUI(BoxLayout):
                 zone_warn = " ZONE:%s@%dkm/h" % (
                     violations[0][0], violations[0][2]
                 )
+        # Phase 5: OCR auto-fill and routing suggestion
+        ocr_active = self.ids.sw_ocr.active if hasattr(self.ids, "sw_ocr") else False
+        if ocr_active and self._plate_ocr and self._analytics:
+            ocr_plate = self._analytics.ocr_plate
+            ocr_conf = self._analytics.ocr_confidence
+            if ocr_plate and ocr_conf > 0.5:
+                current_plate = self.ids.in_plate.text.strip()
+                if not current_plate or current_plate == self._ocr_accepted_plate:
+                    self.ids.in_plate.text = ocr_plate
+                    self._ocr_accepted_plate = ocr_plate
+                suggestion = self._plate_ocr.suggest_routing(
+                    ocr_plate, lat, lon
+                )
+                emails = suggestion.get("emails", [])
+                state = suggestion.get("state_code", "")
+                if emails:
+                    self.ocr_suggest_text = (
+                        "OCR: %s [%s] %.0f%% -> %s"
+                        % (ocr_plate, state, ocr_conf * 100,
+                           ", ".join(emails[:2]))
+                    )
+                else:
+                    self.ocr_suggest_text = (
+                        "OCR: %s [%s] %.0f%% (no route)"
+                        % (ocr_plate, state, ocr_conf * 100)
+                    )
+            else:
+                self.ocr_suggest_text = "OCR: scanning..." if ocr_active else ""
+        else:
+            self.ocr_suggest_text = ""
+
+        # Phase 5: Update subsystem status for OCR
+        if self._subsystem_status and self._plate_ocr:
+            self._subsystem_status.update(
+                "ocr", self._plate_ocr.available or not ocr_active,
+                "plate:%s" % self._analytics.ocr_plate if self._analytics.ocr_plate else ""
+            )
+
         status_suffix = self._subsystem_status.summary() if self._subsystem_status else ""
         self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s%s\n%s" % (
             lat, lon, self.state_name or DASH, kmh, self.latest_g, cv,
@@ -1643,6 +1979,14 @@ class RootUI(BoxLayout):
         self.route_text = DASH
         self.evidence_path = ""
         self.evidence_status = ""
+        # Phase 5: Reset OCR state
+        self._ocr_accepted_plate = ""
+        self.ocr_suggest_text = ""
+        if self._plate_ocr:
+            self._plate_ocr.reset()
+        if self._analytics:
+            self._analytics.ocr_plate = ""
+            self._analytics.ocr_confidence = 0.0
 
     # ── Email ────────────────────────────────────────────────────────────
     def send_report(self):

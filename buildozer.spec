@@ -5,7 +5,7 @@ package.domain = org.sentinelx
 source.dir = .
 source.include_exts = py,png,jpg,kv,json,txt,onnx
 
-version = 1.0.4
+version = 1.5.0
 orientation = portrait
 fullscreen = 0
 
