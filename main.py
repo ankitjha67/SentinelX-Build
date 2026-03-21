@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.1.0 -- Civic Enforcement (Android)
+Sentinel-X v1.4.0 -- Civic Enforcement (Android)
 Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
+Phase 2: Evidence integrity — SHA-256 hashing, metadata watermark, report log.
+Phase 3: Offline resilience — report queue, connectivity detection, auto-retry.
+Phase 4: Enhanced detection — ONNX model loader, speed zones, subsystem status.
 """
 
 import os
@@ -11,6 +14,7 @@ import socket
 import threading
 import time
 import math
+import hashlib
 import shutil
 import collections
 from datetime import datetime
@@ -579,6 +583,443 @@ class TelemetryReceiver:
             return dict(self._latest)
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 2 — Evidence integrity: SHA-256 hashing
+# ═════════════════════════════════════════════════════════════════════════
+class EvidenceHasher:
+    """Computes SHA-256 of evidence files for tamper detection."""
+
+    @staticmethod
+    def hash_file(filepath):
+        """Return hex SHA-256 digest of a file."""
+        h = hashlib.sha256()
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def hash_bytes(data):
+        """Return hex SHA-256 digest of raw bytes."""
+        return hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def write_hashfile(filepath):
+        """Write a .sha256 sidecar file next to the evidence file."""
+        digest = EvidenceHasher.hash_file(filepath)
+        if digest:
+            hpath = filepath + ".sha256"
+            try:
+                with open(hpath, "w") as f:
+                    f.write("%s  %s\n" % (digest, os.path.basename(filepath)))
+                return hpath
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def verify(filepath):
+        """Verify a file against its .sha256 sidecar. Returns True/False/None."""
+        hpath = filepath + ".sha256"
+        if not os.path.isfile(hpath):
+            return None
+        try:
+            with open(hpath, "r") as f:
+                stored = f.read().strip().split()[0]
+            return EvidenceHasher.hash_file(filepath) == stored
+        except Exception:
+            return None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 2 — Evidence metadata watermark
+# ═════════════════════════════════════════════════════════════════════════
+class EvidenceWatermark:
+    """Embeds GPS/timestamp metadata onto evidence images."""
+
+    @staticmethod
+    def apply(filepath, lat, lon, timestamp_str, plate=""):
+        """Burn metadata text onto the bottom of an image."""
+        if cv2 is None or np is None:
+            return False
+        try:
+            img = cv2.imread(filepath)
+            if img is None:
+                return False
+            h, w = img.shape[:2]
+            line1 = "%s | %.5f,%.5f" % (timestamp_str, lat, lon)
+            line2 = "Plate: %s | Sentinel-X" % plate if plate else "Sentinel-X"
+            # Semi-transparent overlay bar at bottom
+            overlay = img.copy()
+            bar_h = max(40, int(h * 0.06))
+            cv2.rectangle(overlay, (0, h - bar_h), (w, h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = max(0.35, w / 1800.0)
+            thick = max(1, int(scale * 2))
+            cv2.putText(img, line1, (8, h - bar_h + int(bar_h * 0.45)),
+                        font, scale, (255, 255, 255), thick)
+            cv2.putText(img, line2, (8, h - int(bar_h * 0.1)),
+                        font, scale * 0.85, (200, 200, 200), thick)
+            cv2.imwrite(filepath, img)
+            return True
+        except Exception:
+            return False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 2 — Report history log
+# ═════════════════════════════════════════════════════════════════════════
+class ReportLog:
+    """Append-only JSON-lines log of sent reports."""
+
+    def __init__(self, log_dir):
+        self._log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self._path = os.path.join(log_dir, "report_log.jsonl")
+
+    def append(self, report_dict):
+        """Append a report entry with timestamp."""
+        entry = dict(report_dict)
+        entry["logged_at"] = datetime.now().isoformat()
+        try:
+            with open(self._path, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+            return True
+        except Exception:
+            return False
+
+    def read_all(self):
+        """Read all log entries."""
+        entries = []
+        try:
+            with open(self._path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entries.append(json.loads(line))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return entries
+
+    @property
+    def count(self):
+        """Number of logged reports."""
+        return len(self.read_all())
+
+    @property
+    def path(self):
+        return self._path
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 3 — Offline report queue
+# ═════════════════════════════════════════════════════════════════════════
+class OfflineReportQueue:
+    """Stores unsent reports as JSON files for later delivery."""
+
+    def __init__(self, queue_dir):
+        self._dir = queue_dir
+        os.makedirs(queue_dir, exist_ok=True)
+
+    def enqueue(self, report_dict):
+        """Save a report to the queue directory."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fpath = os.path.join(self._dir, "report_%s.json" % ts)
+        try:
+            with open(fpath, "w") as f:
+                json.dumps(report_dict, default=str)  # validate first
+                f.write(json.dumps(report_dict, default=str))
+            return fpath
+        except Exception:
+            return ""
+
+    def pending(self):
+        """List pending report file paths, oldest first."""
+        try:
+            files = sorted(f for f in os.listdir(self._dir) if f.endswith(".json"))
+            return [os.path.join(self._dir, f) for f in files]
+        except Exception:
+            return []
+
+    def dequeue(self, fpath):
+        """Remove a report from the queue after successful send."""
+        try:
+            os.remove(fpath)
+            return True
+        except Exception:
+            return False
+
+    def load(self, fpath):
+        """Load a queued report."""
+        try:
+            with open(fpath, "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            return None
+
+    @property
+    def count(self):
+        return len(self.pending())
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 3 — Network connectivity detector
+# ═════════════════════════════════════════════════════════════════════════
+class ConnectivityChecker:
+    """Checks network availability via socket probe."""
+
+    PROBE_HOST = "8.8.8.8"
+    PROBE_PORT = 53
+    TIMEOUT = 3.0
+
+    @staticmethod
+    def is_online():
+        """Returns True if device can reach the internet."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(ConnectivityChecker.TIMEOUT)
+            s.connect((ConnectivityChecker.PROBE_HOST, ConnectivityChecker.PROBE_PORT))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 3 — Offline queue auto-retry daemon
+# ═════════════════════════════════════════════════════════════════════════
+class QueueRetryDaemon:
+    """Background thread that retries queued reports when connectivity returns."""
+
+    RETRY_INTERVAL = 60.0  # check every 60 seconds
+
+    def __init__(self, queue, send_callback):
+        self._queue = queue
+        self._send_cb = send_callback
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def _run(self):
+        while self._running:
+            time.sleep(self.RETRY_INTERVAL)
+            if not self._running:
+                break
+            if not ConnectivityChecker.is_online():
+                continue
+            for fpath in self._queue.pending():
+                report = self._queue.load(fpath)
+                if report is None:
+                    continue
+                try:
+                    if self._send_cb(report):
+                        self._queue.dequeue(fpath)
+                except Exception:
+                    pass
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 4 — ONNX model loader for plate detection
+# ═════════════════════════════════════════════════════════════════════════
+class ONNXDetector:
+    """Optional ONNX model inference for number plate detection."""
+
+    def __init__(self, model_dir):
+        self._session = None
+        self._available = False
+        self._model_path = ""
+        self._load(model_dir)
+
+    def _load(self, model_dir):
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            return
+        # Look for detector.onnx
+        mpath = os.path.join(model_dir, "detector.onnx")
+        if not os.path.isfile(mpath):
+            return
+        try:
+            self._session = ort.InferenceSession(mpath)
+            self._model_path = mpath
+            self._available = True
+        except Exception:
+            pass
+
+    @property
+    def available(self):
+        return self._available
+
+    @property
+    def model_path(self):
+        return self._model_path
+
+    def detect(self, bgr_image):
+        """Run detection on a BGR image. Returns list of (x, y, w, h, conf)."""
+        if not self._available or self._session is None:
+            return []
+        if cv2 is None or np is None:
+            return []
+        try:
+            inp = self._session.get_inputs()[0]
+            name = inp.name
+            shape = inp.shape  # e.g. [1, 3, 640, 640]
+            h, w = shape[2], shape[3]
+            resized = cv2.resize(bgr_image, (w, h))
+            blob = resized.astype(np.float32).transpose(2, 0, 1)[np.newaxis] / 255.0
+            results = self._session.run(None, {name: blob})
+            detections = []
+            if results and len(results) > 0:
+                for det in results[0]:
+                    if len(det) >= 5 and det[4] > 0.5:
+                        detections.append(tuple(float(v) for v in det[:5]))
+            return detections
+        except Exception:
+            return []
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 4 — Speed zone awareness
+# ═════════════════════════════════════════════════════════════════════════
+class SpeedZoneChecker:
+    """Detects if current location is near a speed-sensitive zone."""
+
+    # Known zone types with default speed limits (km/h)
+    ZONES = {
+        "school": {"limit_kmh": 25, "radius_m": 200},
+        "hospital": {"limit_kmh": 25, "radius_m": 150},
+        "residential": {"limit_kmh": 30, "radius_m": 300},
+    }
+
+    def __init__(self):
+        self._custom_zones = []  # list of (lat, lon, zone_type, label)
+
+    def add_zone(self, lat, lon, zone_type, label=""):
+        """Register a speed-sensitive zone."""
+        if zone_type in self.ZONES:
+            self._custom_zones.append((lat, lon, zone_type, label))
+
+    def check(self, lat, lon, speed_kmh):
+        """Check if speed exceeds limit for any nearby zone.
+
+        Returns list of (zone_type, label, limit_kmh, distance_m) violations.
+        """
+        violations = []
+        for zlat, zlon, ztype, zlabel in self._custom_zones:
+            dist = self._haversine(lat, lon, zlat, zlon)
+            zone_info = self.ZONES[ztype]
+            if dist <= zone_info["radius_m"] and speed_kmh > zone_info["limit_kmh"]:
+                violations.append((ztype, zlabel, zone_info["limit_kmh"], dist))
+        return violations
+
+    @staticmethod
+    def _haversine(lat1, lon1, lat2, lon2):
+        """Haversine distance in meters."""
+        R = 6371000.0
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @property
+    def zone_count(self):
+        return len(self._custom_zones)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 4 — Subsystem status aggregator
+# ═════════════════════════════════════════════════════════════════════════
+class SubsystemStatus:
+    """Tracks health of all subsystems for UI display."""
+
+    def __init__(self):
+        self._status = {}
+
+    def update(self, name, healthy, detail=""):
+        self._status[name] = {"healthy": healthy, "detail": detail,
+                              "ts": time.time()}
+
+    def get(self, name):
+        return self._status.get(name, {"healthy": False, "detail": "unknown",
+                                       "ts": 0})
+
+    def all_healthy(self):
+        return all(s["healthy"] for s in self._status.values())
+
+    def summary(self):
+        """One-line status string for UI."""
+        parts = []
+        for name, info in sorted(self._status.items()):
+            icon = "OK" if info["healthy"] else "ERR"
+            parts.append("%s:%s" % (name, icon))
+        return " | ".join(parts)
+
+    @property
+    def subsystems(self):
+        return dict(self._status)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 4 — Harsh braking event log
+# ═════════════════════════════════════════════════════════════════════════
+class HarshBrakeLog:
+    """Records harsh braking events with timestamps and location."""
+
+    def __init__(self, log_dir):
+        self._dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self._path = os.path.join(log_dir, "harsh_brake_log.jsonl")
+        self._events = []
+
+    def record(self, g_dyn, lat, lon, speed_kmh):
+        """Record a harsh braking event."""
+        event = {
+            "ts": datetime.now().isoformat(),
+            "g_dyn": round(g_dyn, 3),
+            "lat": lat, "lon": lon,
+            "speed_kmh": round(speed_kmh, 1),
+        }
+        self._events.append(event)
+        try:
+            with open(self._path, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception:
+            pass
+        return event
+
+    def recent(self, n=10):
+        """Return last N events."""
+        return self._events[-n:]
+
+    @property
+    def count(self):
+        return len(self._events)
+
+    @property
+    def path(self):
+        return self._path
+
+
 SentinelPreview = None
 if Preview is not None:
     class _SentinelPreview(Preview):
@@ -856,6 +1297,17 @@ class RootUI(BoxLayout):
         self._watchdog = None
         self._dashcam = None
         self._telemetry = None
+        # Phase 2
+        self._report_log = None
+        # Phase 3
+        self._offline_queue = None
+        self._queue_retry = None
+        # Phase 4
+        self._onnx = None
+        self._speed_zones = SpeedZoneChecker()
+        self._subsystem_status = SubsystemStatus()
+        self._harsh_brake_log = None
+        self._last_harsh_brake_ts = 0
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -949,6 +1401,24 @@ class RootUI(BoxLayout):
                 svc.start(mActivity, "")
             except Exception:
                 pass
+        # Phase 2: Report log
+        self._report_log = ReportLog(edir)
+        # Phase 3: Offline queue + retry daemon
+        queue_dir = os.path.join(edir, "queue")
+        self._offline_queue = OfflineReportQueue(queue_dir)
+        self._queue_retry = QueueRetryDaemon(
+            self._offline_queue, self._send_queued_report
+        )
+        self._queue_retry.start()
+        # Phase 4: ONNX detector (optional)
+        try:
+            base = App.get_running_app().user_data_dir
+        except Exception:
+            base = "."
+        models_dir = os.path.join(base, "models")
+        self._onnx = ONNXDetector(models_dir)
+        # Phase 4: Harsh braking event log
+        self._harsh_brake_log = HarshBrakeLog(edir)
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
@@ -978,18 +1448,27 @@ class RootUI(BoxLayout):
         t = self._telemetry.latest if self._telemetry else {}
         if "g_dyn" in t:
             self.latest_g = t["g_dyn"]
-            return
-        # Fallback to direct plyer
-        if plyer_accel is None:
-            return
-        try:
-            val = plyer_accel.acceleration
-            if val and val[0] is not None:
-                x, y, z = float(val[0]), float(val[1]), float(val[2] or 9.81)
-                g_total = math.sqrt(x * x + y * y + z * z)
-                self.latest_g = abs(g_total - 9.81)
-        except Exception:
-            pass
+        else:
+            # Fallback to direct plyer
+            if plyer_accel is None:
+                return
+            try:
+                val = plyer_accel.acceleration
+                if val and val[0] is not None:
+                    x, y, z = float(val[0]), float(val[1]), float(val[2] or 9.81)
+                    g_total = math.sqrt(x * x + y * y + z * z)
+                    self.latest_g = abs(g_total - 9.81)
+            except Exception:
+                pass
+        # Phase 4: Record harsh braking events (debounce 5s)
+        now = time.time()
+        if (self.latest_g > 4.0 and self._harsh_brake_log and
+                now - self._last_harsh_brake_ts > 5.0):
+            self._harsh_brake_log.record(
+                self.latest_g, float(self.latest_lat),
+                float(self.latest_lon), self.latest_speed * 3.6
+            )
+            self._last_harsh_brake_ts = now
 
     # ── Camera ───────────────────────────────────────────────────────────
     def _setup_camera(self):
@@ -1064,6 +1543,14 @@ class RootUI(BoxLayout):
                     except Exception:
                         pass
 
+                # Phase 2: Watermark evidence with metadata
+                plate = self.ids.in_plate.text.strip()
+                EvidenceWatermark.apply(
+                    fpath, float(self.latest_lat), float(self.latest_lon),
+                    ts, plate
+                )
+                # Phase 2: Hash evidence for tamper detection
+                EvidenceHasher.write_hashfile(fpath)
                 self.evidence_path = fpath
                 self.evidence_status = "Evidence: %s" % fname
                 self._popup("Saved!", "Photo saved to:\nSentinelX/%s" % fname)
@@ -1104,8 +1591,33 @@ class RootUI(BoxLayout):
         self.route_text = "Loc:%s Plate:%s\n%s" % (lc, pc, rcpts)
         kmh = self.latest_speed * 3.6
         cv = self._analytics.result if self.ids.sw_cv.active else ""
-        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s" % (
-            lat, lon, self.state_name or DASH, kmh, self.latest_g, cv
+        # Phase 4: Subsystem status updates
+        if self._subsystem_status:
+            self._subsystem_status.update("cam", self._cam_ok)
+            self._subsystem_status.update("gps", lat != 0 or lon != 0)
+            self._subsystem_status.update(
+                "dashcam", bool(self._dashcam and self._dashcam.recording)
+            )
+            self._subsystem_status.update(
+                "telemetry", bool(self._telemetry and self._telemetry.latest)
+            )
+            if self._offline_queue:
+                qc = self._offline_queue.count
+                self._subsystem_status.update(
+                    "queue", qc == 0, "%d pending" % qc if qc else ""
+                )
+        # Phase 4: Speed zone check
+        zone_warn = ""
+        if self._speed_zones and kmh > 0:
+            violations = self._speed_zones.check(lat, lon, kmh)
+            if violations:
+                zone_warn = " ZONE:%s@%dkm/h" % (
+                    violations[0][0], violations[0][2]
+                )
+        status_suffix = self._subsystem_status.summary() if self._subsystem_status else ""
+        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s%s\n%s" % (
+            lat, lon, self.state_name or DASH, kmh, self.latest_g, cv,
+            zone_warn, status_suffix
         )
 
     # ── Form ─────────────────────────────────────────────────────────────
@@ -1177,6 +1689,15 @@ class RootUI(BoxLayout):
         body = "\n".join(lines)
         to = rt["all"]
 
+        # Phase 2: Build report record for logging
+        report_record = {
+            "plate": plate, "offense": okey, "section": o["section"],
+            "lat": lat, "lon": lon, "speed_kmh": self.latest_speed * 3.6,
+            "g_dyn": self.latest_g, "recipients": to, "subject": subj,
+            "evidence": self.evidence_path,
+            "evidence_hash": EvidenceHasher.hash_file(self.evidence_path) if self.evidence_path else "",
+        }
+
         sent = False
         if not sent:
             try:
@@ -1195,10 +1716,40 @@ class RootUI(BoxLayout):
                 plyer_email.send(recipient=";".join(to), subject=subj, text=body, create_chooser=True)
                 sent = True
             except Exception as e:
-                self._popup("Failed", str(e))
+                # Phase 3: Queue for offline retry
+                if self._offline_queue:
+                    report_record["body"] = body
+                    self._offline_queue.enqueue(report_record)
+                    self._popup("Queued", "No connection. Report queued for retry.")
+                else:
+                    self._popup("Failed", str(e))
                 return
         if sent:
+            # Phase 2: Log the sent report
+            if self._report_log:
+                report_record["status"] = "sent"
+                self._report_log.append(report_record)
             self._popup("Ready", "Email app opened.")
+
+    # ── Phase 3: Queued report sender callback ──────────────────────────
+    def _send_queued_report(self, report):
+        """Attempt to send a queued report. Returns True on success."""
+        if plyer_email is None:
+            return False
+        try:
+            to = report.get("recipients", [])
+            subj = report.get("subject", "Sentinel-X Report")
+            body = report.get("body", "")
+            if not to or not body:
+                return False
+            plyer_email.send(recipient=to, subject=subj, text=body, create_chooser=False)
+            # Log the sent report
+            if self._report_log:
+                report["status"] = "sent_from_queue"
+                self._report_log.append(report)
+            return True
+        except Exception:
+            return False
 
     def _popup(self, t, m):
         Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(250), None)),
@@ -1232,6 +1783,12 @@ class SentinelXApp(App):
             if r._telemetry:
                 try:
                     r._telemetry.stop()
+                except Exception:
+                    pass
+            # Phase 3: Stop queue retry daemon
+            if r._queue_retry:
+                try:
+                    r._queue_retry.stop()
                 except Exception:
                     pass
             if r._preview and r._cam_ok:

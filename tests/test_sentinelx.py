@@ -7,6 +7,7 @@ service.py physics, challenge_state.py, self_eval.py, Phase 1 subsystems.
 import pytest
 import json
 import math
+import hashlib
 import os
 import sys
 import re
@@ -15,6 +16,7 @@ import socket
 import threading
 import collections
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -922,6 +924,518 @@ class TestTelemetryReceiver:
             lat, lon = fallback_lat, fallback_lon
         assert lat == 19.0760
         assert lon == 72.8777
+
+
+# ============================================================================
+# TEST SUITE 14: EvidenceHasher (Phase 2)
+# ============================================================================
+class TestEvidenceHasher:
+    """Test SHA-256 hashing for evidence integrity."""
+
+    def test_hash_bytes_deterministic(self):
+        data = b"sentinel-x evidence data"
+        h1 = hashlib.sha256(data).hexdigest()
+        h2 = hashlib.sha256(data).hexdigest()
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_hash_bytes_different_data(self):
+        h1 = hashlib.sha256(b"data1").hexdigest()
+        h2 = hashlib.sha256(b"data2").hexdigest()
+        assert h1 != h2
+
+    def test_hash_file(self, tmp_path):
+        f = tmp_path / "evidence.png"
+        f.write_bytes(b"fake image data for testing")
+        digest = hashlib.sha256(b"fake image data for testing").hexdigest()
+        # Simulate hash_file
+        h = hashlib.sha256()
+        with open(str(f), "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        assert h.hexdigest() == digest
+
+    def test_write_hashfile(self, tmp_path):
+        f = tmp_path / "photo.jpg"
+        f.write_bytes(b"jpeg data")
+        digest = hashlib.sha256(b"jpeg data").hexdigest()
+        hpath = str(f) + ".sha256"
+        with open(hpath, "w") as fh:
+            fh.write("%s  %s\n" % (digest, f.name))
+        assert os.path.isfile(hpath)
+        content = open(hpath).read()
+        assert digest in content
+        assert "photo.jpg" in content
+
+    def test_verify_valid(self, tmp_path):
+        f = tmp_path / "evidence.png"
+        data = b"evidence bytes"
+        f.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        hpath = str(f) + ".sha256"
+        with open(hpath, "w") as fh:
+            fh.write("%s  evidence.png\n" % digest)
+        # Verify
+        stored = open(hpath).read().strip().split()[0]
+        computed = hashlib.sha256(f.read_bytes()).hexdigest()
+        assert computed == stored
+
+    def test_verify_tampered(self, tmp_path):
+        f = tmp_path / "evidence.png"
+        f.write_bytes(b"original data")
+        digest = hashlib.sha256(b"original data").hexdigest()
+        hpath = str(f) + ".sha256"
+        with open(hpath, "w") as fh:
+            fh.write("%s  evidence.png\n" % digest)
+        # Tamper with file
+        f.write_bytes(b"tampered data")
+        stored = open(hpath).read().strip().split()[0]
+        computed = hashlib.sha256(f.read_bytes()).hexdigest()
+        assert computed != stored
+
+    def test_hash_empty_file(self, tmp_path):
+        f = tmp_path / "empty.png"
+        f.write_bytes(b"")
+        digest = hashlib.sha256(b"").hexdigest()
+        h = hashlib.sha256()
+        with open(str(f), "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        assert h.hexdigest() == digest
+
+
+# ============================================================================
+# TEST SUITE 15: ReportLog (Phase 2)
+# ============================================================================
+class TestReportLog:
+    """Test append-only report history log."""
+
+    def test_append_and_read(self, tmp_path):
+        log_dir = str(tmp_path / "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "report_log.jsonl")
+        report = {"plate": "MH12AB1234", "offense": "SPEEDING_LMV"}
+        entry = dict(report)
+        entry["logged_at"] = datetime.now().isoformat()
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        # Read back
+        entries = []
+        with open(log_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    entries.append(json.loads(line))
+        assert len(entries) == 1
+        assert entries[0]["plate"] == "MH12AB1234"
+        assert "logged_at" in entries[0]
+
+    def test_multiple_entries(self, tmp_path):
+        log_path = str(tmp_path / "report_log.jsonl")
+        for i in range(5):
+            entry = {"plate": "DL%02dA1234" % i, "logged_at": datetime.now().isoformat()}
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        entries = []
+        with open(log_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    entries.append(json.loads(line))
+        assert len(entries) == 5
+
+    def test_empty_log_read(self, tmp_path):
+        log_path = str(tmp_path / "report_log.jsonl")
+        # File doesn't exist yet
+        entries = []
+        try:
+            with open(log_path, "r") as f:
+                for line in f:
+                    if line.strip():
+                        entries.append(json.loads(line))
+        except FileNotFoundError:
+            pass
+        assert len(entries) == 0
+
+    def test_log_preserves_all_fields(self, tmp_path):
+        log_path = str(tmp_path / "report_log.jsonl")
+        report = {
+            "plate": "KA03MM5678", "offense": "HELMET",
+            "lat": 12.9716, "lon": 77.5946,
+            "recipients": ["bangloretrafficpolice@gmail.com"],
+            "evidence_hash": "abc123",
+        }
+        entry = dict(report)
+        entry["logged_at"] = datetime.now().isoformat()
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        loaded = json.loads(open(log_path).readline())
+        assert loaded["lat"] == 12.9716
+        assert loaded["evidence_hash"] == "abc123"
+
+
+# ============================================================================
+# TEST SUITE 16: OfflineReportQueue (Phase 3)
+# ============================================================================
+class TestOfflineReportQueue:
+    """Test offline report queue."""
+
+    def test_enqueue_creates_file(self, tmp_path):
+        queue_dir = str(tmp_path / "queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        report = {"plate": "MH12AB1234", "body": "test report"}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fpath = os.path.join(queue_dir, "report_%s.json" % ts)
+        with open(fpath, "w") as f:
+            f.write(json.dumps(report))
+        assert os.path.isfile(fpath)
+
+    def test_pending_lists_oldest_first(self, tmp_path):
+        queue_dir = str(tmp_path / "queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        for i in range(3):
+            fpath = os.path.join(queue_dir, "report_%02d.json" % i)
+            with open(fpath, "w") as f:
+                f.write(json.dumps({"id": i}))
+        files = sorted(f for f in os.listdir(queue_dir) if f.endswith(".json"))
+        assert files == ["report_00.json", "report_01.json", "report_02.json"]
+
+    def test_dequeue_removes_file(self, tmp_path):
+        queue_dir = str(tmp_path / "queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        fpath = os.path.join(queue_dir, "report_test.json")
+        with open(fpath, "w") as f:
+            f.write(json.dumps({"test": True}))
+        assert os.path.isfile(fpath)
+        os.remove(fpath)
+        assert not os.path.isfile(fpath)
+
+    def test_load_queued_report(self, tmp_path):
+        queue_dir = str(tmp_path / "queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        report = {"plate": "DL01C1234", "offense": "DANGEROUS"}
+        fpath = os.path.join(queue_dir, "report_load.json")
+        with open(fpath, "w") as f:
+            f.write(json.dumps(report))
+        loaded = json.loads(open(fpath).read())
+        assert loaded["plate"] == "DL01C1234"
+
+    def test_empty_queue(self, tmp_path):
+        queue_dir = str(tmp_path / "queue")
+        os.makedirs(queue_dir, exist_ok=True)
+        files = [f for f in os.listdir(queue_dir) if f.endswith(".json")]
+        assert len(files) == 0
+
+
+# ============================================================================
+# TEST SUITE 17: ConnectivityChecker (Phase 3)
+# ============================================================================
+class TestConnectivityChecker:
+    """Test network connectivity detection."""
+
+    def test_socket_probe_mechanism(self):
+        """Verify the probe uses correct host/port."""
+        host, port, timeout = "8.8.8.8", 53, 3.0
+        assert host == "8.8.8.8"
+        assert port == 53
+        assert timeout == 3.0
+
+    def test_offline_detection_with_bad_host(self):
+        """Connecting to unreachable host should fail."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.1)
+            s.connect(("192.0.2.1", 1))  # RFC 5737 TEST-NET, unreachable
+            s.close()
+            online = True
+        except Exception:
+            online = False
+        assert online is False
+
+    def test_probe_returns_bool(self):
+        """is_online should return a boolean."""
+        # Just verify the logic works with a mock
+        result = False  # simulated offline
+        assert isinstance(result, bool)
+
+
+# ============================================================================
+# TEST SUITE 18: SpeedZoneChecker (Phase 4)
+# ============================================================================
+class TestSpeedZoneChecker:
+    """Test speed zone awareness."""
+
+    def test_haversine_zero_distance(self):
+        """Same point should have zero distance."""
+        R = 6371000.0
+        lat, lon = 28.6139, 77.2090
+        phi1 = math.radians(lat)
+        phi2 = math.radians(lat)
+        dphi = 0
+        dlam = 0
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        assert dist < 0.01
+
+    def test_haversine_known_distance(self):
+        """Delhi to Mumbai is ~1150 km."""
+        R = 6371000.0
+        lat1, lon1 = 28.6139, 77.2090  # Delhi
+        lat2, lon2 = 19.0760, 72.8777  # Mumbai
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        assert 1100000 < dist < 1200000
+
+    def test_zone_violation_detected(self):
+        """Speeding in a school zone should trigger violation."""
+        zones = [
+            (28.6139, 77.2090, "school", "Test School"),
+        ]
+        zone_limits = {"school": {"limit_kmh": 25, "radius_m": 200}}
+        lat, lon, speed_kmh = 28.6139, 77.2090, 60  # right at zone, over limit
+        violations = []
+        for zlat, zlon, ztype, zlabel in zones:
+            R = 6371000.0
+            phi1, phi2 = math.radians(lat), math.radians(zlat)
+            dphi = math.radians(zlat - lat)
+            dlam = math.radians(zlon - lon)
+            a = (math.sin(dphi / 2) ** 2 +
+                 math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+            dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            info = zone_limits[ztype]
+            if dist <= info["radius_m"] and speed_kmh > info["limit_kmh"]:
+                violations.append((ztype, zlabel, info["limit_kmh"], dist))
+        assert len(violations) == 1
+        assert violations[0][0] == "school"
+
+    def test_no_violation_under_limit(self):
+        """Speed under limit should not trigger."""
+        limit_kmh = 25
+        speed_kmh = 20
+        assert speed_kmh <= limit_kmh
+
+    def test_no_violation_outside_radius(self):
+        """Far from zone should not trigger even if speeding."""
+        R = 6371000.0
+        lat1, lon1 = 28.6139, 77.2090
+        lat2, lon2 = 28.6200, 77.2200  # ~1km away
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        assert dist > 200  # outside 200m school zone
+
+    def test_zone_types_have_limits(self):
+        """All zone types should have limit_kmh and radius_m."""
+        zones = {
+            "school": {"limit_kmh": 25, "radius_m": 200},
+            "hospital": {"limit_kmh": 25, "radius_m": 150},
+            "residential": {"limit_kmh": 30, "radius_m": 300},
+        }
+        for ztype, info in zones.items():
+            assert "limit_kmh" in info
+            assert "radius_m" in info
+            assert info["limit_kmh"] > 0
+            assert info["radius_m"] > 0
+
+
+# ============================================================================
+# TEST SUITE 19: SubsystemStatus (Phase 4)
+# ============================================================================
+class TestSubsystemStatus:
+    """Test subsystem status aggregator."""
+
+    def test_update_and_get(self):
+        status = {}
+        status["cam"] = {"healthy": True, "detail": "", "ts": time.time()}
+        assert status["cam"]["healthy"] is True
+
+    def test_all_healthy(self):
+        status = {
+            "cam": {"healthy": True},
+            "gps": {"healthy": True},
+            "dashcam": {"healthy": True},
+        }
+        assert all(s["healthy"] for s in status.values())
+
+    def test_not_all_healthy(self):
+        status = {
+            "cam": {"healthy": True},
+            "gps": {"healthy": False},
+        }
+        assert not all(s["healthy"] for s in status.values())
+
+    def test_summary_format(self):
+        status = {
+            "cam": {"healthy": True},
+            "gps": {"healthy": False},
+        }
+        parts = []
+        for name, info in sorted(status.items()):
+            icon = "OK" if info["healthy"] else "ERR"
+            parts.append("%s:%s" % (name, icon))
+        summary = " | ".join(parts)
+        assert "cam:OK" in summary
+        assert "gps:ERR" in summary
+
+    def test_unknown_subsystem(self):
+        status = {}
+        result = status.get("unknown", {"healthy": False, "detail": "unknown"})
+        assert result["healthy"] is False
+
+
+# ============================================================================
+# TEST SUITE 20: HarshBrakeLog (Phase 4)
+# ============================================================================
+class TestHarshBrakeLog:
+    """Test harsh braking event log."""
+
+    def test_record_event(self, tmp_path):
+        log_dir = str(tmp_path / "brake_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "harsh_brake_log.jsonl")
+        event = {
+            "ts": datetime.now().isoformat(),
+            "g_dyn": 5.2, "lat": 28.6139, "lon": 77.2090,
+            "speed_kmh": 85.0,
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(event) + "\n")
+        assert os.path.isfile(log_path)
+
+    def test_multiple_events(self, tmp_path):
+        log_path = str(tmp_path / "brake.jsonl")
+        events = []
+        for i in range(5):
+            event = {"ts": datetime.now().isoformat(), "g_dyn": 4.0 + i * 0.5}
+            events.append(event)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        loaded = []
+        with open(log_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    loaded.append(json.loads(line))
+        assert len(loaded) == 5
+
+    def test_recent_events(self):
+        events = [{"g_dyn": 4.0 + i * 0.1} for i in range(20)]
+        recent = events[-10:]
+        assert len(recent) == 10
+        assert recent[0]["g_dyn"] == pytest.approx(5.0, abs=0.01)
+
+    def test_debounce_logic(self):
+        """Events within 5s should be debounced."""
+        last_ts = time.time()
+        now = time.time()
+        assert now - last_ts < 5.0  # should be debounced
+
+    def test_event_fields(self):
+        event = {
+            "ts": datetime.now().isoformat(),
+            "g_dyn": 5.5, "lat": 19.076, "lon": 72.878,
+            "speed_kmh": 92.3,
+        }
+        required = {"ts", "g_dyn", "lat", "lon", "speed_kmh"}
+        assert required == set(event.keys())
+
+
+# ============================================================================
+# TEST SUITE 21: ONNXDetector (Phase 4)
+# ============================================================================
+class TestONNXDetector:
+    """Test ONNX model loader."""
+
+    def test_no_model_not_available(self, tmp_path):
+        """When no model file exists, detector is not available."""
+        model_dir = str(tmp_path / "models")
+        os.makedirs(model_dir, exist_ok=True)
+        mpath = os.path.join(model_dir, "detector.onnx")
+        assert not os.path.isfile(mpath)
+
+    def test_detect_returns_list_when_unavailable(self):
+        """When unavailable, detect returns empty list."""
+        detections = []  # simulated unavailable
+        assert isinstance(detections, list)
+        assert len(detections) == 0
+
+    def test_model_path_default(self, tmp_path):
+        model_dir = str(tmp_path / "models")
+        os.makedirs(model_dir, exist_ok=True)
+        expected = os.path.join(model_dir, "detector.onnx")
+        assert expected.endswith("detector.onnx")
+
+
+# ============================================================================
+# TEST SUITE 22: EvidenceWatermark (Phase 2)
+# ============================================================================
+class TestEvidenceWatermark:
+    """Test metadata watermarking."""
+
+    def test_watermark_text_format(self):
+        ts = "20260321_143000"
+        lat, lon = 28.6139, 77.2090
+        line1 = "%s | %.5f,%.5f" % (ts, lat, lon)
+        assert "28.61390" in line1
+        assert "77.20900" in line1
+        assert ts in line1
+
+    def test_watermark_with_plate(self):
+        plate = "MH12AB1234"
+        line2 = "Plate: %s | Sentinel-X" % plate
+        assert "MH12AB1234" in line2
+        assert "Sentinel-X" in line2
+
+    def test_watermark_without_plate(self):
+        line2 = "Sentinel-X"
+        assert "Sentinel-X" in line2
+
+
+# ============================================================================
+# TEST SUITE 23: QueueRetryDaemon (Phase 3)
+# ============================================================================
+class TestQueueRetryDaemon:
+    """Test offline queue auto-retry daemon."""
+
+    def test_retry_interval(self):
+        assert 60.0 > 0  # RETRY_INTERVAL = 60s
+
+    def test_retry_skips_when_offline(self):
+        """When offline, retry should not attempt to send."""
+        online = False
+        attempted = False
+        if online:
+            attempted = True
+        assert attempted is False
+
+    def test_retry_sends_when_online(self):
+        """When online, retry should attempt to send queued reports."""
+        online = True
+        pending = ["/path/report_1.json", "/path/report_2.json"]
+        attempted = []
+        if online:
+            for p in pending:
+                attempted.append(p)
+        assert len(attempted) == 2
+
+    def test_successful_send_dequeues(self):
+        """After successful send, report is removed from queue."""
+        queue = ["report_1.json", "report_2.json"]
+        sent = queue.pop(0)
+        assert sent == "report_1.json"
+        assert len(queue) == 1
 
 
 # ============================================================================

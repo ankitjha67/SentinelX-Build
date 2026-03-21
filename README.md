@@ -17,6 +17,16 @@ AI-powered traffic violation reporting app for Android. Captures evidence, detec
 - **Harsh Braking** — Background 10Hz accelerometer monitoring (G_dyn > 4.0 m/s² threshold)
 - **Service Telemetry** — Main app consumes GPS/accelerometer from background service via UDP (port 17888)
 - **Memory Safety** — Bounded frame ring buffer (30 frames max) prevents OOM on continuous use
+- **Evidence Integrity** — SHA-256 hash sidecar files for tamper detection
+- **Metadata Watermark** — GPS coordinates, timestamp, and plate burned onto evidence images
+- **Report History** — Append-only JSON-lines log of all sent reports
+- **Offline Queue** — Reports queued as JSON when offline, auto-retried when connectivity returns
+- **Connectivity Detection** — Socket probe to 8.8.8.8:53 for network status
+- **Queue Retry Daemon** — Background thread retries queued reports every 60s
+- **ONNX Detector** — Optional ONNX model inference for number plate detection (drop `detector.onnx` into models/)
+- **Speed Zones** — Haversine-based proximity checks for school/hospital/residential zones with speed limits
+- **Subsystem Status** — Real-time health monitoring of all subsystems displayed in status bar
+- **Harsh Brake Log** — JSON-lines event log with timestamps, G-force, GPS, and speed (5s debounce)
 - **Dual Routing** — Reports sent to BOTH location-based AND plate-based police authorities
 - **Offline Geocoding** — GPS to state/district without internet
 - **Good Samaritan** — Anonymous reporting with §134A legal protection in every email
@@ -55,7 +65,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-All 97 tests must pass before building.
+All 142 tests must pass before building.
 
 ### Step 3: Install Buildozer
 
@@ -133,13 +143,13 @@ If you don't want to install anything locally:
 SentinelX/
 ├── camerax_provider/          ← Android CameraX bindings (cloned by setup.sh)
 │   └── gradle_options.py      ← p4a hook — camera won't work without this
-├── main.py                    ← App (Phase 1: continuous recording + crash recovery)
+├── main.py                    ← App (Phases 1-4: recording, integrity, offline, detection)
 ├── service.py                 ← Background GPS + accelerometer service (UDP broadcast)
 ├── buildozer.spec             ← Android build config
 ├── setup.sh                   ← One-time setup script
 ├── tests/
 │   ├── conftest.py
-│   └── test_sentinelx.py      ← 97 unit tests
+│   └── test_sentinelx.py      ← 142 unit tests (23 test suites)
 ├── .github/workflows/
 │   └── build.yml              ← CI: test → build APK
 ├── .gitignore
@@ -149,7 +159,9 @@ SentinelX/
 
 ---
 
-## Architecture — Phase 1 Subsystems
+## Architecture
+
+### Phase 1 — Camera & Telemetry
 
 ```
 Camera Frame Flow:
@@ -170,13 +182,72 @@ Crash Recovery:
   CameraWatchdog ──(no frame >5s)──► disconnect + reconnect (2s, 4s, 8s, 16s, 30s backoff)
 ```
 
-| Subsystem | Class | Thread | Purpose |
-|-----------|-------|--------|---------|
-| Frame Buffer | `FrameRingBuffer` | shared | Bounded deque, prevents OOM |
-| Analysis | `FrameAnalysisWorker` | daemon | CV processing off main thread |
-| Watchdog | `CameraWatchdog` | Kivy Clock | Detects camera stalls, auto-reconnects |
-| Recording | `DashcamRecorder` | daemon | Continuous JPEG segments, auto-prune |
-| Telemetry | `TelemetryReceiver` | daemon | Consumes service.py UDP broadcasts |
+### Phase 2 — Evidence Integrity
+
+```
+Capture Flow:
+  capture_evidence() ──► export_to_png ──► CLAHE (if enabled)
+                                              │
+                                    EvidenceWatermark.apply()  (GPS + timestamp burned on image)
+                                              │
+                                    EvidenceHasher.write_hashfile()  (SHA-256 sidecar)
+
+Report Flow:
+  send_report() ──► plyer.email ──► ReportLog.append()  (JSONL history)
+```
+
+### Phase 3 — Offline Resilience
+
+```
+Online:
+  send_report() ──► plyer.email ──► success ──► ReportLog.append()
+
+Offline:
+  send_report() ──► plyer.email ──► fails ──► OfflineReportQueue.enqueue()
+                                                       │
+  QueueRetryDaemon (60s interval) ──► ConnectivityChecker.is_online()?
+       │ yes                                           │
+       └──► load queued report ──► send ──► dequeue ──► ReportLog.append()
+```
+
+### Phase 4 — Detection & Monitoring
+
+```
+Speed Zone Check:
+  _tick_ui() ──► SpeedZoneChecker.check(lat, lon, kmh)
+                  └── haversine distance to registered zones
+                  └── alert if within radius AND over limit
+
+Subsystem Monitor:
+  _tick_ui() ──► SubsystemStatus.update(cam, gps, dashcam, telemetry, queue)
+                  └── summary() ──► status bar display
+
+Harsh Brake Events:
+  _poll_accel() ──► g_dyn > 4.0? ──► HarshBrakeLog.record() (5s debounce)
+
+ONNX Detection (optional):
+  ONNXDetector ──► loads models/detector.onnx ──► detect(bgr_image) ──► [(x,y,w,h,conf)]
+```
+
+### All Subsystems
+
+| Phase | Subsystem | Class | Thread | Purpose |
+|-------|-----------|-------|--------|---------|
+| 1 | Frame Buffer | `FrameRingBuffer` | shared | Bounded deque, prevents OOM |
+| 1 | Analysis | `FrameAnalysisWorker` | daemon | CV processing off main thread |
+| 1 | Watchdog | `CameraWatchdog` | Kivy Clock | Detects camera stalls, auto-reconnects |
+| 1 | Recording | `DashcamRecorder` | daemon | Continuous JPEG segments, auto-prune |
+| 1 | Telemetry | `TelemetryReceiver` | daemon | Consumes service.py UDP broadcasts |
+| 2 | Hashing | `EvidenceHasher` | main | SHA-256 tamper detection |
+| 2 | Watermark | `EvidenceWatermark` | main | Burns GPS/timestamp onto images |
+| 2 | Report Log | `ReportLog` | main | Append-only JSONL history |
+| 3 | Queue | `OfflineReportQueue` | main | Stores reports as JSON files |
+| 3 | Connectivity | `ConnectivityChecker` | daemon | Socket probe to 8.8.8.8:53 |
+| 3 | Retry | `QueueRetryDaemon` | daemon | Auto-retries queued reports |
+| 4 | ONNX | `ONNXDetector` | main | Optional plate detection model |
+| 4 | Speed Zones | `SpeedZoneChecker` | main | Haversine proximity + speed limits |
+| 4 | Status | `SubsystemStatus` | main | Health aggregator for all subsystems |
+| 4 | Brake Log | `HarshBrakeLog` | main | JSONL event log with debounce |
 
 ---
 
