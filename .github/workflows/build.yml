@@ -2,6 +2,8 @@ name: build
 
 on:
   push:
+    branches: ["main", "claude/*"]
+  pull_request:
     branches: ["main"]
   workflow_dispatch: {}
 
@@ -68,6 +70,9 @@ jobs:
           yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null || true
           "$SM" --sdk_root="$SDK" platform-tools "platforms;android-33" "build-tools;33.0.2"
 
+      - name: Setup project
+        run: bash setup.sh
+
       - name: Build debug APK
         run: buildozer -v android debug
 
@@ -75,3 +80,4 @@ jobs:
         with:
           name: sentinelx-apk
           path: bin/*.apk
+          retention-days: 30
