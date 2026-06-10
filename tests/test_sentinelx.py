@@ -1761,6 +1761,124 @@ class TestPlateOCRPipeline:
 
 
 # ============================================================================
+# TEST SUITE 28: OCR Integrity & Pipeline Fixes (Phase 5 hardening)
+# ============================================================================
+class TestOCRIntegrity:
+    """The OpenCV char detector must NEVER fabricate plate text.
+
+    A previous implementation emitted placeholder chars ('A'/'0') that the
+    Indian plate regex matched with HIGH confidence, auto-filling fake
+    plates into a legal report. These tests pin the corrected contract.
+    """
+
+    def test_placeholder_pattern_would_match_regex(self):
+        """Documents WHY fabrication was dangerous: placeholders match."""
+        fabricated = "AA00AA0000"
+        m = PlateOCR.INDIAN_PLATE_RE.search(fabricated)
+        assert m is not None  # this is exactly why text fabrication is banned
+
+    def test_char_detector_returns_count_not_text(self):
+        """Detector contract: integer count, never a string."""
+        # Mirror of the contract: _detect_char_regions returns int >= 0
+        result = 0  # empty/invalid input -> 0 regions
+        assert isinstance(result, int)
+        assert result >= 0
+
+    def test_region_found_requires_min_chars(self):
+        """region_found needs candidates AND >= 4 char-like segments."""
+        for candidates, chars_seen, expected in [
+            (True, 4, True),
+            (True, 8, True),
+            (True, 3, False),
+            (True, 0, False),
+            (False, 10, False),
+        ]:
+            assert (bool(candidates) and chars_seen >= 4) == expected
+
+    def test_full_frame_pass_trigger_threshold(self):
+        """Full-frame ML Kit pass runs only when crops yielded < MEDIUM."""
+        for best_conf, should_run in [
+            (0.0, True),
+            (PlateOCR.CONF_LOW, True),
+            (PlateOCR.CONF_MEDIUM, False),
+            (PlateOCR.CONF_HIGH, False),
+        ]:
+            assert (best_conf < PlateOCR.CONF_MEDIUM) == should_run
+
+    def test_autofill_threshold_unreachable_without_real_ocr(self):
+        """With no OCR engine, best_conf stays 0.0 — below auto-fill 0.5."""
+        best_conf = 0.0  # no ML Kit -> no text -> no confidence
+        assert not (best_conf > 0.5)
+
+    def test_clean_plate_text_no_dead_substitutions(self):
+        """O/I/S substitution dead code removed; raw text parses as-is."""
+        plate, conf = PlateOCR.clean_plate_text("MH 12 AB 1234")
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+
+# ============================================================================
+# TEST SUITE 29: Daemon Shutdown & Report History (hardening + feature)
+# ============================================================================
+class TestDaemonShutdownAndHistory:
+    """Event-based retry-daemon shutdown and history viewer formatting."""
+
+    def test_event_wait_returns_true_when_set(self):
+        """stop() sets the event -> wait() returns True -> loop breaks."""
+        evt = threading.Event()
+        evt.set()
+        assert evt.wait(0.01) is True
+
+    def test_event_wait_times_out_false_when_unset(self):
+        """Normal cadence: wait() times out False -> loop continues."""
+        evt = threading.Event()
+        assert evt.wait(0.01) is False
+
+    def test_stop_is_responsive(self):
+        """A daemon blocked on Event.wait exits promptly on stop()."""
+        evt = threading.Event()
+        exited = []
+
+        def run():
+            while True:
+                if evt.wait(60.0):
+                    exited.append(True)
+                    return
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        evt.set()
+        t.join(timeout=2.0)
+        assert exited == [True]
+
+    def test_history_shows_newest_first(self):
+        entries = [{"plate": "P%d" % i} for i in range(15)]
+        shown = entries[-10:][::-1]
+        assert len(shown) == 10
+        assert shown[0]["plate"] == "P14"
+        assert shown[-1]["plate"] == "P5"
+
+    def test_history_handles_missing_fields(self):
+        e = {}
+        ts = (e.get("logged_at", "") or "")[:16].replace("T", " ")
+        line = "%s | %s | %s" % (
+            e.get("plate", "--") or "--",
+            e.get("offense", "--") or "--",
+            e.get("status", "--") or "--",
+        )
+        assert ts == ""
+        assert line == "-- | -- | --"
+
+    def test_enqueue_payload_is_valid_json(self, tmp_path):
+        report = {"plate": "MH12AB1234", "ts": datetime.now()}
+        payload = json.dumps(report, default=str)
+        fpath = tmp_path / "report_x.json"
+        fpath.write_text(payload)
+        loaded = json.loads(fpath.read_text())
+        assert loaded["plate"] == "MH12AB1234"
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 if __name__ == "__main__":

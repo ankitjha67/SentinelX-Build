@@ -336,6 +336,7 @@ class PlateOCR:
         self._last_plate = ""
         self._last_confidence = 0.0
         self._cooldown = 0
+        self._region_found = False
         self._lock = threading.Lock()
         self._init_mlkit()
 
@@ -377,6 +378,7 @@ class PlateOCR:
             self._last_plate = ""
             self._last_confidence = 0.0
             self._cooldown = 0
+            self._region_found = False
 
     # ── Plate candidate cropping ─────────────────────────────────────────
     @staticmethod
@@ -446,19 +448,6 @@ class PlateOCR:
         if not raw:
             return "", 0.0
         text = raw.upper().strip()
-        # Common OCR substitutions
-        text = text.replace("O", "0").replace("I", "1").replace("S", "5")
-        # Revert letter positions back (first 2 must be alpha)
-        chars = list(text)
-        cleaned_alpha = re.sub(r"[^A-Z0-9]", "", raw.upper().strip())
-        if len(cleaned_alpha) >= 2:
-            # Restore first 2 as letters
-            first2 = raw.upper().strip()[:6]
-            first2_alpha = re.sub(r"[^A-Z]", "", first2)
-            if len(first2_alpha) >= 2:
-                pass  # Keep original logic below
-
-        text = raw.upper().strip()
         text = re.sub(r"[^A-Z0-9\s]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
 
@@ -510,18 +499,18 @@ class PlateOCR:
         except Exception:
             return ""
 
-    # ── OpenCV contour-based fallback OCR ────────────────────────────────
+    # ── OpenCV character-region detector (fallback signal, NOT text OCR) ─
     @staticmethod
-    def _ocr_opencv_fallback(crop_bgr):
-        """Fallback OCR using OpenCV morphological analysis.
+    def _detect_char_regions(crop_bgr):
+        """Count character-like contours in a preprocessed plate crop.
 
-        Segments character-like contours from a preprocessed plate crop,
-        reads approximate character shapes via aspect-ratio heuristics,
-        and reconstructs a candidate plate string.
-        Returns raw text string or empty string.
+        OpenCV alone cannot read glyphs, so this NEVER returns text — it
+        only signals that a plate-like region with character segments was
+        found, so the UI can tell the user text isn't readable yet.
+        Returns the number of character-like regions detected.
         """
         if cv2 is None or np is None:
-            return ""
+            return 0
         try:
             preprocessed = PlateOCR.preprocess_plate(crop_bgr)
             if len(preprocessed.shape) == 3:
@@ -533,46 +522,21 @@ class PlateOCR:
             if np.mean(gray) > 127:
                 gray = cv2.bitwise_not(gray)
 
-            # Find character contours
             cnts, _ = cv2.findContours(
                 gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
             h_img, w_img = gray.shape[:2]
-            char_boxes = []
+            count = 0
             for c in cnts:
                 x, y, cw, ch = cv2.boundingRect(c)
                 # Character-like: tall-ish, not too wide, reasonable size
                 if (ch > h_img * 0.3 and cw > 3 and cw < w_img * 0.25
                         and 0.15 < (cw / max(ch, 1)) < 1.2):
-                    char_boxes.append((x, y, cw, ch))
-
-            if len(char_boxes) < 4:
-                return ""
-
-            # Sort left-to-right
-            char_boxes.sort(key=lambda b: b[0])
-
-            # Classify each character region as letter or digit by aspect ratio
-            chars = []
-            for x, y, cw, ch in char_boxes:
-                roi = gray[y:y + ch, x:x + cw]
-                fill = np.count_nonzero(roi) / max(roi.size, 1)
-                ar = cw / max(ch, 1)
-                # Heuristic: wider chars with more fill tend to be letters
-                if ar > 0.55 and fill > 0.35:
-                    chars.append("A")  # placeholder letter
-                else:
-                    chars.append("0")  # placeholder digit
-
-            # Build pattern string for regex validation
-            # Indian plates: 2 letters + 1-2 digits + 0-3 letters + 1-4 digits
-            pattern = "".join(chars)
-            if len(pattern) >= 6:
-                return pattern
-            return ""
+                    count += 1
+            return count
         except Exception:
-            return ""
+            return 0
 
     # ── Full pipeline ────────────────────────────────────────────────────
     def process_frame(self, bgr):
@@ -588,26 +552,44 @@ class PlateOCR:
 
         candidates = self.crop_plate_candidates(bgr)
         best_plate, best_conf = "", 0.0
+        chars_seen = 0
 
         for crop, bbox in candidates:
-            raw = ""
             if self._available:
                 raw = self._ocr_mlkit(crop)
-            if not raw:
-                raw = self._ocr_opencv_fallback(crop)
+                if raw:
+                    plate, conf = self.clean_plate_text(raw)
+                    if conf > best_conf:
+                        best_plate, best_conf = plate, conf
+                        if conf >= self.CONF_HIGH:
+                            break  # Good enough, stop early
+            if best_conf < self.CONF_MEDIUM:
+                chars_seen = max(chars_seen, self._detect_char_regions(crop))
+
+        # Full-frame ML Kit pass: contour cropping can miss the plate
+        # entirely (odd angles, partial occlusion). ML Kit locates text
+        # itself, so give it the whole frame before giving up.
+        if self._available and best_conf < self.CONF_MEDIUM:
+            raw = self._ocr_mlkit(bgr)
             if raw:
                 plate, conf = self.clean_plate_text(raw)
                 if conf > best_conf:
                     best_plate, best_conf = plate, conf
-                    if conf >= self.CONF_HIGH:
-                        break  # Good enough, stop early
 
         with self._lock:
+            self._region_found = bool(candidates) and chars_seen >= 4
             if best_conf > 0.5:
                 self._last_plate = best_plate
                 self._last_confidence = best_conf
                 self._cooldown = 15  # ~5s cooldown at 3fps analysis rate
             return best_plate, best_conf
+
+    @property
+    def region_found(self):
+        """True when a plate-like region with characters was seen but
+        no readable text could be extracted (e.g. no OCR engine)."""
+        with self._lock:
+            return self._region_found
 
     def suggest_routing(self, plate, lat=0.0, lon=0.0):
         """Given an OCR-detected plate, suggest jurisdiction email routing.
@@ -856,10 +838,12 @@ class DashcamRecorder:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
             fname = "f_%s.jpg" % datetime.now().strftime("%H%M%S_%f")
             fpath = os.path.join(self._current_segment_dir, fname)
-            cv2.imencode(
+            ok, buf = cv2.imencode(
                 ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )[1].tofile(fpath)
-            self._frame_count += 1
+            )
+            if ok:
+                buf.tofile(fpath)
+                self._frame_count += 1
         except Exception:
             pass
 
@@ -1071,9 +1055,9 @@ class OfflineReportQueue:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         fpath = os.path.join(self._dir, "report_%s.json" % ts)
         try:
+            payload = json.dumps(report_dict, default=str)
             with open(fpath, "w") as f:
-                json.dumps(report_dict, default=str)  # validate first
-                f.write(json.dumps(report_dict, default=str))
+                f.write(payload)
             return fpath
         except Exception:
             return ""
@@ -1143,21 +1127,25 @@ class QueueRetryDaemon:
         self._send_cb = send_callback
         self._running = False
         self._thread = None
+        self._stop_evt = threading.Event()
 
     def start(self):
         self._running = True
+        self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+        self._stop_evt.set()
         if self._thread:
             self._thread.join(timeout=5.0)
 
     def _run(self):
         while self._running:
-            time.sleep(self.RETRY_INTERVAL)
-            if not self._running:
+            # Event.wait returns immediately when stop() sets the event,
+            # so shutdown is not delayed by the retry interval.
+            if self._stop_evt.wait(self.RETRY_INTERVAL):
                 break
             if not ConnectivityChecker.is_online():
                 continue
@@ -1522,7 +1510,7 @@ KV = """
             halign: "left"
             valign: "middle"
             text_size: self.size
-            size_hint_x: 0.6
+            size_hint_x: 0.5
         Label:
             text: "v1.5"
             font_size: "11sp"
@@ -1530,7 +1518,29 @@ KV = """
             halign: "right"
             valign: "middle"
             text_size: self.size
-            size_hint_x: 0.4
+            size_hint_x: 0.25
+        Button:
+            text: "HISTORY"
+            size_hint_x: 0.25
+            font_size: "11sp"
+            bold: True
+            color: C("#00E5FF")
+            background_normal: ""
+            background_down: ""
+            background_color: (0, 0, 0, 0)
+            on_release: root.show_history()
+            canvas.before:
+                Color:
+                    rgba: C("#1A2035")
+                RoundedRectangle:
+                    pos: (self.x + dp(4), self.y + dp(4))
+                    size: (self.width - dp(8), self.height - dp(8))
+                    radius: [dp(8)]
+                Color:
+                    rgba: C("#253050")
+                Line:
+                    rounded_rectangle: (self.x + dp(4), self.y + dp(4), self.width - dp(8), self.height - dp(8), dp(8))
+                    width: 0.8
 
     # ── Camera Viewport ──────────────────────────────────────────────────
     BoxLayout:
@@ -1570,6 +1580,16 @@ KV = """
             valign: "middle"
             text_size: self.size
             markup: True
+            size_hint_x: 0.68
+        Label:
+            text: root.alert_text
+            font_size: "10sp"
+            bold: True
+            color: C("#FF5252")
+            halign: "right"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.32
 
     # ── Scrollable Content ───────────────────────────────────────────────
     ScrollView:
@@ -1837,6 +1857,7 @@ class RootUI(BoxLayout):
     route_text = StringProperty(DASH)
     evidence_status = StringProperty("")
     ocr_suggest_text = StringProperty("")
+    alert_text = StringProperty("")
     latest_lat = NumericProperty(0.0)
     latest_lon = NumericProperty(0.0)
     latest_speed = NumericProperty(0.0)
@@ -2034,6 +2055,12 @@ class RootUI(BoxLayout):
                 float(self.latest_lon), self.latest_speed * 3.6
             )
             self._last_harsh_brake_ts = now
+            # On-screen alert, auto-clears after 4s
+            self.alert_text = "HARSH BRAKE %.1f" % self.latest_g
+            def _clear_alert(dt, ts=now):
+                if self._last_harsh_brake_ts == ts:
+                    self.alert_text = ""
+            Clock.schedule_once(_clear_alert, 4.0)
 
     # ── Camera ───────────────────────────────────────────────────────────
     def _setup_camera(self):
@@ -2101,7 +2128,7 @@ class RootUI(BoxLayout):
 
         try:
             # export_to_png grabs current frame from the preview texture
-            result = self._preview.export_to_png(fpath)
+            self._preview.export_to_png(fpath)
 
             if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
                 # Apply CLAHE if enabled
@@ -2218,7 +2245,16 @@ class RootUI(BoxLayout):
                         % (ocr_plate, state, ocr_conf * 100)
                     )
             else:
-                self.ocr_suggest_text = "OCR: scanning..." if ocr_active else ""
+                if not self._plate_ocr.available:
+                    self.ocr_suggest_text = (
+                        "OCR: text engine unavailable - enter plate manually"
+                    )
+                elif self._plate_ocr.region_found:
+                    self.ocr_suggest_text = (
+                        "OCR: plate region found - move closer / hold steady"
+                    )
+                else:
+                    self.ocr_suggest_text = "OCR: scanning..."
         else:
             self.ocr_suggest_text = ""
 
@@ -2374,7 +2410,26 @@ class RootUI(BoxLayout):
         except Exception:
             return False
 
-    def _popup(self, t, m):
+    # ── Report history viewer ────────────────────────────────────────────
+    def show_history(self):
+        """Show the last 10 sent reports from the report log."""
+        entries = self._report_log.read_all() if self._report_log else []
+        if not entries:
+            self._popup("History", "No reports sent yet.")
+            return
+        lines = []
+        for e in entries[-10:][::-1]:
+            ts = (e.get("logged_at", "") or "")[:16].replace("T", " ")
+            lines.append("%s\n  %s | %s | %s" % (
+                ts or DASH,
+                e.get("plate", DASH) or DASH,
+                e.get("offense", DASH) or DASH,
+                e.get("status", DASH) or DASH,
+            ))
+        title = "History (%d of %d)" % (min(len(entries), 10), len(entries))
+        self._popup(title, "\n\n".join(lines), tall=True)
+
+    def _popup(self, t, m, tall=False):
         # Determine accent color based on popup type
         if t in ("Saved!", "Ready"):
             accent = (0, 0.78, 0.33, 1)       # green
@@ -2391,11 +2446,19 @@ class RootUI(BoxLayout):
             text_size=(dp(240), None), font_size="13sp",
             color=(0.82, 0.84, 0.88, 1),
         )
-        content.add_widget(lbl)
+        if tall:
+            from kivy.uix.scrollview import ScrollView
+            lbl.size_hint_y = None
+            lbl.bind(texture_size=lambda inst, sz: setattr(inst, "height", sz[1]))
+            scroll = ScrollView(do_scroll_x=False)
+            scroll.add_widget(lbl)
+            content.add_widget(scroll)
+        else:
+            content.add_widget(lbl)
 
         p = Popup(
             title=t, content=content,
-            size_hint=(0.82, 0.28),
+            size_hint=(0.88, 0.62) if tall else (0.82, 0.28),
             title_size="15sp",
             title_color=accent,
             separator_color=accent,
