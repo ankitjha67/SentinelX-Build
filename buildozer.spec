@@ -20,6 +20,14 @@ services = service:service.py
 
 p4a.hook = camerax_provider/gradle_options.py
 
+# Pin python-for-android to the v2024.01.21 release. Buildozer clones its own p4a
+# (default branch = master), so a pip pin has no effect — this is the real lever.
+# That release's numpy recipe is 1.22.3, built via classic setup.py (no meson/ninja),
+# which cross-compiles cleanly on NDK r25b. Newer p4a ships numpy 2.x (meson) that
+# fails to build under NDK r25b's clang.
+p4a.fork = kivy
+p4a.branch = v2024.01.21
+
 android.api = 33
 android.minapi = 26
 android.sdk = 33
