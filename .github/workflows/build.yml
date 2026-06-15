@@ -18,6 +18,7 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -28,53 +29,48 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: System deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git zip unzip wget curl build-essential pkg-config \
             autoconf automake libtool libffi-dev libssl-dev \
-            python3-dev libtinfo5 zlib1g-dev
+            python3-dev zlib1g-dev lld
 
       - name: Install Buildozer
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "cython<3.0" buildozer
 
-      - name: Buildozer android update
-        run: |
-          rm -rf .buildozer || true
-          buildozer -v android update
-
-      - name: SDK licenses + build-tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDK="$HOME/.buildozer/android/platform/android-sdk"
-          export ANDROID_SDK_ROOT="$SDK" ANDROID_HOME="$SDK"
-          export ANDROID_SDK_HOME="$RUNNER_TEMP/aprefs"
-          mkdir -p "$ANDROID_SDK_HOME/.android"
-          touch "$ANDROID_SDK_HOME/.android/repositories.cfg"
-          export JAVA_TOOL_OPTIONS="-Duser.home=$ANDROID_SDK_HOME"
-
-          SM=""
-          for p in cmdline-tools/latest/bin cmdline-tools/bin tools/bin; do
-            [ -f "$SDK/$p/sdkmanager" ] && SM="$SDK/$p/sdkmanager" && break
-          done
-          [ -z "$SM" ] && echo "sdkmanager not found" && exit 1
-          chmod +x "$SM"
-
-          yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null || true
-          "$SM" --sdk_root="$SDK" platform-tools "platforms;android-33" "build-tools;33.0.2"
-
       - name: Setup project
         run: bash setup.sh
 
+      - name: Cache .buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            .buildozer
+            ~/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
       - name: Build debug APK
-        run: buildozer -v android debug
+        run: |
+          yes | buildozer -v android debug 2>&1 | tail -500
+        timeout-minutes: 45
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: sentinelx-apk-${{ github.sha }}
           path: bin/*.apk
+          if-no-files-found: ignore
           retention-days: 30
