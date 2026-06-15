@@ -285,10 +285,12 @@ class AnalyticsEngine:
             if w <= 0 or h <= 0:
                 return
             arr = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((h, w, 4))
-            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            bgr_full = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            # CV contour pass runs on a 640-capped copy for speed/stability.
+            bgr = bgr_full
             if w > 640:
                 s = 640.0 / w
-                bgr = cv2.resize(bgr, (640, int(h * s)))
+                bgr = cv2.resize(bgr_full, (640, int(h * s)))
             gray = cv2.bilateralFilter(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 9, 75, 75)
             cnts, _ = cv2.findContours(cv2.Canny(gray, 60, 180), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             count = 0
@@ -298,10 +300,13 @@ class AnalyticsEngine:
                 if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
                     count += 1
             self.result = "CV:%d" % count if count else "CV:--"
-            # Phase 5: Run OCR on detected plate regions
-            if self._plate_ocr and count > 0:
+            # Phase 5: Run OCR on the FULL-resolution frame every cadence.
+            # The engine locates text itself, so this works even when contour
+            # detection finds no plate-like rectangle. process_frame applies
+            # its own wall-clock throttle so this stays cheap.
+            if self._plate_ocr is not None:
                 try:
-                    plate, conf = self._plate_ocr.process_frame(bgr)
+                    plate, conf = self._plate_ocr.process_frame(bgr_full)
                     if conf > 0.5:
                         self.ocr_plate = plate
                         self.ocr_confidence = conf
@@ -312,38 +317,56 @@ class AnalyticsEngine:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# Phase 5 — Automatic Plate OCR (ML Kit + OpenCV fallback)
+# Phase 5 — Automatic Plate OCR (ML Kit on Android, Tesseract on desktop)
 # ═════════════════════════════════════════════════════════════════════════
 class PlateOCR:
-    """Automatic number plate recognition via OpenCV crop + ML Kit OCR.
+    """Automatic number plate recognition.
 
-    Pipeline: contour detection → crop plate candidates → preprocess →
-    ML Kit text recognition (Android) → regex cleanup to Indian plate format →
-    auto-suggest jurisdiction routing.
+    Engines (auto-selected): Google ML Kit on-device text recognition on
+    Android; pytesseract on desktop for development. The pipeline reads the
+    full frame first (ML Kit locates text itself), then refines with cropped
+    plate candidates, normalizes to the Indian plate format, and suggests
+    jurisdiction routing.
     """
 
+    # Final number block requires 3-4 digits: real Indian plates always have
+    # 3-4, and this rejects fragment noise from surrounding signage text
+    # (e.g. "LIMIT 50" must not be mis-read as a plate).
     INDIAN_PLATE_RE = re.compile(
-        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{1,4})", re.I
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})", re.I
     )
     # Confidence thresholds
     CONF_HIGH = 0.85   # Strong regex match with all groups
     CONF_MEDIUM = 0.6  # Partial match
     CONF_LOW = 0.35    # Alphanumeric fallback
+    # Wall-clock throttle so heavy OCR runs at most a couple times per second
+    SCAN_INTERVAL = 0.6    # actively searching
+    HOLD_INTERVAL = 4.0    # re-confirm interval after a successful read
 
     def __init__(self):
-        self._recognizer = None
-        self._available = False
+        self._engine = None        # "mlkit" | "tesseract" | None
+        self._recognizer = None    # ML Kit client
+        self._tess = None          # pytesseract module
         self._last_plate = ""
         self._last_confidence = 0.0
-        self._cooldown = 0
+        self._last_attempt = 0.0
         self._region_found = False
         self._lock = threading.Lock()
-        self._init_mlkit()
+        self._init_engines()
+
+    def _init_engines(self):
+        """Pick the best available OCR engine for this platform."""
+        if self._init_mlkit():
+            self._engine = "mlkit"
+            return
+        if self._init_tesseract():
+            self._engine = "tesseract"
+            return
 
     def _init_mlkit(self):
         """Initialize Google ML Kit TextRecognizer on Android."""
         if platform != "android" or autoclass is None:
-            return
+            return False
         try:
             TextRecognition = autoclass(
                 "com.google.mlkit.vision.text.TextRecognition"
@@ -354,13 +377,30 @@ class PlateOCR:
             self._recognizer = TextRecognition.getClient(
                 LatinOptions.Builder().build()
             )
-            self._available = True
+            return True
         except Exception:
-            pass
+            return False
+
+    def _init_tesseract(self):
+        """Initialize pytesseract on desktop if installed (dev/testing)."""
+        try:
+            import pytesseract
+            # Probe the tesseract binary; raises if not on PATH.
+            pytesseract.get_tesseract_version()
+            self._tess = pytesseract
+            return True
+        except Exception:
+            return False
 
     @property
     def available(self):
-        return self._available
+        return self._engine is not None
+
+    @property
+    def engine_name(self):
+        return {"mlkit": "ML Kit", "tesseract": "Tesseract"}.get(
+            self._engine, "none"
+        )
 
     @property
     def last_plate(self):
@@ -372,12 +412,19 @@ class PlateOCR:
         with self._lock:
             return self._last_confidence
 
+    @property
+    def region_found(self):
+        """True when a plate-like region with characters was seen but no
+        readable text could be extracted (e.g. no OCR engine, too blurry)."""
+        with self._lock:
+            return self._region_found
+
     def reset(self):
         """Clear last detection state."""
         with self._lock:
             self._last_plate = ""
             self._last_confidence = 0.0
-            self._cooldown = 0
+            self._last_attempt = 0.0
             self._region_found = False
 
     # ── Plate candidate cropping ─────────────────────────────────────────
@@ -403,7 +450,7 @@ class PlateOCR:
                 x, y, cw, ch = cv2.boundingRect(c)
                 ar = cw / max(ch, 1)
                 if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
-                    pad = 5
+                    pad = 6
                     x1, y1 = max(0, x - pad), max(0, y - pad)
                     x2, y2 = min(w_img, x + cw + pad), min(h_img, y + ch + pad)
                     crop = bgr[y1:y2, x1:x2]
@@ -414,10 +461,44 @@ class PlateOCR:
             pass
         return candidates[:5]
 
-    # ── Preprocessing for OCR ────────────────────────────────────────────
+    # ── Colour enhancement for OCR engines ───────────────────────────────
+    @staticmethod
+    def enhance_for_ocr(bgr):
+        """Upscale + contrast-enhance a colour image for OCR.
+
+        Text recognizers are trained on natural images, so this keeps colour
+        (no binarization), upscales small crops so glyphs are large enough,
+        boosts local contrast, and applies a mild unsharp mask.
+        """
+        if cv2 is None or np is None:
+            return bgr
+        try:
+            h, w = bgr.shape[:2]
+            if h == 0 or w == 0:
+                return bgr
+            # Upscale so character height is comfortably readable
+            if h < 180:
+                scale = min(180.0 / h, 4.0)
+                bgr = cv2.resize(
+                    bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(lab)
+            l_ch = cv2.createCLAHE(
+                clipLimit=2.0, tileGridSize=(8, 8)
+            ).apply(l_ch)
+            bgr = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+            blur = cv2.GaussianBlur(bgr, (0, 0), 1.0)
+            bgr = cv2.addWeighted(bgr, 1.5, blur, -0.5, 0)
+            return bgr
+        except Exception:
+            return bgr
+
+    # ── Binarized preprocessing (for char-region detection only) ─────────
     @staticmethod
     def preprocess_plate(crop):
-        """Enhance a plate crop for better OCR accuracy."""
+        """Binarize a plate crop for character-region counting."""
         if cv2 is None or np is None:
             return crop
         try:
@@ -426,7 +507,7 @@ class PlateOCR:
                 return crop
             target_h = 64
             scale = target_h / h
-            resized = cv2.resize(crop, (int(w * scale), target_h))
+            resized = cv2.resize(crop, (max(1, int(w * scale)), target_h))
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
             enhanced = clahe.apply(gray)
@@ -440,9 +521,10 @@ class PlateOCR:
     # ── Text cleanup ─────────────────────────────────────────────────────
     @staticmethod
     def clean_plate_text(raw):
-        """Extract Indian plate format from raw OCR text.
+        """Extract the best Indian plate match from raw OCR text.
 
-        Returns (plate_string, confidence).
+        Returns (plate_string, confidence). Scans ALL candidate matches and
+        prefers the one with a series block (highest confidence).
         Indian format: SS DD AAA DDDD  (state, district, series, number)
         """
         if not raw:
@@ -451,63 +533,89 @@ class PlateOCR:
         text = re.sub(r"[^A-Z0-9\s]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
 
-        m = PlateOCR.INDIAN_PLATE_RE.search(text)
-        if m:
+        best_plate, best_conf = "", 0.0
+        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
             state = m.group(1).upper()
             dist = m.group(2)
             series = m.group(3).upper()
             num = m.group(4)
             plate = "%s%s%s%s" % (state, dist, series, num)
             conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
-            return plate, conf
+            if conf > best_conf:
+                best_plate, best_conf = plate, conf
+        if best_plate:
+            return best_plate, best_conf
 
-        # Fallback: strip all non-alphanum
+        # Fallback: contiguous alphanumeric run starting with two letters
         cleaned = re.sub(r"[^A-Z0-9]", "", text)
         if len(cleaned) >= 6 and cleaned[:2].isalpha():
             return cleaned, PlateOCR.CONF_LOW
         return "", 0.0
 
     # ── ML Kit OCR (Android) ─────────────────────────────────────────────
-    def _ocr_mlkit(self, crop_bgr):
-        """Run Google ML Kit text recognition on a BGR crop.
+    def _ocr_mlkit(self, bgr):
+        """Run Google ML Kit text recognition on a BGR image.
 
-        Returns raw text string or empty string on failure.
+        Must run on a background thread — ML Kit's Tasks.await raises if
+        called on the Android main thread. Returns raw text or "".
         """
-        if not self._available or autoclass is None:
+        if self._recognizer is None or autoclass is None:
             return ""
         try:
             Bitmap = autoclass("android.graphics.Bitmap")
             BitmapConfig = autoclass("android.graphics.Bitmap$Config")
-            InputImage = autoclass(
-                "com.google.mlkit.vision.common.InputImage"
-            )
+            InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
             Tasks = autoclass("com.google.android.gms.tasks.Tasks")
-
-            h, w = crop_bgr.shape[:2]
-            rgba = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGBA)
-            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
+            TimeUnit = autoclass("java.util.concurrent.TimeUnit")
             ByteBuffer = autoclass("java.nio.ByteBuffer")
+
+            h, w = bgr.shape[:2]
+            rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
+            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
             buf = ByteBuffer.wrap(rgba.tobytes())
             bitmap.copyPixelsFromBuffer(buf)
 
             image = InputImage.fromBitmap(bitmap, 0)
+            task = self._recognizer.process(image)
+            # 5-second timeout overload prevents indefinite blocking.
             tasks_await = getattr(Tasks, "await")
-            result = tasks_await(self._recognizer.process(image))
+            result = tasks_await(task, 5, TimeUnit.SECONDS)
             raw = result.getText() if result else ""
             bitmap.recycle()
-            return raw
+            return raw or ""
         except Exception:
             return ""
 
-    # ── OpenCV character-region detector (fallback signal, NOT text OCR) ─
+    # ── Tesseract OCR (desktop / dev) ────────────────────────────────────
+    def _ocr_tesseract(self, bgr):
+        """Run pytesseract on a BGR image. Returns raw text or ""."""
+        if self._tess is None or cv2 is None:
+            return ""
+        try:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # PSM 6/11 work well for plates; restrict charset.
+            cfg = ("--oem 1 --psm 6 -c "
+                   "tessedit_char_whitelist="
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            return self._tess.image_to_string(rgb, config=cfg) or ""
+        except Exception:
+            return ""
+
+    def _ocr(self, bgr):
+        """Dispatch to the active OCR engine."""
+        if self._engine == "mlkit":
+            return self._ocr_mlkit(bgr)
+        if self._engine == "tesseract":
+            return self._ocr_tesseract(bgr)
+        return ""
+
+    # ── OpenCV character-region detector (signal only, NOT text OCR) ──────
     @staticmethod
     def _detect_char_regions(crop_bgr):
         """Count character-like contours in a preprocessed plate crop.
 
-        OpenCV alone cannot read glyphs, so this NEVER returns text — it
-        only signals that a plate-like region with character segments was
-        found, so the UI can tell the user text isn't readable yet.
-        Returns the number of character-like regions detected.
+        Used only to tell the user a plate is visible but not yet readable;
+        it can never produce text.
         """
         if cv2 is None or np is None:
             return 0
@@ -517,20 +625,15 @@ class PlateOCR:
                 gray = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2GRAY)
             else:
                 gray = preprocessed
-
-            # Invert if background is lighter than foreground
             if np.mean(gray) > 127:
                 gray = cv2.bitwise_not(gray)
-
             cnts, _ = cv2.findContours(
                 gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-
             h_img, w_img = gray.shape[:2]
             count = 0
             for c in cnts:
                 x, y, cw, ch = cv2.boundingRect(c)
-                # Character-like: tall-ish, not too wide, reasonable size
                 if (ch > h_img * 0.3 and cw > 3 and cw < w_img * 0.25
                         and 0.15 < (cw / max(ch, 1)) < 1.2):
                     count += 1
@@ -538,58 +641,69 @@ class PlateOCR:
         except Exception:
             return 0
 
-    # ── Full pipeline ────────────────────────────────────────────────────
-    def process_frame(self, bgr):
-        """Full OCR pipeline on a BGR frame.
-
-        Returns (plate_text, confidence). Applies cooldown to avoid
-        redundant processing after a successful detection.
-        """
-        with self._lock:
-            if self._cooldown > 0:
-                self._cooldown -= 1
-                return self._last_plate, self._last_confidence
-
-        candidates = self.crop_plate_candidates(bgr)
-        best_plate, best_conf = "", 0.0
-        chars_seen = 0
-
-        for crop, bbox in candidates:
-            if self._available:
-                raw = self._ocr_mlkit(crop)
-                if raw:
-                    plate, conf = self.clean_plate_text(raw)
-                    if conf > best_conf:
-                        best_plate, best_conf = plate, conf
-                        if conf >= self.CONF_HIGH:
-                            break  # Good enough, stop early
-            if best_conf < self.CONF_MEDIUM:
-                chars_seen = max(chars_seen, self._detect_char_regions(crop))
-
-        # Full-frame ML Kit pass: contour cropping can miss the plate
-        # entirely (odd angles, partial occlusion). ML Kit locates text
-        # itself, so give it the whole frame before giving up.
-        if self._available and best_conf < self.CONF_MEDIUM:
-            raw = self._ocr_mlkit(bgr)
+    # ── Core read: full-frame first, then crop refinement ────────────────
+    def _read_best(self, bgr):
+        """Read the best plate from an image. Returns (plate, conf, chars)."""
+        best_plate, best_conf, chars_seen = "", 0.0, 0
+        if self._engine is not None:
+            # 1. Full-frame OCR — the engine locates text itself, which is
+            #    far more robust than relying on contour cropping.
+            raw = self._ocr(self.enhance_for_ocr(bgr))
             if raw:
                 plate, conf = self.clean_plate_text(raw)
                 if conf > best_conf:
                     best_plate, best_conf = plate, conf
+            # 2. Cropped-candidate refinement when the full frame was weak.
+            if best_conf < self.CONF_HIGH:
+                for crop, _bbox in self.crop_plate_candidates(bgr):
+                    raw = self._ocr(self.enhance_for_ocr(crop))
+                    if raw:
+                        plate, conf = self.clean_plate_text(raw)
+                        if conf > best_conf:
+                            best_plate, best_conf = plate, conf
+                            if conf >= self.CONF_HIGH:
+                                break
+                    if best_conf < self.CONF_MEDIUM:
+                        chars_seen = max(
+                            chars_seen, self._detect_char_regions(crop)
+                        )
+        else:
+            # No OCR engine: only report whether a plate region is visible.
+            for crop, _bbox in self.crop_plate_candidates(bgr):
+                chars_seen = max(chars_seen, self._detect_char_regions(crop))
+        return best_plate, best_conf, chars_seen
+
+    # ── Live pipeline (throttled, called from the analysis worker) ───────
+    def process_frame(self, bgr):
+        """Throttled live OCR. Returns (plate, confidence)."""
+        now = time.time()
+        with self._lock:
+            interval = (self.HOLD_INTERVAL if self._last_confidence > 0.5
+                        else self.SCAN_INTERVAL)
+            if now - self._last_attempt < interval:
+                return self._last_plate, self._last_confidence
+            self._last_attempt = now
+
+        plate, conf, chars = self._read_best(bgr)
 
         with self._lock:
-            self._region_found = bool(candidates) and chars_seen >= 4
-            if best_conf > 0.5:
-                self._last_plate = best_plate
-                self._last_confidence = best_conf
-                self._cooldown = 15  # ~5s cooldown at 3fps analysis rate
-            return best_plate, best_conf
+            self._region_found = chars >= 4
+            if conf > 0.5:
+                self._last_plate = plate
+                self._last_confidence = conf
+            return self._last_plate, self._last_confidence
 
-    @property
-    def region_found(self):
-        """True when a plate-like region with characters was seen but
-        no readable text could be extracted (e.g. no OCR engine)."""
+    # ── Forced pipeline (capture / on-demand scan; bg thread) ────────────
+    def process_image(self, bgr):
+        """Force a fresh full read, bypassing throttle. Returns (plate, conf)."""
+        plate, conf, chars = self._read_best(bgr)
         with self._lock:
-            return self._region_found
+            self._region_found = chars >= 4
+            if conf > 0.5:
+                self._last_plate = plate
+                self._last_confidence = conf
+                self._last_attempt = time.time()
+        return plate, conf
 
     def suggest_routing(self, plate, lat=0.0, lon=0.0):
         """Given an OCR-detected plate, suggest jurisdiction email routing.
@@ -1835,6 +1949,11 @@ KV = """
                 size: (self.width, dp(1))
 
         ActionBtn:
+            text: "SCAN"
+            _bg: C("#7C3AED")
+            on_release: root.scan_now()
+
+        ActionBtn:
             text: "CAPTURE"
             _bg: C("#0078D4")
             on_release: root.capture_evidence()
@@ -1960,7 +2079,7 @@ class RootUI(BoxLayout):
             except Exception:
                 pass
         # Phase 1: Frame buffer + threaded analysis
-        self._frame_buffer = FrameRingBuffer(max_frames=30)
+        self._frame_buffer = FrameRingBuffer(max_frames=20)
         self._analysis_worker = FrameAnalysisWorker(
             self._frame_buffer, self._analytics
         )
@@ -2086,7 +2205,7 @@ class RootUI(BoxLayout):
         if not self._preview:
             return
         try:
-            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 640}
+            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 800}
             if platform == "android":
                 kw["enable_video"] = False
             self._preview.connect_camera(**kw)
@@ -2161,10 +2280,93 @@ class RootUI(BoxLayout):
 
                 # Notify Android gallery about new file
                 self._notify_gallery(fpath)
+
+                # Phase 5: OCR the full-resolution evidence and auto-fill the
+                # plate if the user has not entered one. Runs on a background
+                # thread (ML Kit must not block the UI thread).
+                if (not self.ids.in_plate.text.strip()
+                        and self._plate_ocr and self._plate_ocr.available):
+                    threading.Thread(
+                        target=self._ocr_image_worker,
+                        args=(fpath, False), daemon=True,
+                    ).start()
             else:
                 self._popup("Failed", "File was not created.")
         except Exception as e:
             self._popup("Capture Error", str(e))
+
+    # ── On-demand full-resolution scan ───────────────────────────────────
+    def scan_now(self):
+        """Capture a full-resolution frame and OCR it on demand."""
+        if not self._preview or not self._cam_ok:
+            self._popup("Not ready", "Camera not connected.")
+            return
+        if not self._plate_ocr or not self._plate_ocr.available:
+            self._popup(
+                "OCR unavailable",
+                "No text recognition engine on this device.\n"
+                "Enter the plate manually.",
+            )
+            return
+        self.ocr_suggest_text = "OCR: scanning (full-res)..."
+        try:
+            tmp = os.path.join(self._get_evidence_folder(), ".scan_tmp.png")
+            self._preview.export_to_png(tmp)
+        except Exception as e:
+            self._popup("Scan failed", str(e))
+            return
+        threading.Thread(
+            target=self._ocr_image_worker, args=(tmp, True), daemon=True
+        ).start()
+
+    def _ocr_image_worker(self, path, announce):
+        """Background OCR of a saved image; applies result on the UI thread."""
+        plate, conf = "", 0.0
+        try:
+            if cv2 is not None and os.path.isfile(path):
+                img = cv2.imread(path)
+                if img is not None:
+                    plate, conf = self._plate_ocr.process_image(img)
+        except Exception:
+            pass
+        if announce:
+            try:
+                if path.endswith(".scan_tmp.png"):
+                    os.remove(path)
+            except Exception:
+                pass
+        Clock.schedule_once(
+            lambda dt: self._apply_ocr_result(plate, conf, announce)
+        )
+
+    def _apply_ocr_result(self, plate, conf, announce):
+        """Apply an OCR result: auto-fill plate + show routing (UI thread)."""
+        if plate and conf > 0.5:
+            self.ids.in_plate.text = plate
+            self._ocr_accepted_plate = plate
+            if self._analytics:
+                self._analytics.ocr_plate = plate
+                self._analytics.ocr_confidence = conf
+            lat, lon = float(self.latest_lat), float(self.latest_lon)
+            sug = self._plate_ocr.suggest_routing(plate, lat, lon)
+            emails = sug.get("emails", [])
+            state = sug.get("state_code", "") or "?"
+            self.ocr_suggest_text = "OCR: %s [%s] %.0f%%%s" % (
+                plate, state, conf * 100,
+                (" -> " + ", ".join(emails[:2])) if emails else " (no route)",
+            )
+            if announce:
+                self._popup(
+                    "Plate Read",
+                    "Detected: %s\nState: %s\nConfidence: %.0f%%" % (
+                        plate, state, conf * 100),
+                )
+        elif announce:
+            self.ocr_suggest_text = "OCR: no readable plate"
+            self._popup(
+                "Scan",
+                "No readable plate found.\nMove closer and hold steady.",
+            )
 
     def _notify_gallery(self, path):
         """Tell Android to scan the file so it shows in gallery."""
@@ -2244,17 +2446,20 @@ class RootUI(BoxLayout):
                         "OCR: %s [%s] %.0f%% (no route)"
                         % (ocr_plate, state, ocr_conf * 100)
                     )
-            else:
+            elif not self.ocr_suggest_text.startswith("OCR: scanning (full"):
+                # Don't clobber an in-flight on-demand scan message.
                 if not self._plate_ocr.available:
                     self.ocr_suggest_text = (
-                        "OCR: text engine unavailable - enter plate manually"
+                        "OCR: no engine - tap SCAN or enter plate manually"
                     )
                 elif self._plate_ocr.region_found:
                     self.ocr_suggest_text = (
-                        "OCR: plate region found - move closer / hold steady"
+                        "OCR: plate in view - move closer / hold steady"
                     )
                 else:
-                    self.ocr_suggest_text = "OCR: scanning..."
+                    self.ocr_suggest_text = "OCR: scanning (%s)..." % (
+                        self._plate_ocr.engine_name
+                    )
         else:
             self.ocr_suggest_text = ""
 

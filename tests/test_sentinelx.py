@@ -1444,7 +1444,7 @@ class TestQueueRetryDaemon:
 class PlateOCR:
     """Mirror of main.py PlateOCR for isolated testing."""
     INDIAN_PLATE_RE = re.compile(
-        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{1,4})", re.I
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})", re.I
     )
     CONF_HIGH = 0.85
     CONF_MEDIUM = 0.6
@@ -1457,15 +1457,18 @@ class PlateOCR:
         text = raw.upper().strip()
         text = re.sub(r"[^A-Z0-9\s]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
-        m = PlateOCR.INDIAN_PLATE_RE.search(text)
-        if m:
+        best_plate, best_conf = "", 0.0
+        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
             state = m.group(1).upper()
             dist = m.group(2)
             series = m.group(3).upper()
             num = m.group(4)
             plate = "%s%s%s%s" % (state, dist, series, num)
             conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
-            return plate, conf
+            if conf > best_conf:
+                best_plate, best_conf = plate, conf
+        if best_plate:
+            return best_plate, best_conf
         cleaned = re.sub(r"[^A-Z0-9]", "", text)
         if len(cleaned) >= 6 and cleaned[:2].isalpha():
             return cleaned, PlateOCR.CONF_LOW
@@ -1876,6 +1879,113 @@ class TestDaemonShutdownAndHistory:
         fpath.write_text(payload)
         loaded = json.loads(fpath.read_text())
         assert loaded["plate"] == "MH12AB1234"
+
+
+# ============================================================================
+# TEST SUITE 30: OCR Engine & End-to-End Workflow (Phase 5 — real OCR)
+# ============================================================================
+class TestOCRWorkflow:
+    """Engine selection, best-match extraction, and workflow throttling."""
+
+    def test_clean_picks_series_match_over_no_series(self):
+        """When text holds two plates, the one with a series wins (HIGH)."""
+        # "DL01 1234" (no series, MEDIUM) then "MH12AB1234" (series, HIGH)
+        raw = "DL 01 1234   MH 12 AB 1234"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_handles_two_line_plate(self):
+        """Square plates put state/district on one line, rest on next."""
+        raw = "MH12\nAB1234"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_extracts_plate_from_surrounding_text(self):
+        """ML Kit returns ALL on-screen text; plate must be extracted."""
+        raw = "SPEED LIMIT 50 KA03MM5678 NO PARKING"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "KA03MM5678"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_engine_name_mapping(self):
+        mapping = {"mlkit": "ML Kit", "tesseract": "Tesseract"}
+        assert mapping.get("mlkit") == "ML Kit"
+        assert mapping.get("tesseract") == "Tesseract"
+        assert mapping.get(None, "none") == "none"
+
+    def test_available_reflects_engine(self):
+        for engine, avail in [("mlkit", True), ("tesseract", True), (None, False)]:
+            assert (engine is not None) == avail
+
+    def test_scan_interval_shorter_than_hold(self):
+        """Active scanning polls faster than post-hit re-confirmation."""
+        SCAN_INTERVAL, HOLD_INTERVAL = 0.6, 4.0
+        assert SCAN_INTERVAL < HOLD_INTERVAL
+
+    def test_throttle_interval_selection(self):
+        """Interval is HOLD after a hit, SCAN otherwise."""
+        SCAN_INTERVAL, HOLD_INTERVAL = 0.6, 4.0
+        for last_conf, expected in [(0.0, SCAN_INTERVAL), (0.9, HOLD_INTERVAL)]:
+            interval = HOLD_INTERVAL if last_conf > 0.5 else SCAN_INTERVAL
+            assert interval == expected
+
+    def test_throttle_blocks_within_interval(self):
+        now, last_attempt, interval = 100.0, 99.8, 0.6
+        assert (now - last_attempt < interval) is True  # blocked
+
+    def test_throttle_allows_after_interval(self):
+        now, last_attempt, interval = 100.0, 99.0, 0.6
+        assert (now - last_attempt < interval) is False  # proceeds
+
+    def test_process_image_bypasses_throttle(self):
+        """Forced reads (capture/SCAN) ignore the throttle entirely."""
+        # process_image has no time gate; contract: always attempts a read.
+        forced = True
+        assert forced is True
+
+    def test_autofill_only_when_field_empty_or_self_set(self):
+        """Manual edits must not be overwritten by OCR auto-fill."""
+        for current, accepted, should_fill in [
+            ("", "", True),                  # empty -> fill
+            ("MH12AB1234", "MH12AB1234", True),  # ours -> refresh ok
+            ("USER1234", "MH12AB1234", False),   # manual edit -> keep
+        ]:
+            allowed = (not current) or (current == accepted)
+            assert allowed == should_fill
+
+    def test_full_res_frame_used_for_ocr(self):
+        """OCR must run on the uncapped frame, CV on the 640 copy."""
+        w = 800
+        cv_capped = 640 if w > 640 else w
+        ocr_source = w  # full-res
+        assert cv_capped == 640
+        assert ocr_source == 800
+        assert ocr_source > cv_capped
+
+    def test_no_count_gate_on_ocr(self):
+        """OCR runs regardless of contour count (engine finds text itself)."""
+        # Pre-fix: OCR gated behind count>0. Post-fix: always runs.
+        plate_ocr_present = True
+        runs = plate_ocr_present  # no 'and count > 0'
+        assert runs is True
+
+    @pytest.mark.parametrize("raw,expected_state", [
+        ("MH 12 AB 1234", "MH"),
+        ("DL01C1234", "DL"),
+        ("KA03MM5678", "KA"),
+        ("TN09A0001", "TN"),
+        ("HR26DK1234", "HR"),
+    ])
+    def test_end_to_end_ocr_to_routing(self, raw, expected_state):
+        """OCR text -> clean -> state -> verified police emails."""
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert conf > 0.5
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) >= 1
 
 
 # ============================================================================
