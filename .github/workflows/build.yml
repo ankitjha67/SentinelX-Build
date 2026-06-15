@@ -68,9 +68,16 @@ jobs:
           buildozer -v android debug 2>&1 | tee /tmp/build.log
         timeout-minutes: 45
 
-      - name: Build log tail (on failure)
+      - name: Build log diagnostics (on failure)
         if: failure()
-        run: tail -n 400 /tmp/build.log || true
+        run: |
+          echo "========================= ERROR LINES ========================="
+          grep -n -i -E \
+            "error|fail|exception|traceback|could not|not found|cannot|fatal|build failed|aborted|unresolved|duplicate class|manifest merger|minsdk|compilesdk" \
+            /tmp/build.log | tail -n 120 || echo "(no error-pattern lines matched)"
+          echo ""
+          echo "========================= LAST 80 LINES ======================="
+          tail -n 80 /tmp/build.log || true
 
       - uses: actions/upload-artifact@v4
         with:
