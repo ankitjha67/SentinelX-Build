@@ -2781,6 +2781,18 @@ class RootUI(BoxLayout):
         b.bind(on_release=lambda *_: cb())
         return b
 
+    def _dismiss_button(self, text, cb):
+        """A visually distinct Close/OK button for popups."""
+        from kivy.uix.button import Button
+        b = Button(
+            text=text, size_hint_y=None, height=dp(48), font_size="15sp",
+            bold=True, color=(1, 1, 1, 1),
+            background_normal="", background_down="",
+            background_color=(0.22, 0.26, 0.34, 1),
+        )
+        b.bind(on_release=lambda *_: cb())
+        return b
+
     def show_more_menu(self):
         from kivy.uix.scrollview import ScrollView
         box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
@@ -2803,9 +2815,12 @@ class RootUI(BoxLayout):
             box.add_widget(self._menu_button(text, cb))
         scroll = ScrollView(do_scroll_x=False)
         scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="More — Citizen Tools", content=scroll,
-            size_hint=(0.9, 0.8), title_size="15sp",
+            title="More — Citizen Tools", content=container,
+            size_hint=(0.9, 0.85), title_size="15sp",
             title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
         )
@@ -2932,8 +2947,11 @@ class RootUI(BoxLayout):
             box.add_widget(self._menu_button(cat, lambda c=cat: self._send_hazard(c)))
         scroll = ScrollView(do_scroll_x=False)
         scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="Report a hazard", content=scroll, size_hint=(0.9, 0.8),
+            title="Report a hazard", content=container, size_hint=(0.9, 0.85),
             title_size="15sp", title_color=(1, 0.84, 0.25, 1),
             separator_color=(1, 0.84, 0.25, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
@@ -2974,8 +2992,9 @@ class RootUI(BoxLayout):
         ]
         for text, cb in actions:
             box.add_widget(self._menu_button(text, cb))
+        box.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="SOS / Emergency", content=box, size_hint=(0.9, 0.55),
+            title="SOS / Emergency", content=box, size_hint=(0.9, 0.62),
             title_size="15sp", title_color=(1, 0.32, 0.32, 1),
             separator_color=(1, 0.32, 0.32, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
@@ -3118,8 +3137,10 @@ class RootUI(BoxLayout):
         btn.bind(on_release=lambda *_: (self._update_popup.dismiss(),
                                         self._download_and_install(man.get("url", ""))))
         box.add_widget(btn)
+        box.add_widget(self._dismiss_button(
+            "Later", lambda: self._update_popup.dismiss()))
         self._update_popup = Popup(
-            title="Update available", content=box, size_hint=(0.86, 0.42),
+            title="Update available", content=box, size_hint=(0.86, 0.5),
             title_size="15sp", title_color=(0, 0.78, 0.33, 1),
             separator_color=(0, 0.78, 0.33, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
@@ -3207,14 +3228,18 @@ class RootUI(BoxLayout):
         else:
             content.add_widget(lbl)
 
+        okbtn = self._dismiss_button("OK", lambda: None)
+        content.add_widget(okbtn)
+
         p = Popup(
             title=t, content=content,
-            size_hint=(0.88, 0.62) if tall else (0.82, 0.28),
+            size_hint=(0.88, 0.66) if tall else (0.82, 0.36),
             title_size="15sp",
             title_color=accent,
             separator_color=accent,
             background_color=(0.08, 0.09, 0.15, 0.95),
         )
+        okbtn.bind(on_release=lambda *_: p.dismiss())
         p.open()
 
 
