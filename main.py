@@ -25,12 +25,10 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
 from kivy.metrics import dp, sp
-from kivy.properties import StringProperty, NumericProperty, ColorProperty
+from kivy.properties import StringProperty, NumericProperty
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
-from kivy.uix.modalview import ModalView
 from kivy.utils import platform
 from kivy.graphics import Color, RoundedRectangle, Rectangle, Line
 
@@ -757,7 +755,8 @@ class FrameRingBuffer:
 
     @property
     def dropped_count(self):
-        return self._dropped
+        with self._lock:
+            return self._dropped
 
     def __len__(self):
         with self._lock:
@@ -1218,14 +1217,15 @@ class ConnectivityChecker:
     @staticmethod
     def is_online():
         """Returns True if device can reach the internet."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(ConnectivityChecker.TIMEOUT)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(ConnectivityChecker.TIMEOUT)
             s.connect((ConnectivityChecker.PROBE_HOST, ConnectivityChecker.PROBE_PORT))
-            s.close()
             return True
         except Exception:
             return False
+        finally:
+            s.close()
 
 
 # ═════════════════════════════════════════════════════════════════════════
