@@ -98,26 +98,62 @@ class ReportChannels:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Optional VAHAN-style vehicle lookup (RC / insurance / PUC / challans)
+# Vehicle (RC) lookup — Masters India VAHAN API (+ optional generic fallback)
 # ─────────────────────────────────────────────────────────────────────────
 class VehicleLookup:
-    """Look up vehicle details from a plate via a configurable HTTP endpoint.
+    """Vehicle / RC lookup via the Masters India VAHAN API.
 
-    There is no official free public VAHAN API, so the provider URL is read
-    from the SENTINELX_VAHAN_URL env var (or set_endpoint()). The endpoint must
-    accept a ``plate`` query parameter and return JSON. Degrades gracefully when
-    unset or offline — it never fabricates data.
+    Masters India is auth-gated (https://docs.mastersindia.co): it needs a JWT
+    and a Subid from your account. Provide them via set_credentials(), the
+    SENTINELX_MI_* env vars, or a vahan.json in the app data dir. The default
+    JWT is the (expired) demo token from the public docs, so a real token + Subid
+    must be configured. It never fabricates data and surfaces the real API error
+    (e.g. expired token) so misconfiguration is obvious. A generic GET endpoint
+    (SENTINELX_VAHAN_URL) is supported as a fallback for self-hosted providers.
     """
 
+    MI_URL = os.environ.get(
+        "SENTINELX_MI_URL",
+        "https://api-platform.mastersindia.co/api/v2/sbt/VAHAN/")
+    # Authorization header value INCLUDING the "JWT " prefix. Default = expired
+    # public demo token; replace with your own via config/env for production.
+    MI_JWT = os.environ.get(
+        "SENTINELX_MI_JWT",
+        "JWT eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9."
+        "eyJ1c2VyX2lkIjoxNDgsInVzZXJuYW1lIjoicHJhdGVla3JhaStkZW1vQG1hc3RlcnNpbmRpYS5jby"
+        "IsImV4cCI6MTY5NjA0Njc4MCwiZW1haWwiOiJwcmF0ZWVrcmFpK2RlbW9AbWFzdGVyc2luZGlhLmNv"
+        "Iiwib3JpZ19pYXQiOjE2OTU5NjAzODB9.zWJsCcqMd06X1aMjvXPQRqQGQddKjF6vpkOZgKFG_80")
+    MI_SUBID = os.environ.get("SENTINELX_MI_SUBID", "")
+    MI_PRODUCTID = os.environ.get("SENTINELX_MI_PRODUCTID", "arap")
+    MI_MODE = os.environ.get("SENTINELX_MI_MODE", "Buyer")
+
+    # Optional generic fallback endpoint (GET ?plate=, flat JSON)
     ENDPOINT = os.environ.get("SENTINELX_VAHAN_URL", "")
+
+    @classmethod
+    def set_credentials(cls, jwt=None, subid=None, productid=None, mode=None, url=None):
+        if jwt:
+            cls.MI_JWT = jwt if jwt.upper().startswith("JWT ") else "JWT " + jwt
+        if subid is not None:
+            cls.MI_SUBID = subid
+        if productid:
+            cls.MI_PRODUCTID = productid
+        if mode:
+            cls.MI_MODE = mode
+        if url:
+            cls.MI_URL = url
 
     @classmethod
     def set_endpoint(cls, url):
         cls.ENDPOINT = url or ""
 
     @classmethod
+    def _mi_configured(cls):
+        return bool(cls.MI_JWT and cls.MI_SUBID)
+
+    @classmethod
     def available(cls):
-        return bool(cls.ENDPOINT)
+        return cls._mi_configured() or bool(cls.ENDPOINT)
 
     @staticmethod
     def normalize_plate(plate):
@@ -128,13 +164,99 @@ class VehicleLookup:
         p = cls.normalize_plate(plate)
         if not p:
             return {"ok": False, "error": "empty plate"}
-        if not cls.ENDPOINT:
-            return {"ok": False, "error": "no provider configured"}
+        if cls._mi_configured():
+            return cls.lookup_mastersindia(p)
+        if cls.ENDPOINT:
+            return cls._lookup_generic(p)
+        return {"ok": False, "error": "no provider configured"}
+
+    @classmethod
+    def lookup_mastersindia(cls, plate):
+        p = cls.normalize_plate(plate)
+        if not p:
+            return {"ok": False, "error": "empty plate"}
+        try:
+            import urllib.request
+            import urllib.error
+            import json as _json
+            body = _json.dumps({"vehiclenumber": p}).encode("utf-8")
+            req = urllib.request.Request(cls.MI_URL, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", cls.MI_JWT)
+            req.add_header("Subid", cls.MI_SUBID)
+            req.add_header("Productid", cls.MI_PRODUCTID)
+            req.add_header("Mode", cls.MI_MODE)
+            with urllib.request.urlopen(req, timeout=12) as r:
+                data = _json.loads(r.read().decode("utf-8", "replace"))
+            return cls.parse_mastersindia(data)
+        except urllib.error.HTTPError as e:
+            msg = {
+                400: "Bad request (check plate format)",
+                401: "Unauthorized — set a valid Masters India JWT",
+                403: "Forbidden — check JWT / Subid",
+                500: "Provider server error",
+                502: "Provider not responding",
+            }.get(getattr(e, "code", 0), "HTTP %s" % getattr(e, "code", "error"))
+            return {"ok": False, "error": msg}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def parse_mastersindia(data):
+        """Parse the Masters India envelope (XML-in-JSON)."""
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "bad response"}
+        if str(data.get("error", "")).lower() == "true":
+            return {"ok": False, "error": data.get("message", "request failed")}
+        resp = data.get("response")
+        if not isinstance(resp, list) or not resp:
+            return {"ok": False, "error": data.get("message", "no data")}
+        first = resp[0] if isinstance(resp[0], dict) else {}
+        inner = first.get("response", "") or ""
+        if "VehicleDetails" not in inner:
+            return {"ok": False, "error": (inner.strip() or "vehicle not found")}
+        return VehicleLookup._parse_vahan_xml(inner)
+
+    @staticmethod
+    def _parse_vahan_xml(xml_text):
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(xml_text.strip())
+        except Exception as e:
+            return {"ok": False, "error": "parse error: %s" % e}
+
+        def t(tag):
+            el = root.find(tag)
+            return (el.text or "").strip() if el is not None and el.text else ""
+
+        model = (t("rc_maker_desc") + " " + t("rc_maker_model")).strip()
+        return {
+            "ok": True,
+            "plate": t("rc_regn_no"),
+            "owner": t("rc_owner_name"),
+            "model": model,
+            "rc_status": t("rc_status"),
+            "registered": t("rc_regn_dt"),
+            "registered_at": t("rc_registered_at"),
+            "insurance": t("rc_insurance_upto"),
+            "insurer": t("rc_insurance_comp"),
+            "puc": t("rc_pucc_upto"),
+            "fitness": t("rc_fit_upto"),
+            "tax": t("rc_tax_upto"),
+            "fuel": t("rc_fuel_desc"),
+            "vclass": t("rc_vh_class_desc"),
+            "financer": t("rc_financer"),
+            "blacklist": t("rc_blacklist_status"),
+            "gvw": t("rc_gvw"),
+        }
+
+    @classmethod
+    def _lookup_generic(cls, plate):
         try:
             import urllib.request
             import json as _json
             sep = "&" if "?" in cls.ENDPOINT else "?"
-            url = cls.ENDPOINT + sep + "plate=" + p
+            url = cls.ENDPOINT + sep + "plate=" + plate
             with urllib.request.urlopen(url, timeout=8) as r:
                 data = _json.loads(r.read().decode("utf-8", "replace"))
             return cls.parse(data)
@@ -143,6 +265,7 @@ class VehicleLookup:
 
     @staticmethod
     def parse(data):
+        """Generic flat-JSON parser for a self-hosted fallback endpoint."""
         if not isinstance(data, dict):
             return {"ok": False, "error": "bad response"}
 

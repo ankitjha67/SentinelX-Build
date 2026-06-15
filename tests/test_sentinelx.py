@@ -2129,6 +2129,11 @@ class TestCivicDirectory:
 
 
 class TestVehicleLookup:
+    def teardown_method(self):
+        # Keep providers unconfigured so tests never make live network calls
+        civic.VehicleLookup.set_credentials(subid="")
+        civic.VehicleLookup.set_endpoint("")
+
     def test_normalize_plate(self):
         assert civic.VehicleLookup.normalize_plate(" mh-12 ab 1234 ") == "MH12AB1234"
 
@@ -2151,6 +2156,62 @@ class TestVehicleLookup:
 
     def test_parse_bad_response(self):
         assert civic.VehicleLookup.parse(["not", "a", "dict"])["ok"] is False
+
+    # --- Masters India VAHAN format ---
+    MI_XML = (
+        "<VehicleDetails>"
+        "<stautsMessage>OK</stautsMessage>"
+        "<rc_regn_no>PB03Y8611</rc_regn_no>"
+        "<rc_regn_dt>18-Oct-2011</rc_regn_dt>"
+        "<rc_owner_name>R*T*N K*M*R</rc_owner_name>"
+        "<rc_maker_desc>TATA MOTORS LTD</rc_maker_desc>"
+        "<rc_maker_model>LPT 2518</rc_maker_model>"
+        "<rc_vh_class_desc>Goods Carrier(HGV)</rc_vh_class_desc>"
+        "<rc_fuel_desc>DIESEL</rc_fuel_desc>"
+        "<rc_insurance_comp>Cholamandalam MS</rc_insurance_comp>"
+        "<rc_insurance_upto>19-Apr-2022</rc_insurance_upto>"
+        "<rc_fit_upto>22-Jul-2021</rc_fit_upto>"
+        "<rc_registered_at>SANGRUR RTA, Punjab</rc_registered_at>"
+        "<rc_financer>EQUITAS SMALL FINANCE BANK LIMITED</rc_financer>"
+        "<rc_pucc_upto />"
+        "<rc_status>Fitness Expired</rc_status>"
+        "<rc_blacklist_status />"
+        "</VehicleDetails>"
+    )
+
+    def test_mastersindia_success(self):
+        env = {"response": [{"response": self.MI_XML, "responseStatus": "SUCCESS"}],
+               "error": "false", "code": "200", "message": "Success"}
+        r = civic.VehicleLookup.parse_mastersindia(env)
+        assert r["ok"]
+        assert r["plate"] == "PB03Y8611"
+        assert r["model"] == "TATA MOTORS LTD LPT 2518"
+        assert r["insurance"] == "19-Apr-2022"
+        assert r["rc_status"] == "Fitness Expired"
+        assert r["registered_at"] == "SANGRUR RTA, Punjab"
+        assert r["puc"] == ""  # self-closing tag
+
+    def test_mastersindia_not_found(self):
+        env = {"response": [{"response": "\n Vehicle Data Not Found",
+                             "responseStatus": "SUCCESS"}],
+               "error": "false", "code": "200"}
+        r = civic.VehicleLookup.parse_mastersindia(env)
+        assert r["ok"] is False and "Not Found" in r["error"]
+
+    def test_mastersindia_invalid_format(self):
+        env = {"response": None, "error": "true", "code": "400",
+               "message": "Data format failed"}
+        r = civic.VehicleLookup.parse_mastersindia(env)
+        assert r["ok"] is False and "format" in r["error"].lower()
+
+    def test_set_credentials_adds_jwt_prefix(self):
+        civic.VehicleLookup.set_credentials(jwt="abc.def.ghi", subid="S1")
+        assert civic.VehicleLookup.MI_JWT == "JWT abc.def.ghi"
+        assert civic.VehicleLookup._mi_configured() is True
+
+    def test_mi_configured_requires_both(self):
+        civic.VehicleLookup.set_credentials(jwt="JWT t", subid="")
+        assert civic.VehicleLookup._mi_configured() is False
 
 
 class TestDuplicateGuard:
