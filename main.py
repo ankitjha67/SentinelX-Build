@@ -436,10 +436,17 @@ class PlateOCR:
             LatinOptions = autoclass(
                 "com.google.mlkit.vision.text.latin.TextRecognizerOptions"
             )
-            self._recognizer = TextRecognition.getClient(
-                LatinOptions.Builder().build()
-            )
-            return True
+            # pyjnius cannot reach a nested class (Builder) as an attribute, so use
+            # the static DEFAULT_OPTIONS field; fall back to the $-qualified Builder.
+            try:
+                options = LatinOptions.DEFAULT_OPTIONS
+            except Exception:
+                Builder = autoclass(
+                    "com.google.mlkit.vision.text.latin.TextRecognizerOptions$Builder"
+                )
+                options = Builder().build()
+            self._recognizer = TextRecognition.getClient(options)
+            return self._recognizer is not None
         except Exception:
             return False
 
@@ -2160,11 +2167,21 @@ class RootUI(BoxLayout):
         # Phase 1: Start background service on Android
         if platform == "android" and autoclass is not None:
             try:
-                svc = autoclass("org.sentinelx.ServiceService")
-                mActivity = autoclass(
-                    "org.kivy.android.PythonActivity"
-                ).mActivity
-                svc.start(mActivity, "")
+                mActivity = autoclass("org.kivy.android.PythonActivity").mActivity
+                # Derive the service class from the real package name. buildozer
+                # builds it as "<package.domain>.<package.name>.ServiceService"
+                # (here org.sentinelx.sentinelx.ServiceService), so hardcoding
+                # "org.sentinelx.ServiceService" silently fails to start it.
+                pkg = mActivity.getPackageName()
+                svc = None
+                for cls in (pkg + ".ServiceService", "org.sentinelx.ServiceService"):
+                    try:
+                        svc = autoclass(cls)
+                        break
+                    except Exception:
+                        continue
+                if svc is not None:
+                    svc.start(mActivity, "")
             except Exception:
                 pass
         # Phase 2: Report log
