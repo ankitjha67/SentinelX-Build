@@ -71,13 +71,31 @@ jobs:
       - name: Build log diagnostics (on failure)
         if: failure()
         run: |
+          PAT="error|fail|exception|traceback|could not|not found|cannot|fatal|build failed|aborted|unresolved|duplicate class|manifest merger|minsdk|compilesdk|what went wrong"
+          # Console (full)
           echo "========================= ERROR LINES ========================="
-          grep -n -i -E \
-            "error|fail|exception|traceback|could not|not found|cannot|fatal|build failed|aborted|unresolved|duplicate class|manifest merger|minsdk|compilesdk" \
-            /tmp/build.log | tail -n 120 || echo "(no error-pattern lines matched)"
+          grep -n -i -E "$PAT" /tmp/build.log | tail -n 120 || echo "(no error-pattern lines matched)"
           echo ""
           echo "========================= LAST 80 LINES ======================="
           tail -n 80 /tmp/build.log || true
+
+          # Step summary (rendered on the run page)
+          {
+            echo "## Build failure diagnostics"
+            echo '### Matched error lines (last 40)'
+            echo '```'
+            grep -i -E "$PAT" /tmp/build.log | tail -n 40 || echo "(none matched)"
+            echo '```'
+            echo '### Last 60 lines'
+            echo '```'
+            tail -n 60 /tmp/build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Annotations (visible on the run summary even without log access)
+          grep -i -E "$PAT" /tmp/build.log | tail -n 8 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done || true
 
       - uses: actions/upload-artifact@v4
         with:
