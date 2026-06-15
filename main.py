@@ -44,6 +44,69 @@ try:
 except Exception:
     np = None
 
+
+class IndiaGeocoder:
+    """Pure-Python offline reverse geocoder for Indian states.
+
+    Uses nearest state-centroid by great-circle distance — no numpy/scipy.
+    This is the on-device path: reverse_geocode / reverse_geocoder both import
+    scipy (cKDTree), which cannot cross-compile for Android via python-for-android,
+    so they are excluded from the APK and this fallback is used instead.
+    """
+
+    # (lat, lon, full state name) — major-city anchors per state. Multiple anchors
+    # for large/border states sharpen nearest-anchor accuracy (e.g. Bengaluru sits
+    # near the Tamil Nadu border, so Karnataka needs a southern anchor).
+    _CENTROIDS = [
+        # Directory states (routed to police email)
+        (28.61, 77.21, "Delhi"),
+        (29.06, 76.09, "Haryana"), (28.90, 76.61, "Haryana"),
+        (19.08, 72.88, "Maharashtra"), (18.52, 73.86, "Maharashtra"), (21.15, 79.09, "Maharashtra"),
+        (12.97, 77.59, "Karnataka"), (15.36, 75.12, "Karnataka"), (12.30, 76.65, "Karnataka"),
+        (13.08, 80.27, "Tamil Nadu"), (11.02, 76.96, "Tamil Nadu"), (9.92, 78.12, "Tamil Nadu"),
+        (26.85, 80.95, "Uttar Pradesh"), (25.32, 82.97, "Uttar Pradesh"), (27.18, 78.01, "Uttar Pradesh"),
+        (9.93, 76.27, "Kerala"), (8.52, 76.94, "Kerala"), (11.25, 75.78, "Kerala"),
+        (23.02, 72.57, "Gujarat"), (21.17, 72.83, "Gujarat"), (22.31, 73.18, "Gujarat"),
+        (22.57, 88.36, "West Bengal"), (23.25, 87.85, "West Bengal"),
+        (17.39, 78.49, "Telangana"), (18.00, 79.59, "Telangana"),
+        (30.90, 75.85, "Punjab"), (31.63, 74.87, "Punjab"), (31.33, 75.58, "Punjab"),
+        (26.91, 75.79, "Rajasthan"), (26.45, 74.64, "Rajasthan"), (24.58, 73.71, "Rajasthan"),
+        (15.49, 73.83, "Goa"),
+        # Neighbouring states (no email directory, but sharpen nearest-state accuracy)
+        (23.25, 77.41, "Madhya Pradesh"), (22.72, 75.86, "Madhya Pradesh"),
+        (25.59, 85.14, "Bihar"),
+        (16.51, 80.65, "Andhra Pradesh"), (17.69, 83.22, "Andhra Pradesh"),
+        (20.30, 85.82, "Odisha"),
+        (26.14, 91.74, "Assam"),
+        (23.36, 85.33, "Jharkhand"),
+        (21.25, 81.63, "Chhattisgarh"),
+        (30.32, 78.03, "Uttarakhand"),
+        (31.10, 77.17, "Himachal Pradesh"),
+        (34.08, 74.80, "Jammu and Kashmir"), (32.73, 74.86, "Jammu and Kashmir"),
+    ]
+
+    @staticmethod
+    def _haversine(la1, lo1, la2, lo2):
+        r = 6371.0
+        p1, p2 = math.radians(la1), math.radians(la2)
+        dp = math.radians(la2 - la1)
+        dl = math.radians(lo2 - lo1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+    def get(self, coordinate):
+        lat, lon = coordinate
+        # Reject points clearly outside the Indian bounding box
+        if not (6.0 <= lat <= 37.5 and 68.0 <= lon <= 97.5):
+            return {"city": "", "state": ""}
+        best_name, best_d = "", float("inf")
+        for cla, clo, name in self._CENTROIDS:
+            d = self._haversine(lat, lon, cla, clo)
+            if d < best_d:
+                best_d, best_name = d, name
+        return {"city": "", "state": best_name}
+
+
 rg = None
 try:
     import reverse_geocode
@@ -53,7 +116,8 @@ except Exception:
         import reverse_geocoder as _rg
         rg = _rg
     except Exception:
-        rg = None
+        # On Android (and anywhere scipy is unavailable) use the bundled geocoder
+        rg = IndiaGeocoder()
 
 try:
     from plyer import email as plyer_email

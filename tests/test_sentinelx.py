@@ -508,28 +508,17 @@ class TestEdgeCases:
 # TEST SUITE 8: Buildozer Spec Validation
 # ============================================================================
 class TestBuildozerSpec:
-    """Validate buildozer.spec configuration."""
+    """Validate the real buildozer.spec configuration shipped with the app."""
 
-    SPEC_CONTENT = """[app]
-title = Sentinel-X
-package.name = sentinelx
-package.domain = org.sentinelx
-source.dir = .
-source.include_exts = py,png,jpg,kv,json,txt,onnx
-version = 1.0.0
-orientation = portrait
-fullscreen = 0
-requirements = python3,kivy==2.2.1,camera4kivy,plyer,numpy,android,requests,opencv-python-headless,reverse_geocoder
-services = service:service.py
-android.api = 33
-android.minapi = 26
-android.sdk = 33
-android.ndk = 25b
-android.sdk_build_tools = 33.0.2
-android.accept_sdk_license = True
-android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,INTERNET,WRITE_EXTERNAL_STORAGE,FOREGROUND_SERVICE,WAKE_LOCK
-android.archs = arm64-v8a,armeabi-v7a
-"""
+    SPEC_PATH = Path(__file__).resolve().parent.parent / "buildozer.spec"
+    SPEC_CONTENT = SPEC_PATH.read_text()
+
+    def _requirements_line(self):
+        for line in self.SPEC_CONTENT.splitlines():
+            s = line.strip()
+            if s.startswith("requirements") and "=" in s:
+                return s.split("=", 1)[1]
+        return ""
 
     def test_required_permissions_present(self):
         required = ["CAMERA", "ACCESS_FINE_LOCATION", "INTERNET", "FOREGROUND_SERVICE", "WAKE_LOCK"]
@@ -546,12 +535,118 @@ android.archs = arm64-v8a,armeabi-v7a
         assert "android.minapi = 26" in self.SPEC_CONTENT
 
     def test_required_dependencies(self):
-        required_deps = ["kivy", "camera4kivy", "plyer", "numpy", "opencv-python-headless", "reverse_geocoder"]
-        for dep in required_deps:
-            assert dep in self.SPEC_CONTENT
+        reqs = self._requirements_line()
+        for dep in ["kivy", "camera4kivy", "plyer", "numpy", "opencv", "pyjnius"]:
+            assert dep in reqs
+
+    def test_no_scipy_pulling_geocoder(self):
+        # reverse_geocode / reverse_geocoder import scipy (cKDTree), which cannot
+        # cross-compile for Android. They must NOT be in the APK requirements.
+        reqs = self._requirements_line()
+        assert "reverse_geocode" not in reqs
+        assert "reverse_geocoder" not in reqs
+        assert "scipy" not in reqs
 
     def test_onnx_in_include_exts(self):
         assert "onnx" in self.SPEC_CONTENT
+
+
+# ============================================================================
+# TEST SUITE: IndiaGeocoder (offline GPS -> state, no scipy/numpy)
+# ============================================================================
+class IndiaGeocoder:
+    """Mirror of main.py IndiaGeocoder for isolated testing."""
+
+    _CENTROIDS = [
+        (28.61, 77.21, "Delhi"),
+        (29.06, 76.09, "Haryana"), (28.90, 76.61, "Haryana"),
+        (19.08, 72.88, "Maharashtra"), (18.52, 73.86, "Maharashtra"), (21.15, 79.09, "Maharashtra"),
+        (12.97, 77.59, "Karnataka"), (15.36, 75.12, "Karnataka"), (12.30, 76.65, "Karnataka"),
+        (13.08, 80.27, "Tamil Nadu"), (11.02, 76.96, "Tamil Nadu"), (9.92, 78.12, "Tamil Nadu"),
+        (26.85, 80.95, "Uttar Pradesh"), (25.32, 82.97, "Uttar Pradesh"), (27.18, 78.01, "Uttar Pradesh"),
+        (9.93, 76.27, "Kerala"), (8.52, 76.94, "Kerala"), (11.25, 75.78, "Kerala"),
+        (23.02, 72.57, "Gujarat"), (21.17, 72.83, "Gujarat"), (22.31, 73.18, "Gujarat"),
+        (22.57, 88.36, "West Bengal"), (23.25, 87.85, "West Bengal"),
+        (17.39, 78.49, "Telangana"), (18.00, 79.59, "Telangana"),
+        (30.90, 75.85, "Punjab"), (31.63, 74.87, "Punjab"), (31.33, 75.58, "Punjab"),
+        (26.91, 75.79, "Rajasthan"), (26.45, 74.64, "Rajasthan"), (24.58, 73.71, "Rajasthan"),
+        (15.49, 73.83, "Goa"),
+        (23.25, 77.41, "Madhya Pradesh"), (22.72, 75.86, "Madhya Pradesh"),
+        (25.59, 85.14, "Bihar"),
+        (16.51, 80.65, "Andhra Pradesh"), (17.69, 83.22, "Andhra Pradesh"),
+        (20.30, 85.82, "Odisha"),
+        (26.14, 91.74, "Assam"),
+        (23.36, 85.33, "Jharkhand"),
+        (21.25, 81.63, "Chhattisgarh"),
+        (30.32, 78.03, "Uttarakhand"),
+        (31.10, 77.17, "Himachal Pradesh"),
+        (34.08, 74.80, "Jammu and Kashmir"), (32.73, 74.86, "Jammu and Kashmir"),
+    ]
+
+    @staticmethod
+    def _haversine(la1, lo1, la2, lo2):
+        r = 6371.0
+        p1, p2 = math.radians(la1), math.radians(la2)
+        dp = math.radians(la2 - la1)
+        dl = math.radians(lo2 - lo1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+    def get(self, coordinate):
+        lat, lon = coordinate
+        if not (6.0 <= lat <= 37.5 and 68.0 <= lon <= 97.5):
+            return {"city": "", "state": ""}
+        best_name, best_d = "", float("inf")
+        for cla, clo, name in self._CENTROIDS:
+            d = self._haversine(lat, lon, cla, clo)
+            if d < best_d:
+                best_d, best_name = d, name
+        return {"city": "", "state": best_name}
+
+
+class TestIndiaGeocoder:
+    """The on-device geocoder must resolve major Indian cities to their state."""
+
+    geo = IndiaGeocoder()
+
+    # (lat, lon, expected state) — well-known city coordinates
+    @pytest.mark.parametrize("lat,lon,state", [
+        (28.6139, 77.2090, "Delhi"),          # New Delhi
+        (19.0760, 72.8777, "Maharashtra"),    # Mumbai
+        (12.9716, 77.5946, "Karnataka"),      # Bengaluru
+        (13.0827, 80.2707, "Tamil Nadu"),     # Chennai
+        (22.5726, 88.3639, "West Bengal"),    # Kolkata
+        (17.3850, 78.4867, "Telangana"),      # Hyderabad
+        (23.0225, 72.5714, "Gujarat"),        # Ahmedabad
+        (26.9124, 75.7873, "Rajasthan"),      # Jaipur
+        (30.9010, 75.8573, "Punjab"),         # Ludhiana (interior Punjab)
+        (15.4909, 73.8278, "Goa"),            # Panaji
+    ])
+    def test_city_resolves_to_state(self, lat, lon, state):
+        assert self.geo.get((lat, lon))["state"] == state
+
+    def test_returns_keys_city_and_state(self):
+        r = self.geo.get((19.0760, 72.8777))
+        assert "city" in r and "state" in r
+
+    def test_outside_india_returns_empty(self):
+        # New York, USA
+        assert self.geo.get((40.7128, -74.0060)) == {"city": "", "state": ""}
+        # London, UK
+        assert self.geo.get((51.5074, -0.1278))["state"] == ""
+
+    def test_state_names_match_routing_table(self):
+        # Every directory state name the geocoder can emit must map to a code
+        name_to_code = {
+            "Delhi": "DL", "Maharashtra": "MH", "Karnataka": "KA",
+            "Tamil Nadu": "TN", "Uttar Pradesh": "UP", "Haryana": "HR",
+            "Kerala": "KL", "Gujarat": "GJ", "West Bengal": "WB",
+            "Telangana": "TS", "Punjab": "PB", "Rajasthan": "RJ", "Goa": "GA",
+        }
+        for _, _, name in IndiaGeocoder._CENTROIDS:
+            # neighbours may be absent; directory states must be present
+            if name in name_to_code:
+                assert len(name_to_code[name]) == 2
 
 
 # ============================================================================

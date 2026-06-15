@@ -11,7 +11,10 @@ fullscreen = 0
 
 icon.filename = %(source.dir)s/icon.png
 
-requirements = python3,kivy,camera4kivy,gestures4kivy,plyer,numpy,android,opencv,reverse_geocode,pyjnius
+# NOTE: reverse_geocode / reverse_geocoder are intentionally excluded — they import
+# scipy (cKDTree), which cannot cross-compile for Android. main.py falls back to the
+# bundled pure-Python IndiaGeocoder for on-device GPS->state routing.
+requirements = python3,kivy,camera4kivy,gestures4kivy,plyer,numpy,android,opencv,pyjnius
 
 services = service:service.py
 
