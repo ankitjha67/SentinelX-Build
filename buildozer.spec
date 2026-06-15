@@ -5,7 +5,7 @@ package.domain = org.sentinelx
 source.dir = .
 source.include_exts = py,png,jpg,kv,json,txt,onnx
 
-version = 1.5.0
+version = 1.6.0
 # 'all' lets the phone rotate to landscape for capturing wide number plates while
 # keeping the portrait form usable. p4a's activity sets a broad configChanges, so
 # rotating does not restart the app or the camera.

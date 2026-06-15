@@ -2,9 +2,11 @@
 
 AI-powered traffic violation reporting app for Android. Captures evidence, detects number plates via OCR, auto-routes reports to the correct Indian police authority, and protects the reporter under Good Samaritan Law (Section 134A, MVA 1988).
 
-**Version:** 1.5.0
+**Version:** 1.6.0
 **Target:** Android 10+ (arm64-v8a)
-**Stack:** Python 3.10 + Kivy + camera4kivy (CameraX) + OpenCV + ML Kit + Buildozer
+**Stack:** Python 3.10 + Kivy + camera4kivy (CameraX) + OpenCV + ML Kit + Play Core + Buildozer
+**Build toolchain:** python-for-android pinned to `v2024.01.21` (numpy 1.22.3, classic
+setup.py build — newer p4a ships numpy 2.x which fails to cross-compile on NDK r25b)
 
 ---
 
@@ -51,10 +53,27 @@ AI-powered traffic violation reporting app for Android. Captures evidence, detec
 - **Anti-Fabrication** -- OpenCV fallback counts character regions only, never generates placeholder text
 - **Smart Regex** -- Indian plate pattern `([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})` rejects signage fragments
 
+### Phase 6 -- Citizen Empowerment (`civic.py`)
+- **Multi-channel reporting** -- Share to X/Twitter (auto-tags state traffic-police handles) and WhatsApp via deep links
+- **Vehicle lookup** -- Plate -> RC / insurance / PUC / owner via a configurable `SENTINELX_VAHAN_URL` endpoint (degrades gracefully; never fabricates)
+- **Road-hazard reporting** -- 8 municipal categories (potholes, signals, signage, waterlogging, footpath encroachment, ramps, streetlights, manholes) -> email + CPGRAMS fallback
+- **SOS / Emergency** -- Dial 112/108, live-location SMS, Good Samaritan (Section 134A) accident flow
+- **Duplicate guard** -- Warns on near-duplicate reports (same plate+offense, <150 m, <10 min)
+- **Privacy face-blur** -- Opt-in blur of bystander faces on evidence (off by default -- a rider's head can itself be helmet/phone evidence)
+- **Localisation** -- English / Hindi runtime translation for key strings
+- **Violation hotspots** -- Local density map from the report log
+- **Offline India geocoder** -- Pure-Python `IndiaGeocoder` (state-anchor + haversine) resolves GPS->state with no scipy/numpy on device
+
+### App Updates (OTA + Play)
+- **GitHub OTA** (sideloaded) -- Each successful `main` build publishes a GitHub Release with `sentinelx.apk` + `update.json`. The app auto-detects a higher versionCode on launch, downloads via Android DownloadManager, and prompts a one-tap install.
+- **Play In-App Updates** (Play installs) -- Java helper (`java_src/.../InAppUpdate.java`) drives the Play Core FLEXIBLE flow: background download + auto-install.
+- **Auto-routing** -- App detects its install source (`getInstallerPackageName`) and uses Play updates on Play installs, GitHub OTA otherwise -- no double prompts.
+
 ### UI/UX
 - **Dark Theme** -- Custom design system (#0B0E17 background, cyan/green/amber/red accents)
 - **Action Bar** -- SCAN (purple), CAPTURE (blue), SEND (green), CLEAR (slate)
-- **HISTORY Button** -- Scrollable popup of last 10 reports, newest first
+- **Header** -- MORE (citizen tools menu) + HISTORY (last 10 reports)
+- **Landscape capture** -- `orientation = all`; rotate to landscape to frame wide plates
 - **Context-Aware Popups** -- Green for success, red for errors, amber for warnings, cyan for info
 - **Styled Widgets** -- Custom Card, StyledInput, StyledSpinner, ActionBtn, ToggleRow, SectionLabel
 
@@ -86,7 +105,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-All 233 tests across 30 test suites must pass before building.
+All 287 tests must pass before building.
 
 ### Step 3: Install Buildozer
 
@@ -101,7 +120,7 @@ pip install "cython<3.0" buildozer
 buildozer -v android debug
 ```
 
-First build takes 15-25 minutes (downloads Android SDK, NDK, compiles OpenCV for ARM64). The APK will be at `bin/sentinelx-1.5.0-arm64-v8a-debug.apk`.
+First build takes 15-25 minutes (downloads Android SDK, NDK, compiles OpenCV for ARM64). The APK will be at `bin/sentinelx-1.6.0-arm64-v8a-debug.apk`.
 
 ### Step 5: Install on Your Phone
 
@@ -130,17 +149,24 @@ Then: Settings > Apps > Sentinel-X > Battery > **Unrestricted**
 4. Toggle **Night/Fog CLAHE** if conditions are poor
 5. **CAPTURE** to save the evidence photo (watermarked + hashed)
 6. **SEND** -- email app opens with pre-filled recipients, violation report, evidence attachment, and Good Samaritan footer
-7. **HISTORY** to review past 10 reports
+7. **MORE** -- citizen tools (share to X/WhatsApp, vehicle lookup, hazard report, SOS, hotspots, privacy blur, language, check for updates)
+8. **HISTORY** -- review past 10 reports
 
 ---
 
-## Build via GitHub Actions
+## Build & Distribute via GitHub Actions
 
-Every push triggers the CI pipeline automatically:
+Every push runs the CI pipeline: **test -> build APK**.
 
 1. Fork this repo on GitHub
-2. Push any commit -- the `build` workflow runs tests then builds the APK
-3. Download the APK from the workflow's **Artifacts** section (retained 30 days)
+2. Push any commit -- the `build` workflow runs the 287 tests, then builds the APK
+3. Download the APK from the run's **Artifacts** section (retained 30 days)
+
+**OTA releases (main only):** a successful build on `main` also publishes a
+**GitHub Release** with `sentinelx.apk` + `update.json` (marked latest). Installed
+apps poll `releases/latest/download/update.json`, compare the `version_code`, and
+prompt a one-tap update. The build number is injected as the Android versionCode,
+so every `main` build is a higher version that devices detect automatically.
 
 ---
 
@@ -149,16 +175,19 @@ Every push triggers the CI pipeline automatically:
 ```
 SentinelX-Build/
 |-- camerax_provider/          <- Android CameraX bindings (cloned by setup.sh)
-|   |-- gradle_options.py      <- p4a hook: injects CameraX + ML Kit gradle deps
-|-- main.py                    <- App (~2700 lines, Phases 1-5)
+|   |-- gradle_options.py      <- p4a hook: CameraX + ML Kit + Play Core deps, add-source
+|-- java_src/
+|   |-- org/sentinelx/InAppUpdate.java   <- Play In-App Updates helper
+|-- main.py                    <- App UI + subsystems (Phases 1-6, ~3200 lines)
+|-- civic.py                   <- Phase 6 logic (Kivy-free, unit-tested)
 |-- service.py                 <- Background GPS + accelerometer (UDP broadcast)
-|-- buildozer.spec             <- Android build config (v1.5.0, API 33, NDK 25b)
+|-- buildozer.spec             <- Android build config (v1.6.0, API 33, NDK 25b, p4a v2024.01.21)
 |-- setup.sh                   <- One-time setup script
 |-- tests/
 |   |-- conftest.py
-|   |-- test_sentinelx.py      <- 233 unit tests (30 test suites)
+|   |-- test_sentinelx.py      <- 287 unit tests
 |-- .github/workflows/
-|   |-- build.yml              <- CI: test -> build APK -> upload artifact
+|   |-- build.yml              <- CI: test -> build APK -> upload artifact -> publish OTA (main)
 |-- models/                    <- Drop a detector.onnx here (optional)
 |-- evidence/                  <- Captured photos (auto-created, gitignored)
 ```
@@ -254,6 +283,15 @@ Offline:
 | 4 | Brake Log | `HarshBrakeLog` | main | JSONL event log with debounce |
 | 5 | Plate OCR | `PlateOCR` | worker | ML Kit / Tesseract engine abstraction |
 | 5 | Jurisdiction | `JurisdictionEngine` | main | Plate state code to police email routing |
+| 6 | Geocoder | `IndiaGeocoder` | main | Offline GPS->state (no scipy/numpy) |
+| 6 | Channels | `ReportChannels` / `CivicDirectory` | main | X/Twitter + WhatsApp share links |
+| 6 | Vehicle | `VehicleLookup` | worker | RC/insurance/PUC via configurable endpoint |
+| 6 | Hazards | `HazardReport` | main | Municipal/CPGRAMS hazard routing |
+| 6 | Safety | `Emergency` | main | SOS dial, location SMS, Good Samaritan |
+| 6 | Anti-spam | `DuplicateGuard` | main | Near-duplicate report detection |
+| 6 | i18n | `I18N` | main | English/Hindi runtime translation |
+| 6 | Privacy | `PrivacyBlur` | main | Opt-in face blur on evidence |
+| 6 | Updates | `UpdateManifest` + `InAppUpdate.java` | worker | GitHub OTA + Play In-App Updates |
 
 ---
 
@@ -272,8 +310,23 @@ Offline:
 - Try the SCAN button for on-demand full-frame OCR
 - Hold the camera steady with the plate clearly visible
 
-**Background service stops:**
+**Build fails compiling numpy/scipy (ninja/meson C++ errors):**
+- Keep `p4a.branch = v2024.01.21` in buildozer.spec. Newer p4a ships numpy 2.x
+  whose meson build fails on NDK r25b's clang. The pinned release uses numpy 1.22.3
+  (classic setup.py).
+- Do **not** add `reverse_geocode`/`reverse_geocoder`/`scipy` to requirements --
+  they pull scipy, which cannot cross-compile. The bundled `IndiaGeocoder` replaces them.
+
+**Background service / telemetry stops:**
 - Settings > Apps > Sentinel-X > Battery > **Unrestricted**
+
+**Vehicle lookup says "no provider configured":**
+- Set `SENTINELX_VAHAN_URL` to an endpoint accepting `?plate=` and returning JSON.
+
+**Updates not appearing:**
+- OTA releases publish only from the `main` branch. The installed APK must itself
+  contain the update-checker (v1.6.0+). Sideloaded = one-tap install prompt;
+  fully silent updates require Play Store / MDM / root (Android security).
 
 **Email doesn't send:**
 - plyer.email opens your email app (Gmail, etc). You tap Send manually.

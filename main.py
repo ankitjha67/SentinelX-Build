@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.5.0 -- Civic Enforcement (Android)
+Sentinel-X v1.6.0 -- Civic Enforcement (Android)
 Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
 Phase 2: Evidence integrity — SHA-256 hashing, metadata watermark, report log.
 Phase 3: Offline resilience — report queue, connectivity detection, auto-retry.
 Phase 4: Enhanced detection — ONNX model loader, speed zones, subsystem status.
 Phase 5: Automatic plate OCR — ML Kit text recognition, auto-fill, jurisdiction routing.
+Phase 6: Citizen tools (X/WhatsApp, vehicle lookup, hazards, SOS, i18n, privacy)
+         + over-the-air updates (GitHub OTA for sideloaded, Play In-App Updates).
+Offline GPS->state via the bundled pure-Python IndiaGeocoder (no scipy on device).
 """
 
 import os
