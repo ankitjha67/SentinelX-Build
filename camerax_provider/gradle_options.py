@@ -31,7 +31,9 @@ def before_apk_build(toolchain):
                         'androidx.core:core:1.9.0',
                         # Phase 5: ML Kit Text Recognition for plate OCR
                         'com.google.mlkit:text-recognition:16.0.1',
-                        'com.google.android.gms:play-services-tasks:18.1.0']
+                        'com.google.android.gms:play-services-tasks:18.1.0',
+                        # Phase 6: Play In-App Updates (seamless updates on Play installs)
+                        'com.google.android.play:app-update:2.1.0']
     existing_depends = []
     read_next = False
     for ua in unprocessed_args:
@@ -64,6 +66,14 @@ def before_apk_build(toolchain):
         unprocessed_args.append(camerax_java)
         info('Camerax Provider: Add android.add_src = ' +\
              './camerax_provider/camerax_src')
+
+    # Phase 6: add the project's Java sources (Play In-App Updates helper).
+    # Lives one level up from this hook, at <project>/java_src.
+    project_java = join(dirname(dirname(__file__)), 'java_src')
+    if exists(project_java):
+        unprocessed_args.append('--add-source')
+        unprocessed_args.append(project_java)
+        info('Camerax Provider: Add android.add_src = ./java_src')
 
 
 

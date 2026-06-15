@@ -2228,8 +2228,8 @@ class RootUI(BoxLayout):
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
-        # Phase 6: silent OTA update check shortly after launch
-        Clock.schedule_once(lambda _dt: self.check_for_updates(False), 4.0)
+        # Phase 6: silent update check shortly after launch (Play or GitHub OTA)
+        Clock.schedule_once(lambda _dt: self._auto_update_check(False), 4.0)
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
@@ -2792,7 +2792,7 @@ class RootUI(BoxLayout):
             ("Report a road hazard", self.report_hazard),
             ("SOS / Emergency", self.show_sos),
             ("Violation hotspots", self.show_hotspots),
-            ("Check for app updates", lambda: self.check_for_updates(True)),
+            ("Check for app updates", lambda: self._auto_update_check(True)),
             (blur_lbl, self.toggle_privacy_blur),
             (lang_lbl, self.toggle_language),
         ]
@@ -3029,6 +3029,40 @@ class RootUI(BoxLayout):
     # ═════════════════════════════════════════════════════════════════════
     # Over-the-air auto-update (detect -> download -> one-tap install)
     # ═════════════════════════════════════════════════════════════════════
+    def _installed_from_play(self):
+        """True if this app was installed from the Google Play Store."""
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            installer = act.getPackageManager().getInstallerPackageName(
+                act.getPackageName())
+            return installer in ("com.android.vending",
+                                 "com.google.android.feedback")
+        except Exception:
+            return False
+
+    def _auto_update_check(self, announce=False):
+        """Use Play In-App Updates on Play installs; GitHub OTA otherwise."""
+        self._close_menu()
+        if self._installed_from_play():
+            self._play_in_app_update()
+            if announce:
+                self._popup("Updates", "Checking Google Play for updates...")
+        else:
+            self.check_for_updates(announce)
+
+    def _play_in_app_update(self):
+        """Trigger the Play In-App Updates flexible flow via the Java helper."""
+        if platform != "android" or autoclass is None:
+            return
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            autoclass("org.sentinelx.InAppUpdate").start(act)
+        except Exception:
+            # Helper/Play Core unavailable -> fall back to GitHub OTA
+            self.check_for_updates(False)
+
     def _current_version_code(self):
         """Installed app versionCode via PackageManager (0 off-device)."""
         if platform != "android" or autoclass is None:
