@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.5.0 -- Civic Enforcement (Android)
+Sentinel-X v1.6.0 -- Civic Enforcement (Android)
 Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
 Phase 2: Evidence integrity — SHA-256 hashing, metadata watermark, report log.
 Phase 3: Offline resilience — report queue, connectivity detection, auto-retry.
 Phase 4: Enhanced detection — ONNX model loader, speed zones, subsystem status.
 Phase 5: Automatic plate OCR — ML Kit text recognition, auto-fill, jurisdiction routing.
+Phase 6: Citizen tools (X/WhatsApp, vehicle lookup, hazards, SOS, i18n, privacy)
+         + over-the-air updates (GitHub OTA for sideloaded, Play In-App Updates).
+Offline GPS->state via the bundled pure-Python IndiaGeocoder (no scipy on device).
 """
 
 import os
@@ -44,6 +47,70 @@ try:
 except Exception:
     np = None
 
+
+class IndiaGeocoder:
+    """Pure-Python offline reverse geocoder for Indian states.
+
+    Uses nearest state-centroid by great-circle distance — no numpy/scipy.
+    This is the on-device path: reverse_geocode / reverse_geocoder both import
+    scipy (cKDTree), which cannot cross-compile for Android via python-for-android,
+    so they are excluded from the APK and this fallback is used instead.
+    """
+
+    # (lat, lon, full state name) — major-city anchors per state. Multiple anchors
+    # for large/border states sharpen nearest-anchor accuracy (e.g. Bengaluru sits
+    # near the Tamil Nadu border, so Karnataka needs a southern anchor).
+    _CENTROIDS = [
+        # Directory states (routed to police email)
+        (28.61, 77.21, "Delhi"),
+        (29.06, 76.09, "Haryana"), (28.90, 76.61, "Haryana"),
+        (28.4595, 77.0266, "Haryana"), (28.4089, 77.3178, "Haryana"),  # Gurugram, Faridabad (NCR)
+        (19.08, 72.88, "Maharashtra"), (18.52, 73.86, "Maharashtra"), (21.15, 79.09, "Maharashtra"),
+        (12.97, 77.59, "Karnataka"), (15.36, 75.12, "Karnataka"), (12.30, 76.65, "Karnataka"),
+        (13.08, 80.27, "Tamil Nadu"), (11.02, 76.96, "Tamil Nadu"), (9.92, 78.12, "Tamil Nadu"),
+        (26.85, 80.95, "Uttar Pradesh"), (25.32, 82.97, "Uttar Pradesh"), (27.18, 78.01, "Uttar Pradesh"),
+        (9.93, 76.27, "Kerala"), (8.52, 76.94, "Kerala"), (11.25, 75.78, "Kerala"),
+        (23.02, 72.57, "Gujarat"), (21.17, 72.83, "Gujarat"), (22.31, 73.18, "Gujarat"),
+        (22.57, 88.36, "West Bengal"), (23.25, 87.85, "West Bengal"),
+        (17.39, 78.49, "Telangana"), (18.00, 79.59, "Telangana"),
+        (30.90, 75.85, "Punjab"), (31.63, 74.87, "Punjab"), (31.33, 75.58, "Punjab"),
+        (26.91, 75.79, "Rajasthan"), (26.45, 74.64, "Rajasthan"), (24.58, 73.71, "Rajasthan"),
+        (15.49, 73.83, "Goa"),
+        # Neighbouring states (no email directory, but sharpen nearest-state accuracy)
+        (23.25, 77.41, "Madhya Pradesh"), (22.72, 75.86, "Madhya Pradesh"),
+        (25.59, 85.14, "Bihar"),
+        (16.51, 80.65, "Andhra Pradesh"), (17.69, 83.22, "Andhra Pradesh"),
+        (20.30, 85.82, "Odisha"),
+        (26.14, 91.74, "Assam"),
+        (23.36, 85.33, "Jharkhand"),
+        (21.25, 81.63, "Chhattisgarh"),
+        (30.32, 78.03, "Uttarakhand"),
+        (31.10, 77.17, "Himachal Pradesh"),
+        (34.08, 74.80, "Jammu and Kashmir"), (32.73, 74.86, "Jammu and Kashmir"),
+    ]
+
+    @staticmethod
+    def _haversine(la1, lo1, la2, lo2):
+        r = 6371.0
+        p1, p2 = math.radians(la1), math.radians(la2)
+        dp = math.radians(la2 - la1)
+        dl = math.radians(lo2 - lo1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+    def get(self, coordinate):
+        lat, lon = coordinate
+        # Reject points clearly outside the Indian bounding box
+        if not (6.0 <= lat <= 37.5 and 68.0 <= lon <= 97.5):
+            return {"city": "", "state": ""}
+        best_name, best_d = "", float("inf")
+        for cla, clo, name in self._CENTROIDS:
+            d = self._haversine(lat, lon, cla, clo)
+            if d < best_d:
+                best_d, best_name = d, name
+        return {"city": "", "state": best_name}
+
+
 rg = None
 try:
     import reverse_geocode
@@ -53,7 +120,14 @@ except Exception:
         import reverse_geocoder as _rg
         rg = _rg
     except Exception:
-        rg = None
+        # On Android (and anywhere scipy is unavailable) use the bundled geocoder
+        rg = IndiaGeocoder()
+
+# Phase 6 — citizen-empowerment logic (pure Python, Kivy-free, unit-tested)
+from civic import (
+    CivicDirectory, ReportChannels, VehicleLookup, DuplicateGuard, I18N,
+    HazardReport, Emergency, ViolationHeatmap, PrivacyBlur, UpdateManifest,
+)
 
 try:
     from plyer import email as plyer_email
@@ -372,10 +446,17 @@ class PlateOCR:
             LatinOptions = autoclass(
                 "com.google.mlkit.vision.text.latin.TextRecognizerOptions"
             )
-            self._recognizer = TextRecognition.getClient(
-                LatinOptions.Builder().build()
-            )
-            return True
+            # pyjnius cannot reach a nested class (Builder) as an attribute, so use
+            # the static DEFAULT_OPTIONS field; fall back to the $-qualified Builder.
+            try:
+                options = LatinOptions.DEFAULT_OPTIONS
+            except Exception:
+                Builder = autoclass(
+                    "com.google.mlkit.vision.text.latin.TextRecognizerOptions$Builder"
+                )
+                options = Builder().build()
+            self._recognizer = TextRecognition.getClient(options)
+            return self._recognizer is not None
         except Exception:
             return False
 
@@ -1624,18 +1705,27 @@ KV = """
             halign: "left"
             valign: "middle"
             text_size: self.size
-            size_hint_x: 0.5
-        Label:
-            text: "v1.5"
+            size_hint_x: 0.40
+        Button:
+            text: "MORE"
+            size_hint_x: 0.30
             font_size: "11sp"
-            color: C("#4A5270")
-            halign: "right"
-            valign: "middle"
-            text_size: self.size
-            size_hint_x: 0.25
+            bold: True
+            color: C("#FFD740")
+            background_normal: ""
+            background_down: ""
+            background_color: (0, 0, 0, 0)
+            on_release: root.show_more_menu()
+            canvas.before:
+                Color:
+                    rgba: C("#1A2035")
+                RoundedRectangle:
+                    pos: (self.x + dp(4), self.y + dp(4))
+                    size: (self.width - dp(8), self.height - dp(8))
+                    radius: [dp(8)]
         Button:
             text: "HISTORY"
-            size_hint_x: 0.25
+            size_hint_x: 0.30
             font_size: "11sp"
             bold: True
             color: C("#00E5FF")
@@ -2010,6 +2100,9 @@ class RootUI(BoxLayout):
         # Phase 5
         self._plate_ocr = None
         self._ocr_accepted_plate = ""
+        # Phase 6 — citizen features
+        self._privacy_blur = False
+        self._dup_ack = False
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -2096,11 +2189,21 @@ class RootUI(BoxLayout):
         # Phase 1: Start background service on Android
         if platform == "android" and autoclass is not None:
             try:
-                svc = autoclass("org.sentinelx.ServiceService")
-                mActivity = autoclass(
-                    "org.kivy.android.PythonActivity"
-                ).mActivity
-                svc.start(mActivity, "")
+                mActivity = autoclass("org.kivy.android.PythonActivity").mActivity
+                # Derive the service class from the real package name. buildozer
+                # builds it as "<package.domain>.<package.name>.ServiceService"
+                # (here org.sentinelx.sentinelx.ServiceService), so hardcoding
+                # "org.sentinelx.ServiceService" silently fails to start it.
+                pkg = mActivity.getPackageName()
+                svc = None
+                for cls in (pkg + ".ServiceService", "org.sentinelx.ServiceService"):
+                    try:
+                        svc = autoclass(cls)
+                        break
+                    except Exception:
+                        continue
+                if svc is not None:
+                    svc.start(mActivity, "")
             except Exception:
                 pass
         # Phase 2: Report log
@@ -2128,6 +2231,8 @@ class RootUI(BoxLayout):
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
+        # Phase 6: silent update check shortly after launch (Play or GitHub OTA)
+        Clock.schedule_once(lambda _dt: self._auto_update_check(False), 4.0)
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
@@ -2257,6 +2362,17 @@ class RootUI(BoxLayout):
                         if img is not None:
                             enhanced = AnalyticsEngine.clahe(img)
                             cv2.imwrite(fpath, enhanced)
+                    except Exception:
+                        pass
+
+                # Phase 6: Optional privacy blur of bystander faces (opt-in via
+                # MORE menu; off by default because a rider's head can itself be
+                # evidence of a helmet/phone violation).
+                if getattr(self, "_privacy_blur", False) and cv2:
+                    try:
+                        img = cv2.imread(fpath)
+                        if img is not None:
+                            cv2.imwrite(fpath, PrivacyBlur.blur_faces(img))
                     except Exception:
                         pass
 
@@ -2528,6 +2644,22 @@ class RootUI(BoxLayout):
             self._popup("No route", "Unknown state code.")
             return
 
+        # Phase 6: warn on near-duplicate (same plate+offense, close in time/space)
+        if not getattr(self, "_dup_ack", False) and self._report_log:
+            try:
+                entries = self._report_log.read_all()
+            except Exception:
+                entries = []
+            if DuplicateGuard.is_duplicate(entries, plate, okey, lat, lon):
+                self._dup_ack = True
+                self._popup(
+                    "Duplicate",
+                    "A matching report for %s was just filed nearby.\n"
+                    "Tap SEND again to submit anyway." % plate,
+                )
+                return
+        self._dup_ack = False
+
         o = TrafficLawDB.OFFENSES[okey]
         anon = bool(self.ids.sw_anon.active)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2558,6 +2690,7 @@ class RootUI(BoxLayout):
             "plate": plate, "offense": okey, "section": o["section"],
             "lat": lat, "lon": lon, "speed_kmh": self.latest_speed * 3.6,
             "g_dyn": self.latest_g, "recipients": to, "subject": subj,
+            "ts": time.time(),  # for duplicate detection
             "evidence": self.evidence_path,
             "evidence_hash": EvidenceHasher.hash_file(self.evidence_path) if self.evidence_path else "",
         }
@@ -2634,6 +2767,440 @@ class RootUI(BoxLayout):
         title = "History (%d of %d)" % (min(len(entries), 10), len(entries))
         self._popup(title, "\n\n".join(lines), tall=True)
 
+    # ═════════════════════════════════════════════════════════════════════
+    # Phase 6 — citizen features (menu + handlers)
+    # ═════════════════════════════════════════════════════════════════════
+    def _menu_button(self, text, cb):
+        from kivy.uix.button import Button
+        b = Button(
+            text=text, size_hint_y=None, height=dp(46), font_size="14sp",
+            bold=True, color=(0.9, 0.93, 0.97, 1),
+            background_normal="", background_down="",
+            background_color=(0.10, 0.12, 0.20, 1),
+        )
+        b.bind(on_release=lambda *_: cb())
+        return b
+
+    def _dismiss_button(self, text, cb):
+        """A visually distinct Close/OK button for popups."""
+        from kivy.uix.button import Button
+        b = Button(
+            text=text, size_hint_y=None, height=dp(48), font_size="15sp",
+            bold=True, color=(1, 1, 1, 1),
+            background_normal="", background_down="",
+            background_color=(0.22, 0.26, 0.34, 1),
+        )
+        b.bind(on_release=lambda *_: cb())
+        return b
+
+    def show_more_menu(self):
+        from kivy.uix.scrollview import ScrollView
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        blur_lbl = "Privacy blur (faces): %s" % ("ON" if self._privacy_blur else "OFF")
+        lang_lbl = "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English")
+        items = [
+            ("Share to X / Twitter", self.share_twitter),
+            ("Share to WhatsApp", self.share_whatsapp),
+            ("Vehicle lookup (RC/Insurance/PUC)", self.vehicle_lookup),
+            ("Report a road hazard", self.report_hazard),
+            ("SOS / Emergency", self.show_sos),
+            ("Violation hotspots", self.show_hotspots),
+            ("Check for app updates", lambda: self._auto_update_check(True)),
+            (blur_lbl, self.toggle_privacy_blur),
+            (lang_lbl, self.toggle_language),
+        ]
+        for text, cb in items:
+            box.add_widget(self._menu_button(text, cb))
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
+        self._menu_popup = Popup(
+            title="More — Citizen Tools", content=container,
+            size_hint=(0.9, 0.85), title_size="15sp",
+            title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _close_menu(self):
+        if getattr(self, "_menu_popup", None):
+            try:
+                self._menu_popup.dismiss()
+            except Exception:
+                pass
+
+    # ── context helpers ──────────────────────────────────────────────────
+    def _ctx(self):
+        plate = self.ids.in_plate.text.strip()
+        okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
+        label = TrafficLawDB.OFFENSES.get(okey, {}).get("label", "")
+        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        sc = JurisdictionEngine.extract_state_code(plate) or \
+            JurisdictionEngine._resolve_state(float(self.latest_lat), float(self.latest_lon))
+        return plate, label, loc, sc
+
+    def _open_url(self, url):
+        """Open a URL via an Android intent, else the desktop browser."""
+        if platform == "android" and autoclass is not None:
+            try:
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                act.startActivity(i)
+                return True
+            except Exception:
+                return False
+        try:
+            import webbrowser
+            return webbrowser.open(url)
+        except Exception:
+            return False
+
+    def _android_intent(self, action, uri, extras=None):
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = Intent(action, Uri.parse(uri))
+            for k, v in (extras or {}).items():
+                i.putExtra(k, v)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            act.startActivity(i)
+            return True
+        except Exception:
+            return False
+
+    # ── share channels ───────────────────────────────────────────────────
+    def share_twitter(self):
+        self._close_menu()
+        plate, label, loc, sc = self._ctx()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        text = ReportChannels.compose(plate, label, loc, sc)
+        if not self._open_url(ReportChannels.twitter_url(text)):
+            self._popup("Unavailable", "Could not open X/Twitter.")
+
+    def share_whatsapp(self):
+        self._close_menu()
+        plate, label, loc, sc = self._ctx()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        text = ReportChannels.compose(plate, label, loc, sc)
+        if not self._open_url(ReportChannels.whatsapp_url(text)):
+            self._popup("Unavailable", "WhatsApp not installed.")
+
+    # ── vehicle lookup ───────────────────────────────────────────────────
+    def vehicle_lookup(self):
+        self._close_menu()
+        plate = self.ids.in_plate.text.strip()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        if not VehicleLookup.available():
+            self._popup(
+                "Lookup",
+                "No vehicle-data provider configured.\n\n"
+                "Set SENTINELX_VAHAN_URL to an endpoint that accepts ?plate= "
+                "and returns JSON (RC, insurance, PUC).",
+            )
+            return
+        self._popup("Lookup", "Querying vehicle records for %s..." % plate)
+        threading.Thread(target=self._vehicle_lookup_worker,
+                         args=(plate,), daemon=True).start()
+
+    def _vehicle_lookup_worker(self, plate):
+        res = VehicleLookup.lookup(plate)
+
+        def show(_dt):
+            if not res.get("ok"):
+                self._popup("Lookup failed", res.get("error", "unknown error"))
+                return
+            msg = "\n".join([
+                "Owner: %s" % (res.get("owner") or DASH),
+                "Model: %s" % (res.get("model") or DASH),
+                "RC: %s" % (res.get("rc_status") or DASH),
+                "Insurance: %s" % (res.get("insurance") or DASH),
+                "PUC: %s" % (res.get("puc") or DASH),
+                "Registered: %s" % (res.get("registered") or DASH),
+            ])
+            self._popup("Vehicle %s" % plate, msg, tall=True)
+        Clock.schedule_once(show, 0)
+
+    # ── road-hazard reporting (municipal) ────────────────────────────────
+    def report_hazard(self):
+        self._close_menu()
+        from kivy.uix.scrollview import ScrollView
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        for cat in HazardReport.CATEGORIES:
+            box.add_widget(self._menu_button(cat, lambda c=cat: self._send_hazard(c)))
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
+        self._menu_popup = Popup(
+            title="Report a hazard", content=container, size_hint=(0.9, 0.85),
+            title_size="15sp", title_color=(1, 0.84, 0.25, 1),
+            separator_color=(1, 0.84, 0.25, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _send_hazard(self, category):
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        notes = self.ids.in_notes.text.strip()
+        subj = HazardReport.subject(category, loc)
+        body = HazardReport.body(category, lat, lon, loc, notes)
+        opened = False
+        if plyer_email is not None:
+            try:
+                plyer_email.send(subject=subj, text=body, create_chooser=True)
+                opened = True
+            except Exception:
+                opened = False
+        if not opened:
+            # Fall back to the national grievance portal
+            self._open_url(HazardReport.CPGRAMS_PORTAL)
+        self._popup("Hazard", "Hazard report prepared:\n%s" % category)
+
+    # ── SOS / emergency ──────────────────────────────────────────────────
+    def show_sos(self):
+        self._close_menu()
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        actions = [
+            ("Call 112 (Emergency)", lambda: self._dial(CivicDirectory.EMERGENCY)),
+            ("Call 108 (Ambulance)", lambda: self._dial(CivicDirectory.AMBULANCE)),
+            ("Report accident (Good Samaritan)", self._good_samaritan),
+            ("Share my location (SMS)", lambda: self._sos_sms(lat, lon)),
+        ]
+        for text, cb in actions:
+            box.add_widget(self._menu_button(text, cb))
+        box.add_widget(self._dismiss_button("Close", self._close_menu))
+        self._menu_popup = Popup(
+            title="SOS / Emergency", content=box, size_hint=(0.9, 0.62),
+            title_size="15sp", title_color=(1, 0.32, 0.32, 1),
+            separator_color=(1, 0.32, 0.32, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _dial(self, number):
+        # Intent action constants are plain strings, so no autoclass on desktop.
+        self._close_menu()
+        if not self._android_intent("android.intent.action.DIAL", "tel:" + str(number)):
+            self._popup("Dial", "Call %s" % number)
+
+    def _sos_sms(self, lat, lon):
+        self._close_menu()
+        text = Emergency.sos_text(lat, lon)
+        if not self._android_intent("android.intent.action.SENDTO", "smsto:",
+                                    {"sms_body": text}):
+            self._popup("SOS", text)
+
+    def _good_samaritan(self):
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        self._popup(
+            "Good Samaritan",
+            "Reporting an accident under Sec.134A protection.\n\n%s\n\n"
+            "Use SOS to call 112/108." % Emergency.good_samaritan_text(lat, lon),
+            tall=True,
+        )
+
+    # ── hotspots, privacy, language ──────────────────────────────────────
+    def show_hotspots(self):
+        self._close_menu()
+        entries = self._report_log.read_all() if self._report_log else []
+        spots = ViolationHeatmap.hotspots(entries)
+        if not spots:
+            self._popup("Hotspots", "Not enough reports yet to map hotspots.")
+            return
+        lines = ["%d report(s) near %.3f, %.3f" % (s["count"], s["lat"], s["lon"])
+                 for s in spots]
+        self._popup("Violation hotspots", "\n\n".join(lines), tall=True)
+
+    def toggle_privacy_blur(self):
+        self._privacy_blur = not self._privacy_blur
+        self._close_menu()
+        self._popup("Privacy", "Face blur on capture: %s"
+                    % ("ON" if self._privacy_blur else "OFF"))
+
+    def toggle_language(self):
+        I18N.set_lang("hi" if I18N.LANG == "en" else "en")
+        self._close_menu()
+        self._popup(I18N.tr("Ready"),
+                    "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English"))
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Over-the-air auto-update (detect -> download -> one-tap install)
+    # ═════════════════════════════════════════════════════════════════════
+    def _installed_from_play(self):
+        """True if this app was installed from the Google Play Store."""
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            installer = act.getPackageManager().getInstallerPackageName(
+                act.getPackageName())
+            return installer in ("com.android.vending",
+                                 "com.google.android.feedback")
+        except Exception:
+            return False
+
+    def _auto_update_check(self, announce=False):
+        """Use Play In-App Updates on Play installs; GitHub OTA otherwise."""
+        self._close_menu()
+        if self._installed_from_play():
+            self._play_in_app_update()
+            if announce:
+                self._popup("Updates", "Checking Google Play for updates...")
+        else:
+            self.check_for_updates(announce)
+
+    def _play_in_app_update(self):
+        """Trigger the Play In-App Updates flexible flow via the Java helper."""
+        if platform != "android" or autoclass is None:
+            return
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            autoclass("org.sentinelx.InAppUpdate").start(act)
+        except Exception:
+            # Helper/Play Core unavailable -> fall back to GitHub OTA
+            self.check_for_updates(False)
+
+    def _current_version_code(self):
+        """Installed app versionCode via PackageManager (0 off-device)."""
+        if platform != "android" or autoclass is None:
+            return 0
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            pi = act.getPackageManager().getPackageInfo(act.getPackageName(), 0)
+            return int(pi.versionCode)
+        except Exception:
+            return 0
+
+    def check_for_updates(self, announce=False):
+        """Fetch the published manifest and compare with the installed build."""
+        self._close_menu()
+        threading.Thread(target=self._check_updates_worker,
+                         args=(announce,), daemon=True).start()
+
+    def _check_updates_worker(self, announce):
+        man = None
+        try:
+            import urllib.request
+            import json as _json
+            with urllib.request.urlopen(UpdateManifest.DEFAULT_URL, timeout=8) as r:
+                man = UpdateManifest.parse(_json.loads(r.read().decode("utf-8", "replace")))
+        except Exception:
+            man = None
+        cur = self._current_version_code()
+
+        def show(_dt):
+            if UpdateManifest.is_newer(cur, man):
+                self._prompt_update(man)
+            elif announce:
+                self._popup("Up to date", "You have the latest version.")
+        Clock.schedule_once(show, 0)
+
+    def _prompt_update(self, man):
+        from kivy.uix.button import Button
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(10))
+        box.add_widget(Label(
+            text="Version %s is available.\n\n%s" % (
+                man.get("version", "?"), man.get("notes", "") or "Tap Update to install."),
+            halign="left", valign="top", text_size=(dp(250), None),
+            font_size="13sp", color=(0.82, 0.84, 0.88, 1),
+        ))
+        btn = Button(
+            text="Update now", size_hint_y=None, height=dp(46), bold=True,
+            color=(1, 1, 1, 1), background_normal="", background_down="",
+            background_color=(0, 0.78, 0.33, 1),
+        )
+        btn.bind(on_release=lambda *_: (self._update_popup.dismiss(),
+                                        self._download_and_install(man.get("url", ""))))
+        box.add_widget(btn)
+        box.add_widget(self._dismiss_button(
+            "Later", lambda: self._update_popup.dismiss()))
+        self._update_popup = Popup(
+            title="Update available", content=box, size_hint=(0.86, 0.5),
+            title_size="15sp", title_color=(0, 0.78, 0.33, 1),
+            separator_color=(0, 0.78, 0.33, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._update_popup.open()
+
+    def _download_and_install(self, url):
+        if not url:
+            return
+        if platform != "android" or autoclass is None:
+            self._open_url(url)  # desktop / fallback
+            return
+        try:
+            Uri = autoclass("android.net.Uri")
+            Request = autoclass("android.app.DownloadManager$Request")
+            Environment = autoclass("android.os.Environment")
+            Context = autoclass("android.content.Context")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            req = Request(Uri.parse(url))
+            req.setTitle("Sentinel-X update")
+            req.setMimeType("application/vnd.android.package-archive")
+            req.setNotificationVisibility(
+                Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            req.setDestinationInExternalFilesDir(
+                act, Environment.DIRECTORY_DOWNLOADS, "sentinelx-update.apk")
+            self._dl_dm = act.getSystemService(Context.DOWNLOAD_SERVICE)
+            self._dl_id = self._dl_dm.enqueue(req)
+            self._dl_tries = 0
+            self._popup("Updating", "Downloading the new version...")
+            Clock.schedule_interval(self._poll_download, 1.5)
+        except Exception:
+            # Fall back to opening the APK URL in the browser
+            self._open_url(url)
+
+    def _poll_download(self, _dt):
+        try:
+            uri = self._dl_dm.getUriForDownloadedFile(self._dl_id)
+            if uri is not None:
+                self._install_apk(uri)
+                return False
+        except Exception:
+            return False
+        self._dl_tries = getattr(self, "_dl_tries", 0) + 1
+        if self._dl_tries > 180:  # ~4.5 min cap
+            self._popup("Update", "Download is taking long. Check notifications.")
+            return False
+        return True
+
+    def _install_apk(self, uri):
+        try:
+            Intent = autoclass("android.content.Intent")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(uri, "application/vnd.android.package-archive")
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            act.startActivity(i)
+        except Exception:
+            self._popup("Update", "Downloaded. Open it from notifications to install.")
+
     def _popup(self, t, m, tall=False):
         # Determine accent color based on popup type
         if t in ("Saved!", "Ready"):
@@ -2661,14 +3228,18 @@ class RootUI(BoxLayout):
         else:
             content.add_widget(lbl)
 
+        okbtn = self._dismiss_button("OK", lambda: None)
+        content.add_widget(okbtn)
+
         p = Popup(
             title=t, content=content,
-            size_hint=(0.88, 0.62) if tall else (0.82, 0.28),
+            size_hint=(0.88, 0.66) if tall else (0.82, 0.36),
             title_size="15sp",
             title_color=accent,
             separator_color=accent,
             background_color=(0.08, 0.09, 0.15, 0.95),
         )
+        okbtn.bind(on_release=lambda *_: p.dismiss())
         p.open()
 
 
