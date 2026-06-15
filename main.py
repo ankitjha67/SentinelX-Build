@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Sentinel-X v1.4.0 -- Civic Enforcement (Android)
+Sentinel-X v1.5.0 -- Civic Enforcement (Android)
 Phase 1: Continuous recording, crash recovery, threaded analysis, telemetry.
 Phase 2: Evidence integrity — SHA-256 hashing, metadata watermark, report log.
 Phase 3: Offline resilience — report queue, connectivity detection, auto-retry.
 Phase 4: Enhanced detection — ONNX model loader, speed zones, subsystem status.
+Phase 5: Automatic plate OCR — ML Kit text recognition, auto-fill, jurisdiction routing.
 """
 
 import os
@@ -23,12 +24,13 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.lang import Builder
-from kivy.metrics import dp
+from kivy.metrics import dp, sp
 from kivy.properties import StringProperty, NumericProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.label import Label
 from kivy.utils import platform
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Line
 
 Window.softinput_mode = "below_target"
 
@@ -250,6 +252,13 @@ class AnalyticsEngine:
     def __init__(self):
         self.result = ""
         self._skip = 0
+        self._plate_ocr = None
+        self.ocr_plate = ""
+        self.ocr_confidence = 0.0
+
+    def set_plate_ocr(self, ocr):
+        """Attach a PlateOCR instance for automatic plate recognition."""
+        self._plate_ocr = ocr
 
     @staticmethod
     def clahe(img):
@@ -274,10 +283,12 @@ class AnalyticsEngine:
             if w <= 0 or h <= 0:
                 return
             arr = np.frombuffer(bytes(pixels), dtype=np.uint8).reshape((h, w, 4))
-            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            bgr_full = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            # CV contour pass runs on a 640-capped copy for speed/stability.
+            bgr = bgr_full
             if w > 640:
                 s = 640.0 / w
-                bgr = cv2.resize(bgr, (640, int(h * s)))
+                bgr = cv2.resize(bgr_full, (640, int(h * s)))
             gray = cv2.bilateralFilter(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 9, 75, 75)
             cnts, _ = cv2.findContours(cv2.Canny(gray, 60, 180), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             count = 0
@@ -287,8 +298,427 @@ class AnalyticsEngine:
                 if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
                     count += 1
             self.result = "CV:%d" % count if count else "CV:--"
+            # Phase 5: Run OCR on the FULL-resolution frame every cadence.
+            # The engine locates text itself, so this works even when contour
+            # detection finds no plate-like rectangle. process_frame applies
+            # its own wall-clock throttle so this stays cheap.
+            if self._plate_ocr is not None:
+                try:
+                    plate, conf = self._plate_ocr.process_frame(bgr_full)
+                    if conf > 0.5:
+                        self.ocr_plate = plate
+                        self.ocr_confidence = conf
+                except Exception:
+                    pass
         except Exception:
             self.result = "CV:err"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Phase 5 — Automatic Plate OCR (ML Kit on Android, Tesseract on desktop)
+# ═════════════════════════════════════════════════════════════════════════
+class PlateOCR:
+    """Automatic number plate recognition.
+
+    Engines (auto-selected): Google ML Kit on-device text recognition on
+    Android; pytesseract on desktop for development. The pipeline reads the
+    full frame first (ML Kit locates text itself), then refines with cropped
+    plate candidates, normalizes to the Indian plate format, and suggests
+    jurisdiction routing.
+    """
+
+    # Final number block requires 3-4 digits: real Indian plates always have
+    # 3-4, and this rejects fragment noise from surrounding signage text
+    # (e.g. "LIMIT 50" must not be mis-read as a plate).
+    INDIAN_PLATE_RE = re.compile(
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})", re.I
+    )
+    # Confidence thresholds
+    CONF_HIGH = 0.85   # Strong regex match with all groups
+    CONF_MEDIUM = 0.6  # Partial match
+    CONF_LOW = 0.35    # Alphanumeric fallback
+    # Wall-clock throttle so heavy OCR runs at most a couple times per second
+    SCAN_INTERVAL = 0.6    # actively searching
+    HOLD_INTERVAL = 4.0    # re-confirm interval after a successful read
+
+    def __init__(self):
+        self._engine = None        # "mlkit" | "tesseract" | None
+        self._recognizer = None    # ML Kit client
+        self._tess = None          # pytesseract module
+        self._last_plate = ""
+        self._last_confidence = 0.0
+        self._last_attempt = 0.0
+        self._region_found = False
+        self._lock = threading.Lock()
+        self._init_engines()
+
+    def _init_engines(self):
+        """Pick the best available OCR engine for this platform."""
+        if self._init_mlkit():
+            self._engine = "mlkit"
+            return
+        if self._init_tesseract():
+            self._engine = "tesseract"
+            return
+
+    def _init_mlkit(self):
+        """Initialize Google ML Kit TextRecognizer on Android."""
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            TextRecognition = autoclass(
+                "com.google.mlkit.vision.text.TextRecognition"
+            )
+            LatinOptions = autoclass(
+                "com.google.mlkit.vision.text.latin.TextRecognizerOptions"
+            )
+            self._recognizer = TextRecognition.getClient(
+                LatinOptions.Builder().build()
+            )
+            return True
+        except Exception:
+            return False
+
+    def _init_tesseract(self):
+        """Initialize pytesseract on desktop if installed (dev/testing)."""
+        try:
+            import pytesseract
+            # Probe the tesseract binary; raises if not on PATH.
+            pytesseract.get_tesseract_version()
+            self._tess = pytesseract
+            return True
+        except Exception:
+            return False
+
+    @property
+    def available(self):
+        return self._engine is not None
+
+    @property
+    def engine_name(self):
+        return {"mlkit": "ML Kit", "tesseract": "Tesseract"}.get(
+            self._engine, "none"
+        )
+
+    @property
+    def last_plate(self):
+        with self._lock:
+            return self._last_plate
+
+    @property
+    def last_confidence(self):
+        with self._lock:
+            return self._last_confidence
+
+    @property
+    def region_found(self):
+        """True when a plate-like region with characters was seen but no
+        readable text could be extracted (e.g. no OCR engine, too blurry)."""
+        with self._lock:
+            return self._region_found
+
+    def reset(self):
+        """Clear last detection state."""
+        with self._lock:
+            self._last_plate = ""
+            self._last_confidence = 0.0
+            self._last_attempt = 0.0
+            self._region_found = False
+
+    # ── Plate candidate cropping ─────────────────────────────────────────
+    @staticmethod
+    def crop_plate_candidates(bgr):
+        """Find and crop plate-like regions from a BGR image.
+
+        Returns list of (cropped_bgr, (x, y, w, h)) sorted by area descending.
+        """
+        if cv2 is None or np is None:
+            return []
+        candidates = []
+        try:
+            gray = cv2.bilateralFilter(
+                cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 9, 75, 75
+            )
+            edges = cv2.Canny(gray, 60, 180)
+            cnts, _ = cv2.findContours(
+                edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            h_img, w_img = bgr.shape[:2]
+            for c in cnts:
+                x, y, cw, ch = cv2.boundingRect(c)
+                ar = cw / max(ch, 1)
+                if cw >= 60 and ch >= 20 and 2.0 <= ar <= 6.5 and cw * ch >= 2000:
+                    pad = 6
+                    x1, y1 = max(0, x - pad), max(0, y - pad)
+                    x2, y2 = min(w_img, x + cw + pad), min(h_img, y + ch + pad)
+                    crop = bgr[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        candidates.append((crop, (x, y, cw, ch)))
+            candidates.sort(key=lambda c: c[1][2] * c[1][3], reverse=True)
+        except Exception:
+            pass
+        return candidates[:5]
+
+    # ── Colour enhancement for OCR engines ───────────────────────────────
+    @staticmethod
+    def enhance_for_ocr(bgr):
+        """Upscale + contrast-enhance a colour image for OCR.
+
+        Text recognizers are trained on natural images, so this keeps colour
+        (no binarization), upscales small crops so glyphs are large enough,
+        boosts local contrast, and applies a mild unsharp mask.
+        """
+        if cv2 is None or np is None:
+            return bgr
+        try:
+            h, w = bgr.shape[:2]
+            if h == 0 or w == 0:
+                return bgr
+            # Upscale so character height is comfortably readable
+            if h < 180:
+                scale = min(180.0 / h, 4.0)
+                bgr = cv2.resize(
+                    bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(lab)
+            l_ch = cv2.createCLAHE(
+                clipLimit=2.0, tileGridSize=(8, 8)
+            ).apply(l_ch)
+            bgr = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+            blur = cv2.GaussianBlur(bgr, (0, 0), 1.0)
+            bgr = cv2.addWeighted(bgr, 1.5, blur, -0.5, 0)
+            return bgr
+        except Exception:
+            return bgr
+
+    # ── Binarized preprocessing (for char-region detection only) ─────────
+    @staticmethod
+    def preprocess_plate(crop):
+        """Binarize a plate crop for character-region counting."""
+        if cv2 is None or np is None:
+            return crop
+        try:
+            h, w = crop.shape[:2]
+            if h == 0 or w == 0:
+                return crop
+            target_h = 64
+            scale = target_h / h
+            resized = cv2.resize(crop, (max(1, int(w * scale)), target_h))
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+            enhanced = clahe.apply(gray)
+            _, thresh = cv2.threshold(
+                enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            return thresh
+        except Exception:
+            return crop
+
+    # ── Text cleanup ─────────────────────────────────────────────────────
+    @staticmethod
+    def clean_plate_text(raw):
+        """Extract the best Indian plate match from raw OCR text.
+
+        Returns (plate_string, confidence). Scans ALL candidate matches and
+        prefers the one with a series block (highest confidence).
+        Indian format: SS DD AAA DDDD  (state, district, series, number)
+        """
+        if not raw:
+            return "", 0.0
+        text = raw.upper().strip()
+        text = re.sub(r"[^A-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        best_plate, best_conf = "", 0.0
+        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
+            state = m.group(1).upper()
+            dist = m.group(2)
+            series = m.group(3).upper()
+            num = m.group(4)
+            plate = "%s%s%s%s" % (state, dist, series, num)
+            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+            if conf > best_conf:
+                best_plate, best_conf = plate, conf
+        if best_plate:
+            return best_plate, best_conf
+
+        # Fallback: contiguous alphanumeric run starting with two letters
+        cleaned = re.sub(r"[^A-Z0-9]", "", text)
+        if len(cleaned) >= 6 and cleaned[:2].isalpha():
+            return cleaned, PlateOCR.CONF_LOW
+        return "", 0.0
+
+    # ── ML Kit OCR (Android) ─────────────────────────────────────────────
+    def _ocr_mlkit(self, bgr):
+        """Run Google ML Kit text recognition on a BGR image.
+
+        Must run on a background thread — ML Kit's Tasks.await raises if
+        called on the Android main thread. Returns raw text or "".
+        """
+        if self._recognizer is None or autoclass is None:
+            return ""
+        try:
+            Bitmap = autoclass("android.graphics.Bitmap")
+            BitmapConfig = autoclass("android.graphics.Bitmap$Config")
+            InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
+            Tasks = autoclass("com.google.android.gms.tasks.Tasks")
+            TimeUnit = autoclass("java.util.concurrent.TimeUnit")
+            ByteBuffer = autoclass("java.nio.ByteBuffer")
+
+            h, w = bgr.shape[:2]
+            rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
+            bitmap = Bitmap.createBitmap(w, h, BitmapConfig.ARGB_8888)
+            buf = ByteBuffer.wrap(rgba.tobytes())
+            bitmap.copyPixelsFromBuffer(buf)
+
+            image = InputImage.fromBitmap(bitmap, 0)
+            task = self._recognizer.process(image)
+            # 5-second timeout overload prevents indefinite blocking.
+            tasks_await = getattr(Tasks, "await")
+            result = tasks_await(task, 5, TimeUnit.SECONDS)
+            raw = result.getText() if result else ""
+            bitmap.recycle()
+            return raw or ""
+        except Exception:
+            return ""
+
+    # ── Tesseract OCR (desktop / dev) ────────────────────────────────────
+    def _ocr_tesseract(self, bgr):
+        """Run pytesseract on a BGR image. Returns raw text or ""."""
+        if self._tess is None or cv2 is None:
+            return ""
+        try:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # PSM 6/11 work well for plates; restrict charset.
+            cfg = ("--oem 1 --psm 6 -c "
+                   "tessedit_char_whitelist="
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            return self._tess.image_to_string(rgb, config=cfg) or ""
+        except Exception:
+            return ""
+
+    def _ocr(self, bgr):
+        """Dispatch to the active OCR engine."""
+        if self._engine == "mlkit":
+            return self._ocr_mlkit(bgr)
+        if self._engine == "tesseract":
+            return self._ocr_tesseract(bgr)
+        return ""
+
+    # ── OpenCV character-region detector (signal only, NOT text OCR) ──────
+    @staticmethod
+    def _detect_char_regions(crop_bgr):
+        """Count character-like contours in a preprocessed plate crop.
+
+        Used only to tell the user a plate is visible but not yet readable;
+        it can never produce text.
+        """
+        if cv2 is None or np is None:
+            return 0
+        try:
+            preprocessed = PlateOCR.preprocess_plate(crop_bgr)
+            if len(preprocessed.shape) == 3:
+                gray = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = preprocessed
+            if np.mean(gray) > 127:
+                gray = cv2.bitwise_not(gray)
+            cnts, _ = cv2.findContours(
+                gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            h_img, w_img = gray.shape[:2]
+            count = 0
+            for c in cnts:
+                x, y, cw, ch = cv2.boundingRect(c)
+                if (ch > h_img * 0.3 and cw > 3 and cw < w_img * 0.25
+                        and 0.15 < (cw / max(ch, 1)) < 1.2):
+                    count += 1
+            return count
+        except Exception:
+            return 0
+
+    # ── Core read: full-frame first, then crop refinement ────────────────
+    def _read_best(self, bgr):
+        """Read the best plate from an image. Returns (plate, conf, chars)."""
+        best_plate, best_conf, chars_seen = "", 0.0, 0
+        if self._engine is not None:
+            # 1. Full-frame OCR — the engine locates text itself, which is
+            #    far more robust than relying on contour cropping.
+            raw = self._ocr(self.enhance_for_ocr(bgr))
+            if raw:
+                plate, conf = self.clean_plate_text(raw)
+                if conf > best_conf:
+                    best_plate, best_conf = plate, conf
+            # 2. Cropped-candidate refinement when the full frame was weak.
+            if best_conf < self.CONF_HIGH:
+                for crop, _bbox in self.crop_plate_candidates(bgr):
+                    raw = self._ocr(self.enhance_for_ocr(crop))
+                    if raw:
+                        plate, conf = self.clean_plate_text(raw)
+                        if conf > best_conf:
+                            best_plate, best_conf = plate, conf
+                            if conf >= self.CONF_HIGH:
+                                break
+                    if best_conf < self.CONF_MEDIUM:
+                        chars_seen = max(
+                            chars_seen, self._detect_char_regions(crop)
+                        )
+        else:
+            # No OCR engine: only report whether a plate region is visible.
+            for crop, _bbox in self.crop_plate_candidates(bgr):
+                chars_seen = max(chars_seen, self._detect_char_regions(crop))
+        return best_plate, best_conf, chars_seen
+
+    # ── Live pipeline (throttled, called from the analysis worker) ───────
+    def process_frame(self, bgr):
+        """Throttled live OCR. Returns (plate, confidence)."""
+        now = time.time()
+        with self._lock:
+            interval = (self.HOLD_INTERVAL if self._last_confidence > 0.5
+                        else self.SCAN_INTERVAL)
+            if now - self._last_attempt < interval:
+                return self._last_plate, self._last_confidence
+            self._last_attempt = now
+
+        plate, conf, chars = self._read_best(bgr)
+
+        with self._lock:
+            self._region_found = chars >= 4
+            if conf > 0.5:
+                self._last_plate = plate
+                self._last_confidence = conf
+            return self._last_plate, self._last_confidence
+
+    # ── Forced pipeline (capture / on-demand scan; bg thread) ────────────
+    def process_image(self, bgr):
+        """Force a fresh full read, bypassing throttle. Returns (plate, conf)."""
+        plate, conf, chars = self._read_best(bgr)
+        with self._lock:
+            self._region_found = chars >= 4
+            if conf > 0.5:
+                self._last_plate = plate
+                self._last_confidence = conf
+                self._last_attempt = time.time()
+        return plate, conf
+
+    def suggest_routing(self, plate, lat=0.0, lon=0.0):
+        """Given an OCR-detected plate, suggest jurisdiction email routing.
+
+        Returns dict with state_code, emails, and confidence.
+        """
+        if not plate:
+            return {"plate": "", "state_code": "", "emails": [],
+                    "confidence": 0.0, "source": "ocr"}
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        return {
+            "plate": plate,
+            "state_code": rt["pc"],
+            "emails": rt["all"],
+            "confidence": self._last_confidence,
+            "source": "ocr",
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -325,7 +755,8 @@ class FrameRingBuffer:
 
     @property
     def dropped_count(self):
-        return self._dropped
+        with self._lock:
+            return self._dropped
 
     def __len__(self):
         with self._lock:
@@ -520,10 +951,12 @@ class DashcamRecorder:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
             fname = "f_%s.jpg" % datetime.now().strftime("%H%M%S_%f")
             fpath = os.path.join(self._current_segment_dir, fname)
-            cv2.imencode(
+            ok, buf = cv2.imencode(
                 ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )[1].tofile(fpath)
-            self._frame_count += 1
+            )
+            if ok:
+                buf.tofile(fpath)
+                self._frame_count += 1
         except Exception:
             pass
 
@@ -735,9 +1168,9 @@ class OfflineReportQueue:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         fpath = os.path.join(self._dir, "report_%s.json" % ts)
         try:
+            payload = json.dumps(report_dict, default=str)
             with open(fpath, "w") as f:
-                json.dumps(report_dict, default=str)  # validate first
-                f.write(json.dumps(report_dict, default=str))
+                f.write(payload)
             return fpath
         except Exception:
             return ""
@@ -784,14 +1217,15 @@ class ConnectivityChecker:
     @staticmethod
     def is_online():
         """Returns True if device can reach the internet."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(ConnectivityChecker.TIMEOUT)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(ConnectivityChecker.TIMEOUT)
             s.connect((ConnectivityChecker.PROBE_HOST, ConnectivityChecker.PROBE_PORT))
-            s.close()
             return True
         except Exception:
             return False
+        finally:
+            s.close()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -807,21 +1241,25 @@ class QueueRetryDaemon:
         self._send_cb = send_callback
         self._running = False
         self._thread = None
+        self._stop_evt = threading.Event()
 
     def start(self):
         self._running = True
+        self._stop_evt.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+        self._stop_evt.set()
         if self._thread:
             self._thread.join(timeout=5.0)
 
     def _run(self):
         while self._running:
-            time.sleep(self.RETRY_INTERVAL)
-            if not self._running:
+            # Event.wait returns immediately when stop() sets the event,
+            # so shutdown is not delayed by the retry interval.
+            if self._stop_evt.wait(self.RETRY_INTERVAL):
                 break
             if not ConnectivityChecker.is_online():
                 continue
@@ -1039,237 +1477,496 @@ if Preview is not None:
 
 KV = """
 #:import dp kivy.metrics.dp
+#:import sp kivy.metrics.sp
+#:import C kivy.utils.get_color_from_hex
 
+# ─── Color Palette ───────────────────────────────────────────────────────
+# bg_primary:     #0B0E17   deep space navy
+# bg_card:        #141929   card surfaces
+# bg_card_alt:    #1A2035   elevated card
+# accent_cyan:    #00E5FF   primary accent
+# accent_green:   #00E676   success / send
+# accent_amber:   #FFD740   warning / penalty
+# accent_red:     #FF5252   error / alert
+# text_primary:   #E8EAF0   main text
+# text_secondary: #8892A8   muted text
+# border:         #253050   subtle borders
+
+# ─── Reusable Card Widget ────────────────────────────────────────────────
+<Card@BoxLayout>:
+    orientation: "vertical"
+    size_hint_y: None
+    padding: dp(12), dp(8)
+    spacing: dp(4)
+    canvas.before:
+        Color:
+            rgba: C("#141929")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: C("#253050")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(12))
+            width: 0.8
+
+# ─── Styled Toggle Row ──────────────────────────────────────────────────
+<ToggleRow@BoxLayout>:
+    size_hint_y: None
+    height: dp(36)
+    padding: dp(4), 0
+
+# ─── Section Header Label ───────────────────────────────────────────────
+<SectionLabel@Label>:
+    size_hint_y: None
+    height: dp(22)
+    font_size: "11sp"
+    bold: True
+    color: C("#00E5FF")
+    halign: "left"
+    valign: "middle"
+    text_size: self.size
+
+# ─── Styled Text Input ──────────────────────────────────────────────────
+<StyledInput@TextInput>:
+    background_color: (0, 0, 0, 0)
+    foreground_color: C("#E8EAF0")
+    cursor_color: C("#00E5FF")
+    hint_text_color: (0.45, 0.5, 0.6, 0.7)
+    padding: [dp(10), dp(8)]
+    canvas.before:
+        Color:
+            rgba: C("#1A2035")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+        Color:
+            rgba: C("#253050") if not self.focus else C("#00E5FF")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(8))
+            width: 1.2 if self.focus else 0.7
+
+# ─── Styled Spinner ─────────────────────────────────────────────────────
+<StyledSpinner@Spinner>:
+    background_color: (0, 0, 0, 0)
+    color: C("#E8EAF0")
+    option_cls: "SpinnerOption"
+    canvas.before:
+        Color:
+            rgba: C("#1A2035")
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+        Color:
+            rgba: C("#253050")
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(8))
+            width: 0.7
+
+# ─── Action Button ──────────────────────────────────────────────────────
+<ActionBtn@Button>:
+    background_normal: ""
+    background_down: ""
+    background_color: (0, 0, 0, 0)
+    color: C("#E8EAF0")
+    bold: True
+    font_size: "14sp"
+    size_hint_y: None
+    height: dp(48)
+    _bg: [0.2, 0.6, 0.9, 1]
+    canvas.before:
+        Color:
+            rgba: self._bg if self.state == "normal" else [self._bg[0]*0.7, self._bg[1]*0.7, self._bg[2]*0.7, 1]
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(10)]
+
+# ═════════════════════════════════════════════════════════════════════════
+# ROOT LAYOUT
+# ═════════════════════════════════════════════════════════════════════════
 <RootUI>:
     orientation: "vertical"
-    padding: dp(10)
-    spacing: dp(4)
+    padding: 0
+    spacing: 0
+    canvas.before:
+        Color:
+            rgba: C("#0B0E17")
+        Rectangle:
+            pos: self.pos
+            size: self.size
 
-    Label:
-        text: "Sentinel-X"
-        size_hint_y: None
-        height: dp(36)
-        bold: True
-        font_size: "20sp"
-
+    # ── Header Bar ───────────────────────────────────────────────────────
     BoxLayout:
-        id: camera_box
         size_hint_y: None
-        height: dp(220)
+        height: dp(48)
+        padding: dp(14), dp(8)
         canvas.before:
             Color:
-                rgba: (0.05, 0.05, 0.07, 1)
+                rgba: C("#0D1120")
             Rectangle:
                 pos: self.pos
                 size: self.size
+            # Bottom accent line
+            Color:
+                rgba: C("#00E5FF")
+            Rectangle:
+                pos: self.pos
+                size: (self.width, dp(1.5))
+        Label:
+            text: "SENTINEL-X"
+            font_size: "18sp"
+            bold: True
+            color: C("#00E5FF")
+            halign: "left"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.5
+        Label:
+            text: "v1.5"
+            font_size: "11sp"
+            color: C("#4A5270")
+            halign: "right"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.25
+        Button:
+            text: "HISTORY"
+            size_hint_x: 0.25
+            font_size: "11sp"
+            bold: True
+            color: C("#00E5FF")
+            background_normal: ""
+            background_down: ""
+            background_color: (0, 0, 0, 0)
+            on_release: root.show_history()
+            canvas.before:
+                Color:
+                    rgba: C("#1A2035")
+                RoundedRectangle:
+                    pos: (self.x + dp(4), self.y + dp(4))
+                    size: (self.width - dp(8), self.height - dp(8))
+                    radius: [dp(8)]
+                Color:
+                    rgba: C("#253050")
+                Line:
+                    rounded_rectangle: (self.x + dp(4), self.y + dp(4), self.width - dp(8), self.height - dp(8), dp(8))
+                    width: 0.8
 
-    Label:
+    # ── Camera Viewport ──────────────────────────────────────────────────
+    BoxLayout:
+        id: camera_box
         size_hint_y: None
-        height: dp(28)
-        text: root.status_text
-        font_size: "10sp"
-        color: (0.5, 0.8, 1, 1)
-        halign: "left"
-        text_size: self.size
+        height: dp(210)
+        padding: dp(10), dp(6)
+        canvas.before:
+            Color:
+                rgba: C("#050810")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+            # Subtle inner border
+            Color:
+                rgba: C("#1A2035")
+            Line:
+                rectangle: (self.x + dp(9), self.y + dp(5), self.width - dp(18), self.height - dp(10))
+                width: 0.8
 
+    # ── Telemetry Strip ──────────────────────────────────────────────────
+    BoxLayout:
+        size_hint_y: None
+        height: dp(38)
+        padding: dp(12), dp(2)
+        canvas.before:
+            Color:
+                rgba: C("#0D1120")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        Label:
+            text: root.status_text
+            font_size: "9sp"
+            color: C("#5A8CC8")
+            halign: "left"
+            valign: "middle"
+            text_size: self.size
+            markup: True
+            size_hint_x: 0.68
+        Label:
+            text: root.alert_text
+            font_size: "10sp"
+            bold: True
+            color: C("#FF5252")
+            halign: "right"
+            valign: "middle"
+            text_size: self.size
+            size_hint_x: 0.32
+
+    # ── Scrollable Content ───────────────────────────────────────────────
     ScrollView:
         do_scroll_x: False
+        bar_color: C("#00E5FF")
+        bar_inactive_color: C("#253050")
+        bar_width: dp(3)
+
         BoxLayout:
             orientation: "vertical"
             size_hint_y: None
             height: self.minimum_height
-            spacing: dp(2)
+            padding: dp(10), dp(6)
+            spacing: dp(8)
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+            # ── OCR Detection Card ───────────────────────────────────────
+            Card:
+                height: dp(34) if not root.ocr_suggest_text else dp(50)
                 Label:
-                    text: "Anonymous"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    id: lbl_ocr_suggest
+                    size_hint_y: None
+                    height: dp(16) if not root.ocr_suggest_text else dp(32)
+                    text: root.ocr_suggest_text if root.ocr_suggest_text else "Plate OCR: standby"
+                    font_size: "11sp"
+                    color: C("#00E676") if root.ocr_suggest_text else C("#4A5270")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_anon
-                    active: True
-                    size_hint_x: 0.5
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+            # ── Settings Card ────────────────────────────────────────────
+            Card:
+                height: dp(178)
+
+                SectionLabel:
+                    text: "SETTINGS"
+
+                ToggleRow:
+                    Label:
+                        text: "Anonymous Reporter"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_anon
+                        active: True
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "CLAHE Night Mode"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_clahe
+                        active: False
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "CV Assist"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_cv
+                        active: True
+                        size_hint_x: 0.35
+
+                ToggleRow:
+                    Label:
+                        text: "Plate OCR"
+                        font_size: "13sp"
+                        color: C("#C8CDDA")
+                        halign: "left"
+                        text_size: self.size
+                        size_hint_x: 0.65
+                    Switch:
+                        id: sw_ocr
+                        active: True
+                        size_hint_x: 0.35
+
+            # ── Report Form Card ─────────────────────────────────────────
+            Card:
+                height: dp(310)
+
+                SectionLabel:
+                    text: "VIOLATION REPORT"
+
+                # Plate input
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
+                    Label:
+                        text: "Plate"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        bold: True
+                        color: C("#00E5FF")
+                        halign: "left"
+                        text_size: self.size
+                    StyledInput:
+                        id: in_plate
+                        size_hint_x: 0.82
+                        multiline: False
+                        hint_text: "MH12AB1234"
+                        font_size: "15sp"
+
+                # Offense spinner
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(8)
+                    Label:
+                        text: "Offense"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        bold: True
+                        color: C("#00E5FF")
+                        halign: "left"
+                        text_size: self.size
+                    StyledSpinner:
+                        id: sp_offense
+                        size_hint_x: 0.82
+                        text: "Select violation..."
+                        values: []
+                        font_size: "12sp"
+                        on_text: root.on_offense_selected(self.text)
+
+                # Section + Penalty display
                 Label:
-                    text: "CLAHE Night"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    size_hint_y: None
+                    height: dp(26)
+                    text: root.section_penalty
+                    font_size: "11sp"
+                    color: C("#FFD740")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_clahe
-                    active: False
-                    size_hint_x: 0.5
+                    padding: dp(4), 0
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(40)
+                # Sign selectors
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(40)
+                    spacing: dp(6)
+                    Label:
+                        text: "Sign"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        color: C("#8892A8")
+                        halign: "left"
+                        text_size: self.size
+                    StyledSpinner:
+                        id: sp_sign_group
+                        size_hint_x: 0.41
+                        text: "Group"
+                        values: []
+                        font_size: "11sp"
+                        on_text: root.on_sign_group(self.text)
+                    StyledSpinner:
+                        id: sp_sign
+                        size_hint_x: 0.41
+                        text: "Sign"
+                        values: []
+                        font_size: "11sp"
+
+                # Notes
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(62)
+                    spacing: dp(8)
+                    Label:
+                        text: "Notes"
+                        size_hint_x: 0.18
+                        font_size: "13sp"
+                        color: C("#8892A8")
+                        halign: "left"
+                        valign: "top"
+                        text_size: self.size
+                    StyledInput:
+                        id: in_notes
+                        size_hint_x: 0.82
+                        hint_text: "Additional details..."
+                        multiline: True
+                        font_size: "13sp"
+
+                # Evidence status
                 Label:
-                    text: "CV Assist"
-                    size_hint_x: 0.5
-                    font_size: "14sp"
+                    size_hint_y: None
+                    height: dp(20)
+                    text: root.evidence_status
+                    font_size: "10sp"
+                    color: C("#00E5FF")
                     halign: "left"
                     text_size: self.size
-                Switch:
-                    id: sw_cv
-                    active: True
-                    size_hint_x: 0.5
+                    padding: dp(4), 0
 
+            # ── Routing Card ─────────────────────────────────────────────
+            Card:
+                height: dp(72)
+
+                SectionLabel:
+                    text: "JURISDICTION ROUTING"
+
+                Label:
+                    size_hint_y: None
+                    height: dp(32)
+                    text: root.route_text
+                    font_size: "11sp"
+                    color: C("#00E676")
+                    halign: "left"
+                    text_size: self.size
+                    markup: True
+
+            # Bottom spacer for scroll
             Widget:
                 size_hint_y: None
-                height: dp(1)
-                canvas:
-                    Color:
-                        rgba: (0.25, 0.25, 0.25, 1)
-                    Rectangle:
-                        pos: self.pos
-                        size: self.size
+                height: dp(4)
 
-            BoxLayout:
-                size_hint_y: None
-                height: dp(42)
-                spacing: dp(6)
-                Label:
-                    text: "Plate"
-                    size_hint_x: 0.22
-                    font_size: "14sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                TextInput:
-                    id: in_plate
-                    size_hint_x: 0.78
-                    multiline: False
-                    hint_text: "MH12AB1234"
-                    font_size: "15sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(46)
-                spacing: dp(6)
-                Label:
-                    text: "Offense"
-                    size_hint_x: 0.22
-                    font_size: "14sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                Spinner:
-                    id: sp_offense
-                    size_hint_x: 0.78
-                    text: "Select"
-                    values: []
-                    font_size: "13sp"
-                    on_text: root.on_offense_selected(self.text)
-
-            Label:
-                size_hint_y: None
-                height: dp(30)
-                text: root.section_penalty
-                font_size: "12sp"
-                color: (1, 0.8, 0.3, 1)
-                halign: "left"
-                text_size: self.size
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(46)
-                spacing: dp(6)
-                Label:
-                    text: "Sign"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    halign: "left"
-                    text_size: self.size
-                Spinner:
-                    id: sp_sign_group
-                    size_hint_x: 0.39
-                    text: "Group"
-                    values: []
-                    font_size: "11sp"
-                    on_text: root.on_sign_group(self.text)
-                Spinner:
-                    id: sp_sign
-                    size_hint_x: 0.39
-                    text: "Sign"
-                    values: []
-                    font_size: "11sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(70)
-                spacing: dp(6)
-                Label:
-                    text: "Notes"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    halign: "left"
-                    valign: "top"
-                    text_size: self.size
-                TextInput:
-                    id: in_notes
-                    size_hint_x: 0.78
-                    hint_text: "Details"
-                    multiline: True
-                    font_size: "14sp"
-
-            BoxLayout:
-                size_hint_y: None
-                height: dp(42)
-                spacing: dp(6)
-                Label:
-                    text: "Route"
-                    size_hint_x: 0.22
-                    font_size: "13sp"
-                    bold: True
-                    halign: "left"
-                    text_size: self.size
-                Label:
-                    text: root.route_text
-                    size_hint_x: 0.78
-                    font_size: "11sp"
-                    halign: "left"
-                    text_size: self.size
-                    color: (0.4, 0.9, 0.4, 1)
-
-            # Evidence status
-            Label:
-                size_hint_y: None
-                height: dp(24)
-                text: root.evidence_status
-                font_size: "10sp"
-                color: (0.3, 0.8, 1, 1)
-                halign: "left"
-                text_size: self.size
-
+    # ── Action Bar ───────────────────────────────────────────────────────
     BoxLayout:
         size_hint_y: None
-        height: dp(50)
+        height: dp(62)
+        padding: dp(10), dp(7)
         spacing: dp(8)
-        Button:
-            text: "Capture"
-            font_size: "15sp"
-            bold: True
+        canvas.before:
+            Color:
+                rgba: C("#0D1120")
+            Rectangle:
+                pos: self.pos
+                size: self.size
+            # Top accent line
+            Color:
+                rgba: C("#1A2035")
+            Rectangle:
+                pos: (self.x, self.top - dp(1))
+                size: (self.width, dp(1))
+
+        ActionBtn:
+            text: "SCAN"
+            _bg: C("#7C3AED")
+            on_release: root.scan_now()
+
+        ActionBtn:
+            text: "CAPTURE"
+            _bg: C("#0078D4")
             on_release: root.capture_evidence()
-            background_color: (0.2, 0.6, 0.9, 1)
-        Button:
-            text: "Send Report"
-            font_size: "15sp"
-            bold: True
+
+        ActionBtn:
+            text: "SEND"
+            _bg: C("#00C853")
             on_release: root.send_report()
-            background_color: (0.1, 0.7, 0.3, 1)
-        Button:
-            text: "Clear"
-            font_size: "14sp"
+
+        ActionBtn:
+            text: "CLEAR"
+            _bg: C("#37474F")
             on_release: root.clear_form()
-            background_color: (0.4, 0.4, 0.4, 1)
 """
 
 
@@ -1278,6 +1975,8 @@ class RootUI(BoxLayout):
     section_penalty = StringProperty(DASH)
     route_text = StringProperty(DASH)
     evidence_status = StringProperty("")
+    ocr_suggest_text = StringProperty("")
+    alert_text = StringProperty("")
     latest_lat = NumericProperty(0.0)
     latest_lon = NumericProperty(0.0)
     latest_speed = NumericProperty(0.0)
@@ -1308,6 +2007,9 @@ class RootUI(BoxLayout):
         self._subsystem_status = SubsystemStatus()
         self._harsh_brake_log = None
         self._last_harsh_brake_ts = 0
+        # Phase 5
+        self._plate_ocr = None
+        self._ocr_accepted_plate = ""
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -1377,7 +2079,7 @@ class RootUI(BoxLayout):
             except Exception:
                 pass
         # Phase 1: Frame buffer + threaded analysis
-        self._frame_buffer = FrameRingBuffer(max_frames=30)
+        self._frame_buffer = FrameRingBuffer(max_frames=20)
         self._analysis_worker = FrameAnalysisWorker(
             self._frame_buffer, self._analytics
         )
@@ -1419,6 +2121,9 @@ class RootUI(BoxLayout):
         self._onnx = ONNXDetector(models_dir)
         # Phase 4: Harsh braking event log
         self._harsh_brake_log = HarshBrakeLog(edir)
+        # Phase 5: Plate OCR
+        self._plate_ocr = PlateOCR()
+        self._analytics.set_plate_ocr(self._plate_ocr)
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
@@ -1469,12 +2174,21 @@ class RootUI(BoxLayout):
                 float(self.latest_lon), self.latest_speed * 3.6
             )
             self._last_harsh_brake_ts = now
+            # On-screen alert, auto-clears after 4s
+            self.alert_text = "HARSH BRAKE %.1f" % self.latest_g
+            def _clear_alert(dt, ts=now):
+                if self._last_harsh_brake_ts == ts:
+                    self.alert_text = ""
+            Clock.schedule_once(_clear_alert, 4.0)
 
     # ── Camera ───────────────────────────────────────────────────────────
     def _setup_camera(self):
         self.ids.camera_box.clear_widgets()
         if SentinelPreview is None:
-            self.ids.camera_box.add_widget(Label(text="No camera", font_size="14sp"))
+            self.ids.camera_box.add_widget(Label(
+                text="Camera unavailable", font_size="13sp",
+                color=(0.35, 0.4, 0.52, 1),
+            ))
             return
         try:
             self._preview = SentinelPreview()
@@ -1482,13 +2196,16 @@ class RootUI(BoxLayout):
             self.ids.camera_box.add_widget(self._preview)
             Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
         except Exception:
-            self.ids.camera_box.add_widget(Label(text="Camera failed", font_size="14sp"))
+            self.ids.camera_box.add_widget(Label(
+                text="Camera initialization failed", font_size="13sp",
+                color=(1, 0.32, 0.32, 1),
+            ))
 
     def _connect_cam(self):
         if not self._preview:
             return
         try:
-            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 640}
+            kw = {"enable_analyze_pixels": True, "analyze_pixels_resolution": 800}
             if platform == "android":
                 kw["enable_video"] = False
             self._preview.connect_camera(**kw)
@@ -1530,7 +2247,7 @@ class RootUI(BoxLayout):
 
         try:
             # export_to_png grabs current frame from the preview texture
-            result = self._preview.export_to_png(fpath)
+            self._preview.export_to_png(fpath)
 
             if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
                 # Apply CLAHE if enabled
@@ -1554,13 +2271,102 @@ class RootUI(BoxLayout):
                 self.evidence_path = fpath
                 self.evidence_status = "Evidence: %s" % fname
                 self._popup("Saved!", "Photo saved to:\nSentinelX/%s" % fname)
+                # Auto-dismiss evidence notification after 5 seconds
+                _fname = fname  # capture for closure
+                def _dismiss(dt, fn=_fname):
+                    if self.evidence_status.endswith(fn):
+                        self.evidence_status = ""
+                Clock.schedule_once(_dismiss, 5.0)
 
                 # Notify Android gallery about new file
                 self._notify_gallery(fpath)
+
+                # Phase 5: OCR the full-resolution evidence and auto-fill the
+                # plate if the user has not entered one. Runs on a background
+                # thread (ML Kit must not block the UI thread).
+                if (not self.ids.in_plate.text.strip()
+                        and self._plate_ocr and self._plate_ocr.available):
+                    threading.Thread(
+                        target=self._ocr_image_worker,
+                        args=(fpath, False), daemon=True,
+                    ).start()
             else:
                 self._popup("Failed", "File was not created.")
         except Exception as e:
             self._popup("Capture Error", str(e))
+
+    # ── On-demand full-resolution scan ───────────────────────────────────
+    def scan_now(self):
+        """Capture a full-resolution frame and OCR it on demand."""
+        if not self._preview or not self._cam_ok:
+            self._popup("Not ready", "Camera not connected.")
+            return
+        if not self._plate_ocr or not self._plate_ocr.available:
+            self._popup(
+                "OCR unavailable",
+                "No text recognition engine on this device.\n"
+                "Enter the plate manually.",
+            )
+            return
+        self.ocr_suggest_text = "OCR: scanning (full-res)..."
+        try:
+            tmp = os.path.join(self._get_evidence_folder(), ".scan_tmp.png")
+            self._preview.export_to_png(tmp)
+        except Exception as e:
+            self._popup("Scan failed", str(e))
+            return
+        threading.Thread(
+            target=self._ocr_image_worker, args=(tmp, True), daemon=True
+        ).start()
+
+    def _ocr_image_worker(self, path, announce):
+        """Background OCR of a saved image; applies result on the UI thread."""
+        plate, conf = "", 0.0
+        try:
+            if cv2 is not None and os.path.isfile(path):
+                img = cv2.imread(path)
+                if img is not None:
+                    plate, conf = self._plate_ocr.process_image(img)
+        except Exception:
+            pass
+        if announce:
+            try:
+                if path.endswith(".scan_tmp.png"):
+                    os.remove(path)
+            except Exception:
+                pass
+        Clock.schedule_once(
+            lambda dt: self._apply_ocr_result(plate, conf, announce)
+        )
+
+    def _apply_ocr_result(self, plate, conf, announce):
+        """Apply an OCR result: auto-fill plate + show routing (UI thread)."""
+        if plate and conf > 0.5:
+            self.ids.in_plate.text = plate
+            self._ocr_accepted_plate = plate
+            if self._analytics:
+                self._analytics.ocr_plate = plate
+                self._analytics.ocr_confidence = conf
+            lat, lon = float(self.latest_lat), float(self.latest_lon)
+            sug = self._plate_ocr.suggest_routing(plate, lat, lon)
+            emails = sug.get("emails", [])
+            state = sug.get("state_code", "") or "?"
+            self.ocr_suggest_text = "OCR: %s [%s] %.0f%%%s" % (
+                plate, state, conf * 100,
+                (" -> " + ", ".join(emails[:2])) if emails else " (no route)",
+            )
+            if announce:
+                self._popup(
+                    "Plate Read",
+                    "Detected: %s\nState: %s\nConfidence: %.0f%%" % (
+                        plate, state, conf * 100),
+                )
+        elif announce:
+            self.ocr_suggest_text = "OCR: no readable plate"
+            self._popup(
+                "Scan",
+                "No readable plate found.\nMove closer and hold steady.",
+            )
 
     def _notify_gallery(self, path):
         """Tell Android to scan the file so it shows in gallery."""
@@ -1614,6 +2420,56 @@ class RootUI(BoxLayout):
                 zone_warn = " ZONE:%s@%dkm/h" % (
                     violations[0][0], violations[0][2]
                 )
+        # Phase 5: OCR auto-fill and routing suggestion
+        ocr_active = self.ids.sw_ocr.active if hasattr(self.ids, "sw_ocr") else False
+        if ocr_active and self._plate_ocr and self._analytics:
+            ocr_plate = self._analytics.ocr_plate
+            ocr_conf = self._analytics.ocr_confidence
+            if ocr_plate and ocr_conf > 0.5:
+                current_plate = self.ids.in_plate.text.strip()
+                if not current_plate or current_plate == self._ocr_accepted_plate:
+                    self.ids.in_plate.text = ocr_plate
+                    self._ocr_accepted_plate = ocr_plate
+                suggestion = self._plate_ocr.suggest_routing(
+                    ocr_plate, lat, lon
+                )
+                emails = suggestion.get("emails", [])
+                state = suggestion.get("state_code", "")
+                if emails:
+                    self.ocr_suggest_text = (
+                        "OCR: %s [%s] %.0f%% -> %s"
+                        % (ocr_plate, state, ocr_conf * 100,
+                           ", ".join(emails[:2]))
+                    )
+                else:
+                    self.ocr_suggest_text = (
+                        "OCR: %s [%s] %.0f%% (no route)"
+                        % (ocr_plate, state, ocr_conf * 100)
+                    )
+            elif not self.ocr_suggest_text.startswith("OCR: scanning (full"):
+                # Don't clobber an in-flight on-demand scan message.
+                if not self._plate_ocr.available:
+                    self.ocr_suggest_text = (
+                        "OCR: no engine - tap SCAN or enter plate manually"
+                    )
+                elif self._plate_ocr.region_found:
+                    self.ocr_suggest_text = (
+                        "OCR: plate in view - move closer / hold steady"
+                    )
+                else:
+                    self.ocr_suggest_text = "OCR: scanning (%s)..." % (
+                        self._plate_ocr.engine_name
+                    )
+        else:
+            self.ocr_suggest_text = ""
+
+        # Phase 5: Update subsystem status for OCR
+        if self._subsystem_status and self._plate_ocr:
+            self._subsystem_status.update(
+                "ocr", self._plate_ocr.available or not ocr_active,
+                "plate:%s" % self._analytics.ocr_plate if self._analytics.ocr_plate else ""
+            )
+
         status_suffix = self._subsystem_status.summary() if self._subsystem_status else ""
         self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s%s\n%s" % (
             lat, lon, self.state_name or DASH, kmh, self.latest_g, cv,
@@ -1643,6 +2499,14 @@ class RootUI(BoxLayout):
         self.route_text = DASH
         self.evidence_path = ""
         self.evidence_status = ""
+        # Phase 5: Reset OCR state
+        self._ocr_accepted_plate = ""
+        self.ocr_suggest_text = ""
+        if self._plate_ocr:
+            self._plate_ocr.reset()
+        if self._analytics:
+            self._analytics.ocr_plate = ""
+            self._analytics.ocr_confidence = 0.0
 
     # ── Email ────────────────────────────────────────────────────────────
     def send_report(self):
@@ -1751,13 +2615,66 @@ class RootUI(BoxLayout):
         except Exception:
             return False
 
-    def _popup(self, t, m):
-        Popup(title=t, content=Label(text=m, halign="left", valign="top", text_size=(dp(250), None)),
-              size_hint=(.82, .32)).open()
+    # ── Report history viewer ────────────────────────────────────────────
+    def show_history(self):
+        """Show the last 10 sent reports from the report log."""
+        entries = self._report_log.read_all() if self._report_log else []
+        if not entries:
+            self._popup("History", "No reports sent yet.")
+            return
+        lines = []
+        for e in entries[-10:][::-1]:
+            ts = (e.get("logged_at", "") or "")[:16].replace("T", " ")
+            lines.append("%s\n  %s | %s | %s" % (
+                ts or DASH,
+                e.get("plate", DASH) or DASH,
+                e.get("offense", DASH) or DASH,
+                e.get("status", DASH) or DASH,
+            ))
+        title = "History (%d of %d)" % (min(len(entries), 10), len(entries))
+        self._popup(title, "\n\n".join(lines), tall=True)
+
+    def _popup(self, t, m, tall=False):
+        # Determine accent color based on popup type
+        if t in ("Saved!", "Ready"):
+            accent = (0, 0.78, 0.33, 1)       # green
+        elif t in ("Failed", "Capture Error", "No route"):
+            accent = (1, 0.32, 0.32, 1)        # red
+        elif t in ("Queued",):
+            accent = (1, 0.84, 0.25, 1)        # amber
+        else:
+            accent = (0, 0.9, 1, 1)            # cyan
+
+        content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        lbl = Label(
+            text=m, halign="left", valign="top",
+            text_size=(dp(240), None), font_size="13sp",
+            color=(0.82, 0.84, 0.88, 1),
+        )
+        if tall:
+            from kivy.uix.scrollview import ScrollView
+            lbl.size_hint_y = None
+            lbl.bind(texture_size=lambda inst, sz: setattr(inst, "height", sz[1]))
+            scroll = ScrollView(do_scroll_x=False)
+            scroll.add_widget(lbl)
+            content.add_widget(scroll)
+        else:
+            content.add_widget(lbl)
+
+        p = Popup(
+            title=t, content=content,
+            size_hint=(0.88, 0.62) if tall else (0.82, 0.28),
+            title_size="15sp",
+            title_color=accent,
+            separator_color=accent,
+            background_color=(0.08, 0.09, 0.15, 0.95),
+        )
+        p.open()
 
 
 class SentinelXApp(App):
     def build(self):
+        Window.clearcolor = (0.043, 0.055, 0.09, 1)  # #0B0E17
         Builder.load_string(KV)
         return RootUI()
 

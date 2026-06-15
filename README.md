@@ -1,42 +1,66 @@
-# Sentinel-X — Civic Enforcement System
+# Sentinel-X -- Civic Enforcement System
 
-AI-powered traffic violation reporting app for Android. Captures evidence, detects number plates, routes reports to the correct police authority, and protects the reporter under India's Good Samaritan Law (Section 134A).
+AI-powered traffic violation reporting app for Android. Captures evidence, detects number plates via OCR, auto-routes reports to the correct Indian police authority, and protects the reporter under Good Samaritan Law (Section 134A, MVA 1988).
 
+**Version:** 1.5.0
 **Target:** Android 10+ (arm64-v8a)
-**Stack:** Python + Kivy + camera4kivy + OpenCV + Buildozer
+**Stack:** Python 3.10 + Kivy + camera4kivy (CameraX) + OpenCV + ML Kit + Buildozer
 
 ---
 
 ## Features
 
-- **Camera** — Live preview via CameraX, photo capture with evidence timestamping
-- **Dashcam Recording** — Continuous JPEG capture in 2-minute segments with auto-pruning (ring buffer keeps ~10 min)
-- **Camera Crash Recovery** — Watchdog detects stalls >5s and reconnects with exponential backoff
-- **Night Vision** — CLAHE enhancement for low-light/fog number plate visibility
-- **CV Assist** — Real-time contour detection for plate-like regions (dedicated worker thread with load-shedding)
-- **Harsh Braking** — Background 10Hz accelerometer monitoring (G_dyn > 4.0 m/s² threshold)
-- **Service Telemetry** — Main app consumes GPS/accelerometer from background service via UDP (port 17888)
-- **Memory Safety** — Bounded frame ring buffer (30 frames max) prevents OOM on continuous use
-- **Evidence Integrity** — SHA-256 hash sidecar files for tamper detection
-- **Metadata Watermark** — GPS coordinates, timestamp, and plate burned onto evidence images
-- **Report History** — Append-only JSON-lines log of all sent reports
-- **Offline Queue** — Reports queued as JSON when offline, auto-retried when connectivity returns
-- **Connectivity Detection** — Socket probe to 8.8.8.8:53 for network status
-- **Queue Retry Daemon** — Background thread retries queued reports every 60s
-- **ONNX Detector** — Optional ONNX model inference for number plate detection (drop `detector.onnx` into models/)
-- **Speed Zones** — Haversine-based proximity checks for school/hospital/residential zones with speed limits
-- **Subsystem Status** — Real-time health monitoring of all subsystems displayed in status bar
-- **Harsh Brake Log** — JSON-lines event log with timestamps, G-force, GPS, and speed (5s debounce)
-- **Dual Routing** — Reports sent to BOTH location-based AND plate-based police authorities
-- **Offline Geocoding** — GPS to state/district without internet
-- **Good Samaritan** — Anonymous reporting with §134A legal protection in every email
-- **7 MVA 2019 Offenses** — §183, §184, §194B, §194C, §194D, §194E
-- **13 State Police Directories** — DL, MH, KA, TN, UP, HR, KL, GJ, WB, TS, PB, RJ, GA
-- **IRC:67-2022 Sign Groups** — Mandatory + Cautionary signs including EV Charging, Bus Lane
+### Core
+- **Live Camera** -- CameraX preview with real-time frame analysis
+- **Evidence Capture** -- Photo capture with GPS/timestamp watermark and SHA-256 hash sidecar
+- **Dual Routing** -- Reports sent to BOTH location-based AND plate-based police authorities
+- **Good Samaritan** -- Anonymous reporting with Section 134A legal protection in every email
+- **7 MVA 2019 Offenses** -- Sections 183, 184, 194B, 194C, 194D, 194E
+- **13 State Police Directories** -- DL, MH, KA, TN, UP, HR, KL, GJ, WB, TS, PB, RJ, GA
+
+### Phase 1 -- Recording & Resilience
+- **Dashcam Recording** -- Continuous JPEG capture in 2-minute segments with 5-segment ring buffer (~10 min)
+- **Camera Crash Recovery** -- Watchdog detects stalls >5s, reconnects with exponential backoff (2s to 30s cap)
+- **Memory Safety** -- Bounded frame ring buffer (20 frames max) prevents OOM
+- **Service Telemetry** -- Background 10Hz GPS + accelerometer via UDP (port 17888)
+
+### Phase 2 -- Evidence Integrity
+- **SHA-256 Hashing** -- Tamper-detection sidecar files for every captured image
+- **Metadata Watermark** -- GPS coordinates, timestamp, and plate number burned onto evidence
+- **Report History** -- Append-only JSON-lines log of all sent reports
+
+### Phase 3 -- Offline Resilience
+- **Offline Queue** -- Reports queued as JSON files when connectivity fails
+- **Connectivity Detection** -- Socket probe to 8.8.8.8:53
+- **Auto-Retry Daemon** -- Background thread retries queued reports every 60s with responsive shutdown
+
+### Phase 4 -- Detection & Monitoring
+- **ONNX Detector** -- Optional ONNX model inference (drop `detector.onnx` into models/)
+- **Speed Zones** -- Haversine proximity checks for school/hospital/residential zones
+- **Subsystem Status** -- Real-time health monitoring across all subsystems
+- **Harsh Brake Log** -- JSON-lines event log with 5s debounce, G-force, GPS, speed
+- **Night Vision** -- CLAHE enhancement for low-light/fog plate visibility
+
+### Phase 5 -- Automatic Plate OCR
+- **ML Kit Text Recognition** -- On-device OCR via Google ML Kit (Android) with Tesseract desktop fallback
+- **Full-Resolution Scanning** -- OCR runs on the full-res camera frame (not downscaled)
+- **SCAN Button** -- On-demand full-frame OCR with visual feedback
+- **Auto-Fill** -- Detected plates auto-populate the plate field (only when empty or previously auto-set)
+- **Capture-Time OCR** -- Additional OCR pass on saved evidence images
+- **Jurisdiction Routing** -- Plate state code auto-suggests correct police email recipients
+- **Anti-Fabrication** -- OpenCV fallback counts character regions only, never generates placeholder text
+- **Smart Regex** -- Indian plate pattern `([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})` rejects signage fragments
+
+### UI/UX
+- **Dark Theme** -- Custom design system (#0B0E17 background, cyan/green/amber/red accents)
+- **Action Bar** -- SCAN (purple), CAPTURE (blue), SEND (green), CLEAR (slate)
+- **HISTORY Button** -- Scrollable popup of last 10 reports, newest first
+- **Context-Aware Popups** -- Green for success, red for errors, amber for warnings, cyan for info
+- **Styled Widgets** -- Custom Card, StyledInput, StyledSpinner, ActionBtn, ToggleRow, SectionLabel
 
 ---
 
-## Step-by-Step: Build and Install on Your Phone
+## Step-by-Step: Build and Install
 
 ### Prerequisites
 
@@ -46,17 +70,14 @@ AI-powered traffic violation reporting app for Android. Captures evidence, detec
 | Python 3.10+ | `sudo apt install python3 python3-pip` |
 | Java 17 | `sudo apt install openjdk-17-jdk` |
 | Android phone | arm64 device, Android 10+, USB debugging ON |
-| USB cable | To install APK via `adb` |
 
 ### Step 1: Clone and Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SentinelX.git
-cd SentinelX
+git clone https://github.com/ankitjha67/SentinelX-Build.git
+cd SentinelX-Build
 bash setup.sh
 ```
-
-The setup script clones `camerax_provider` (Android CameraX bindings required for the camera to work) and verifies all files are in place.
 
 ### Step 2: Run Tests
 
@@ -65,7 +86,7 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-All 142 tests must pass before building.
+All 233 tests across 30 test suites must pass before building.
 
 ### Step 3: Install Buildozer
 
@@ -80,161 +101,144 @@ pip install "cython<3.0" buildozer
 buildozer -v android debug
 ```
 
-This takes **15-25 minutes** on first run (downloads Android SDK, NDK, compiles OpenCV for ARM64). Subsequent builds are faster.
-
-The APK will be at `bin/sentinelx-1.0.0-arm64-v8a-debug.apk`.
+First build takes 15-25 minutes (downloads Android SDK, NDK, compiles OpenCV for ARM64). The APK will be at `bin/sentinelx-1.5.0-arm64-v8a-debug.apk`.
 
 ### Step 5: Install on Your Phone
 
-**Option A — USB cable:**
+**Option A -- USB:**
 ```bash
-# Enable USB debugging on your phone:
-# Settings → About Phone → tap Build Number 7 times → Developer Options → USB Debugging ON
-
 adb install -r bin/*.apk
 ```
 
-**Option B — Transfer file:**
-Copy the `.apk` file to your phone via USB/cloud and tap to install. You'll need to allow "Install from unknown sources" in Settings.
+**Option B -- Transfer:** Copy the `.apk` to your phone and tap to install (allow "Install from unknown sources").
 
-### Step 6: First Launch — Grant Permissions
+### Step 6: Grant Permissions
 
-When Sentinel-X opens for the first time, grant ALL these permissions:
+| Permission | Select | Why |
+|------------|--------|-----|
+| Camera | Allow | Evidence capture + OCR |
+| Location | Allow all the time | GPS geocoding + background service |
+| Storage | Allow | Save evidence photos |
 
-| Permission | What to Select | Why |
-|------------|---------------|-----|
-| Camera | **Allow** | Evidence capture |
-| Location | **Allow all the time** | GPS for geocoding + background service |
-| Storage | **Allow** | Save evidence photos |
-
-Then go to **Settings → Apps → Sentinel-X → Battery → Unrestricted** so the background harsh-braking service doesn't get killed.
+Then: Settings > Apps > Sentinel-X > Battery > **Unrestricted**
 
 ### Step 7: Use the App
 
 1. Point camera at a vehicle committing a violation
-2. Toggle **Night/Fog CLAHE** if it's dark (enhances plate visibility)
-3. Enter the **Number Plate** (e.g. `MH12AB1234`)
-4. Select the **Violation** from the dropdown
-5. Tap **Capture** to save evidence photo
-6. Tap **Send Report** — your email app opens with:
-   - Pre-filled recipients (correct police authorities)
-   - Full violation report with GPS, speed, G-force data
-   - Good Samaritan §134A legal protection footer
-   - Evidence photo attached
-7. Tap **Send** in your email app
+2. **SCAN** to read the number plate via OCR (or type it manually)
+3. Select the **Violation** from the dropdown
+4. Toggle **Night/Fog CLAHE** if conditions are poor
+5. **CAPTURE** to save the evidence photo (watermarked + hashed)
+6. **SEND** -- email app opens with pre-filled recipients, violation report, evidence attachment, and Good Samaritan footer
+7. **HISTORY** to review past 10 reports
 
 ---
 
-## Build via GitHub Actions (No Local Setup)
+## Build via GitHub Actions
 
-If you don't want to install anything locally:
+Every push triggers the CI pipeline automatically:
 
 1. Fork this repo on GitHub
-2. Go to **Actions** tab → the `build` workflow runs automatically
-3. Wait ~20 minutes
-4. Download the APK from the workflow's **Artifacts** section
-5. Transfer to phone and install
+2. Push any commit -- the `build` workflow runs tests then builds the APK
+3. Download the APK from the workflow's **Artifacts** section (retained 30 days)
 
 ---
 
 ## Project Structure
 
 ```
-SentinelX/
-├── camerax_provider/          ← Android CameraX bindings (cloned by setup.sh)
-│   └── gradle_options.py      ← p4a hook — camera won't work without this
-├── main.py                    ← App (Phases 1-4: recording, integrity, offline, detection)
-├── service.py                 ← Background GPS + accelerometer service (UDP broadcast)
-├── buildozer.spec             ← Android build config
-├── setup.sh                   ← One-time setup script
-├── tests/
-│   ├── conftest.py
-│   └── test_sentinelx.py      ← 142 unit tests (23 test suites)
-├── .github/workflows/
-│   └── build.yml              ← CI: test → build APK
-├── .gitignore
-├── models/                    ← Drop a detector.onnx here (optional)
-└── evidence/                  ← Captured photos (auto-created, gitignored)
+SentinelX-Build/
+|-- camerax_provider/          <- Android CameraX bindings (cloned by setup.sh)
+|   |-- gradle_options.py      <- p4a hook: injects CameraX + ML Kit gradle deps
+|-- main.py                    <- App (~2700 lines, Phases 1-5)
+|-- service.py                 <- Background GPS + accelerometer (UDP broadcast)
+|-- buildozer.spec             <- Android build config (v1.5.0, API 33, NDK 25b)
+|-- setup.sh                   <- One-time setup script
+|-- tests/
+|   |-- conftest.py
+|   |-- test_sentinelx.py      <- 233 unit tests (30 test suites)
+|-- .github/workflows/
+|   |-- build.yml              <- CI: test -> build APK -> upload artifact
+|-- models/                    <- Drop a detector.onnx here (optional)
+|-- evidence/                  <- Captured photos (auto-created, gitignored)
 ```
 
 ---
 
 ## Architecture
 
-### Phase 1 — Camera & Telemetry
+### Frame & OCR Pipeline
 
 ```
 Camera Frame Flow:
-  camera4kivy ──► analyze_pixels_callback ──► FrameRingBuffer (30 frames max)
-                         │                         │              │
-                   watchdog.frame_received()       │              │
+  camera4kivy --> analyze_pixels_callback --> FrameRingBuffer (20 frames)
+                       |                           |              |
+                 watchdog.frame_received()         |              |
                                           FrameAnalysisWorker   DashcamRecorder
                                           (daemon thread)       (daemon thread)
                                           pops & analyzes       peeks & saves JPEG
                                           skips if behind       1 FPS, 2-min segments
 
-Telemetry Flow:
-  service.py (background) ──UDP:17888──► TelemetryReceiver ──► _poll_gps / _poll_accel
-                                         (daemon thread)       (prefer telemetry,
-                                                                fallback to direct sensors)
+OCR Flow:
+  FrameAnalysisWorker --> PlateOCR.process_frame(full_res_frame)
+       |                       |
+       |                  ML Kit / Tesseract engine
+       |                       |
+       |                  clean_plate_text() --> Indian plate regex (best-of-multiple)
+       |                       |
+       |                  suggest_routing() --> JurisdictionEngine
+       |                       |
+       v                       v
+  UI: ocr_suggest_text    UI: plate auto-fill (if field empty)
+
+SCAN Button:
+  scan_now() --> background thread --> PlateOCR.process_image(full_res_frame)
+                                           |
+                                    bypasses throttle, returns (plate, confidence)
+                                           |
+                                    _apply_ocr_result() on UI thread
+```
+
+### Telemetry & Recovery
+
+```
+Telemetry:
+  service.py (background) --UDP:17888--> TelemetryReceiver --> _poll_gps / _poll_accel
+                                         (daemon thread)       (prefer telemetry, fallback direct)
 
 Crash Recovery:
-  CameraWatchdog ──(no frame >5s)──► disconnect + reconnect (2s, 4s, 8s, 16s, 30s backoff)
+  CameraWatchdog --(no frame >5s)--> disconnect + reconnect (2s, 4s, 8s, 16s, 30s cap)
 ```
 
-### Phase 2 — Evidence Integrity
+### Evidence & Reporting
 
 ```
-Capture Flow:
-  capture_evidence() ──► export_to_png ──► CLAHE (if enabled)
-                                              │
-                                    EvidenceWatermark.apply()  (GPS + timestamp burned on image)
-                                              │
-                                    EvidenceHasher.write_hashfile()  (SHA-256 sidecar)
+Capture:
+  capture_evidence() --> export_to_png --> CLAHE (if enabled)
+                                              |
+                                    EvidenceWatermark.apply() (GPS + timestamp + plate)
+                                              |
+                                    EvidenceHasher.write_hashfile() (SHA-256 sidecar)
+                                              |
+                                    PlateOCR.process_image() (capture-time OCR)
 
-Report Flow:
-  send_report() ──► plyer.email ──► ReportLog.append()  (JSONL history)
-```
-
-### Phase 3 — Offline Resilience
-
-```
-Online:
-  send_report() ──► plyer.email ──► success ──► ReportLog.append()
+Online Send:
+  send_report() --> plyer.email --> ReportLog.append()
 
 Offline:
-  send_report() ──► plyer.email ──► fails ──► OfflineReportQueue.enqueue()
-                                                       │
-  QueueRetryDaemon (60s interval) ──► ConnectivityChecker.is_online()?
-       │ yes                                           │
-       └──► load queued report ──► send ──► dequeue ──► ReportLog.append()
+  send_report() --> fails --> OfflineReportQueue.enqueue()
+                                       |
+  QueueRetryDaemon (60s) --> ConnectivityChecker.is_online()?
+       | yes                           |
+       --> load --> send --> dequeue --> ReportLog.append()
 ```
 
-### Phase 4 — Detection & Monitoring
-
-```
-Speed Zone Check:
-  _tick_ui() ──► SpeedZoneChecker.check(lat, lon, kmh)
-                  └── haversine distance to registered zones
-                  └── alert if within radius AND over limit
-
-Subsystem Monitor:
-  _tick_ui() ──► SubsystemStatus.update(cam, gps, dashcam, telemetry, queue)
-                  └── summary() ──► status bar display
-
-Harsh Brake Events:
-  _poll_accel() ──► g_dyn > 4.0? ──► HarshBrakeLog.record() (5s debounce)
-
-ONNX Detection (optional):
-  ONNXDetector ──► loads models/detector.onnx ──► detect(bgr_image) ──► [(x,y,w,h,conf)]
-```
-
-### All Subsystems
+### Subsystem Table
 
 | Phase | Subsystem | Class | Thread | Purpose |
 |-------|-----------|-------|--------|---------|
 | 1 | Frame Buffer | `FrameRingBuffer` | shared | Bounded deque, prevents OOM |
-| 1 | Analysis | `FrameAnalysisWorker` | daemon | CV processing off main thread |
+| 1 | Analysis | `FrameAnalysisWorker` | daemon | CV + OCR processing off main thread |
 | 1 | Watchdog | `CameraWatchdog` | Kivy Clock | Detects camera stalls, auto-reconnects |
 | 1 | Recording | `DashcamRecorder` | daemon | Continuous JPEG segments, auto-prune |
 | 1 | Telemetry | `TelemetryReceiver` | daemon | Consumes service.py UDP broadcasts |
@@ -242,26 +246,14 @@ ONNX Detection (optional):
 | 2 | Watermark | `EvidenceWatermark` | main | Burns GPS/timestamp onto images |
 | 2 | Report Log | `ReportLog` | main | Append-only JSONL history |
 | 3 | Queue | `OfflineReportQueue` | main | Stores reports as JSON files |
-| 3 | Connectivity | `ConnectivityChecker` | daemon | Socket probe to 8.8.8.8:53 |
+| 3 | Connectivity | `ConnectivityChecker` | main | Socket probe to 8.8.8.8:53 |
 | 3 | Retry | `QueueRetryDaemon` | daemon | Auto-retries queued reports |
 | 4 | ONNX | `ONNXDetector` | main | Optional plate detection model |
 | 4 | Speed Zones | `SpeedZoneChecker` | main | Haversine proximity + speed limits |
 | 4 | Status | `SubsystemStatus` | main | Health aggregator for all subsystems |
 | 4 | Brake Log | `HarshBrakeLog` | main | JSONL event log with debounce |
-
----
-
-## What Each Fix Does
-
-| # | Problem | Fix |
-|---|---------|-----|
-| 1 | `opencv-python-headless` not a p4a recipe | Changed to `opencv` |
-| 2 | `reverse_geocoder` needs scipy (no p4a recipe) | Changed to `reverse_geocode` (pure Python) |
-| 3 | `texture.pixels` polling crashes on Android | Subclassed Preview with `analyze_pixels_callback` |
-| 4 | Camera connects before permission granted | Moved to grant callback |
-| 5 | `__file__` path read-only inside APK | Changed to `App.user_data_dir` |
-| 6 | Camera never disconnected | Added `on_stop()` → `disconnect_camera()` |
-| 7 | Missing `camerax_provider` + `gestures4kivy` + `p4a.hook` | Added all three |
+| 5 | Plate OCR | `PlateOCR` | worker | ML Kit / Tesseract engine abstraction |
+| 5 | Jurisdiction | `JurisdictionEngine` | main | Plate state code to police email routing |
 
 ---
 
@@ -274,17 +266,21 @@ ONNX Detection (optional):
 
 **App crashes on launch:**
 - Connect USB, run `adb logcat -s python:D` to see Python errors
-- Common: `ModuleNotFoundError` means a requirement is wrong
 
-**Background service stops after 10 min:**
-- Settings → Apps → Sentinel-X → Battery → **Unrestricted**
+**OCR not detecting plates:**
+- Ensure ML Kit deps are in `camerax_provider/gradle_options.py` (text-recognition:16.0.1)
+- Try the SCAN button for on-demand full-frame OCR
+- Hold the camera steady with the plate clearly visible
+
+**Background service stops:**
+- Settings > Apps > Sentinel-X > Battery > **Unrestricted**
 
 **Email doesn't send:**
 - plyer.email opens your email app (Gmail, etc). You tap Send manually.
-- This is by design — no silent sending, for legal compliance.
+- This is by design for legal compliance.
 
 ---
 
 ## License
 
-MIT License — see LICENSE for details.
+MIT License

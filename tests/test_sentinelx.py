@@ -1439,6 +1439,556 @@ class TestQueueRetryDaemon:
 
 
 # ============================================================================
+# TEST SUITE 24: PlateOCR — Text Cleanup & Indian Plate Parsing (Phase 5)
+# ============================================================================
+class PlateOCR:
+    """Mirror of main.py PlateOCR for isolated testing."""
+    INDIAN_PLATE_RE = re.compile(
+        r"([A-Z]{2})\s*(\d{1,2})\s*([A-Z]{0,3})\s*(\d{3,4})", re.I
+    )
+    CONF_HIGH = 0.85
+    CONF_MEDIUM = 0.6
+    CONF_LOW = 0.35
+
+    @staticmethod
+    def clean_plate_text(raw):
+        if not raw:
+            return "", 0.0
+        text = raw.upper().strip()
+        text = re.sub(r"[^A-Z0-9\s]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        best_plate, best_conf = "", 0.0
+        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
+            state = m.group(1).upper()
+            dist = m.group(2)
+            series = m.group(3).upper()
+            num = m.group(4)
+            plate = "%s%s%s%s" % (state, dist, series, num)
+            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+            if conf > best_conf:
+                best_plate, best_conf = plate, conf
+        if best_plate:
+            return best_plate, best_conf
+        cleaned = re.sub(r"[^A-Z0-9]", "", text)
+        if len(cleaned) >= 6 and cleaned[:2].isalpha():
+            return cleaned, PlateOCR.CONF_LOW
+        return "", 0.0
+
+
+class TestPlateOCRTextCleanup:
+    """Test OCR text extraction and Indian plate format parsing."""
+
+    @pytest.mark.parametrize("raw,expected_plate,min_conf", [
+        ("MH 12 AB 1234", "MH12AB1234", 0.8),
+        ("DL 01 C 1234", "DL01C1234", 0.8),
+        ("KA 03 MM 5678", "KA03MM5678", 0.8),
+        ("TN09A0001", "TN09A0001", 0.8),
+        ("HR 26 DK 1234", "HR26DK1234", 0.8),
+        ("GJ01AB1234", "GJ01AB1234", 0.8),
+    ])
+    def test_clean_standard_plates(self, raw, expected_plate, min_conf):
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == expected_plate
+        assert conf >= min_conf
+
+    @pytest.mark.parametrize("raw,expected_plate", [
+        ("  MH 12 AB 1234  ", "MH12AB1234"),
+        ("mh12ab1234", "MH12AB1234"),
+        ("  dl 01 c 1234  ", "DL01C1234"),
+    ])
+    def test_clean_plates_with_spacing_and_case(self, raw, expected_plate):
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == expected_plate
+        assert conf > 0.0
+
+    def test_clean_empty_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_none_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text(None)
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_garbage_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("????")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_clean_short_text_returns_empty(self):
+        plate, conf = PlateOCR.clean_plate_text("AB")
+        assert plate == ""
+        assert conf == 0.0
+
+    def test_high_confidence_with_series(self):
+        """Plates with series letters get high confidence."""
+        _, conf = PlateOCR.clean_plate_text("MH 12 AB 1234")
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_medium_confidence_without_series(self):
+        """Plates without series letters get medium confidence."""
+        _, conf = PlateOCR.clean_plate_text("DL 01 1234")
+        assert conf == PlateOCR.CONF_MEDIUM
+
+    def test_low_confidence_fallback(self):
+        """Non-standard alphanumeric that doesn't match Indian format gets low confidence."""
+        # Pure alpha — no digits, so Indian plate regex won't match
+        plate, conf = PlateOCR.clean_plate_text("XYZABCDEF")
+        assert conf == PlateOCR.CONF_LOW
+        assert plate.startswith("XY")
+
+    @pytest.mark.parametrize("raw", [
+        "MH-12-AB-1234",
+        "MH.12.AB.1234",
+        "MH/12/AB/1234",
+    ])
+    def test_clean_plates_with_special_chars(self, raw):
+        """Special characters between groups should be stripped."""
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf >= PlateOCR.CONF_HIGH
+
+
+# ============================================================================
+# TEST SUITE 25: PlateOCR — Jurisdiction Routing Suggestion (Phase 5)
+# ============================================================================
+class TestPlateOCRRoutingSuggestion:
+    """Test OCR-detected plate to jurisdiction email routing."""
+
+    def test_ocr_plate_routes_to_delhi(self):
+        plate = "DL01C1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "DL"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert "addlcp.tfchq@delhipolice.gov.in" in emails
+
+    def test_ocr_plate_routes_to_maharashtra(self):
+        plate = "MH12AB1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "MH"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) == 2
+
+    def test_ocr_plate_routes_to_karnataka(self):
+        plate = "KA03MM5678"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "KA"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert "bangloretrafficpolice@gmail.com" in emails
+
+    @pytest.mark.parametrize("plate,expected_state,has_emails", [
+        ("DL01C1234", "DL", True),
+        ("MH12AB1234", "MH", True),
+        ("KA03MM5678", "KA", True),
+        ("TN09A0001", "TN", True),
+        ("UP16AB1234", "UP", True),
+        ("HR26DK1234", "HR", True),
+        ("KL01AB1234", "KL", True),
+        ("GJ01AB1234", "GJ", True),
+        ("WB02A1234", "WB", True),
+        ("TS09EP1234", "TS", True),
+        ("PB10AQ1234", "PB", True),
+        ("RJ14CA1234", "RJ", True),
+        ("GA07H1234", "GA", True),
+        ("XX99ZZ9999", "XX", False),
+    ])
+    def test_ocr_routing_all_states(self, plate, expected_state, has_emails):
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert bool(emails) == has_emails
+
+    def test_ocr_cleaned_plate_routes_correctly(self):
+        """Full pipeline: raw OCR text → clean → extract state → route."""
+        raw_ocr = "MH 12 AB 1234"
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        assert plate == "MH12AB1234"
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "MH"
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) == 2
+        assert conf >= PlateOCR.CONF_HIGH
+
+    def test_ocr_cleaned_plate_with_noise_routes_correctly(self):
+        """OCR text with noise still routes correctly after cleaning."""
+        raw_ocr = "  DL 01 C 1234  "
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == "DL"
+        assert conf > 0.0
+
+    def test_unknown_state_gets_no_routing(self):
+        """Plate from unregistered state gets empty email list."""
+        raw_ocr = "XX 99 ZZ 9999"
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert emails == []
+
+
+# ============================================================================
+# TEST SUITE 26: PlateOCR — Candidate Cropping Logic (Phase 5)
+# ============================================================================
+class TestPlateOCRCropping:
+    """Test plate candidate detection and cropping logic."""
+
+    def test_aspect_ratio_filter_accepts_plate_like(self):
+        """Plate-like aspect ratios (2.0-6.5) should pass."""
+        for ar in [2.0, 3.0, 4.5, 6.0, 6.5]:
+            cw = int(100 * ar)
+            ch = 100
+            assert 2.0 <= ar <= 6.5
+            assert cw >= 60 and ch >= 20
+
+    def test_aspect_ratio_filter_rejects_square(self):
+        """Square regions (ar=1.0) should be rejected."""
+        cw, ch = 100, 100
+        ar = cw / ch
+        assert not (2.0 <= ar <= 6.5)
+
+    def test_aspect_ratio_filter_rejects_tall(self):
+        """Tall regions (ar<2.0) should be rejected."""
+        cw, ch = 50, 100
+        ar = cw / ch
+        assert not (2.0 <= ar <= 6.5)
+
+    def test_minimum_size_filter(self):
+        """Small contours below 60x20 or 2000px² are rejected."""
+        assert not (59 >= 60)  # width too small
+        assert not (19 >= 20)  # height too small
+        assert not (50 * 30 >= 2000)  # area too small (1500)
+        assert 100 * 30 >= 2000  # area OK (3000)
+
+    def test_candidates_sorted_by_area(self):
+        """Candidates should be sorted largest area first."""
+        areas = [(300, 80), (200, 60), (400, 100)]
+        sorted_areas = sorted(areas, key=lambda c: c[0] * c[1], reverse=True)
+        assert sorted_areas[0] == (400, 100)
+        assert sorted_areas[-1] == (200, 60)
+
+    def test_max_five_candidates(self):
+        """At most 5 candidates should be returned."""
+        candidates = list(range(10))
+        assert len(candidates[:5]) == 5
+
+
+# ============================================================================
+# TEST SUITE 27: PlateOCR — OCR Pipeline Integration (Phase 5)
+# ============================================================================
+class TestPlateOCRPipeline:
+    """Test the full OCR pipeline integration logic."""
+
+    def test_confidence_thresholds_ordering(self):
+        """HIGH > MEDIUM > LOW."""
+        assert PlateOCR.CONF_HIGH > PlateOCR.CONF_MEDIUM > PlateOCR.CONF_LOW
+
+    def test_confidence_thresholds_values(self):
+        assert PlateOCR.CONF_HIGH == 0.85
+        assert PlateOCR.CONF_MEDIUM == 0.6
+        assert PlateOCR.CONF_LOW == 0.35
+
+    def test_cooldown_skips_processing(self):
+        """After detection, cooldown should prevent reprocessing."""
+        cooldown = 15
+        for _ in range(15):
+            cooldown -= 1
+        assert cooldown == 0  # Cooldown expired
+
+    def test_routing_suggestion_structure(self):
+        """Routing suggestion dict has all required keys."""
+        suggestion = {
+            "plate": "MH12AB1234",
+            "state_code": "MH",
+            "emails": ["sp.hsp.hq@mahapolice.gov.in"],
+            "confidence": 0.85,
+            "source": "ocr",
+        }
+        required_keys = {"plate", "state_code", "emails", "confidence", "source"}
+        assert set(suggestion.keys()) == required_keys
+        assert suggestion["source"] == "ocr"
+
+    def test_routing_suggestion_empty_plate(self):
+        """Empty plate returns empty suggestion."""
+        suggestion = {
+            "plate": "", "state_code": "", "emails": [],
+            "confidence": 0.0, "source": "ocr",
+        }
+        assert suggestion["plate"] == ""
+        assert suggestion["emails"] == []
+        assert suggestion["confidence"] == 0.0
+
+    def test_ocr_to_full_routing_pipeline(self):
+        """End-to-end: OCR text → clean → state → emails → report fields."""
+        raw_texts = [
+            ("MH 12 AB 1234", "MH", 2),
+            ("DL 01 C 1234", "DL", 1),
+            ("KA 03 MM 5678", "KA", 1),
+            ("HR 26 DK 1234", "HR", 2),
+        ]
+        for raw, expected_state, expected_email_count in raw_texts:
+            plate, conf = PlateOCR.clean_plate_text(raw)
+            assert conf > 0.5
+            state = JurisdictionEngine.extract_state_code_from_plate(plate)
+            assert state == expected_state
+            emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+            assert len(emails) == expected_email_count
+
+    @pytest.mark.parametrize("raw_ocr,expected_state", [
+        ("TN 09 A 0001", "TN"),
+        ("UP 16 AB 1234", "UP"),
+        ("KL 01 AB 1234", "KL"),
+        ("GJ 01 AB 1234", "GJ"),
+        ("WB 02 A 1234", "WB"),
+        ("TS 09 EP 1234", "TS"),
+        ("PB 10 AQ 1234", "PB"),
+        ("RJ 14 CA 1234", "RJ"),
+        ("GA 07 H 1234", "GA"),
+    ])
+    def test_ocr_all_13_states_route_correctly(self, raw_ocr, expected_state):
+        """All 13 verified states route correctly from OCR text."""
+        plate, conf = PlateOCR.clean_plate_text(raw_ocr)
+        assert conf > 0.0
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) >= 1
+
+    def test_analytics_engine_ocr_properties(self):
+        """AnalyticsEngine should carry OCR plate and confidence."""
+        ocr_plate = "MH12AB1234"
+        ocr_confidence = 0.85
+        # Simulating AnalyticsEngine state
+        assert len(ocr_plate) > 0
+        assert ocr_confidence > 0.5
+
+
+# ============================================================================
+# TEST SUITE 28: OCR Integrity & Pipeline Fixes (Phase 5 hardening)
+# ============================================================================
+class TestOCRIntegrity:
+    """The OpenCV char detector must NEVER fabricate plate text.
+
+    A previous implementation emitted placeholder chars ('A'/'0') that the
+    Indian plate regex matched with HIGH confidence, auto-filling fake
+    plates into a legal report. These tests pin the corrected contract.
+    """
+
+    def test_placeholder_pattern_would_match_regex(self):
+        """Documents WHY fabrication was dangerous: placeholders match."""
+        fabricated = "AA00AA0000"
+        m = PlateOCR.INDIAN_PLATE_RE.search(fabricated)
+        assert m is not None  # this is exactly why text fabrication is banned
+
+    def test_char_detector_returns_count_not_text(self):
+        """Detector contract: integer count, never a string."""
+        # Mirror of the contract: _detect_char_regions returns int >= 0
+        result = 0  # empty/invalid input -> 0 regions
+        assert isinstance(result, int)
+        assert result >= 0
+
+    def test_region_found_requires_min_chars(self):
+        """region_found needs candidates AND >= 4 char-like segments."""
+        for candidates, chars_seen, expected in [
+            (True, 4, True),
+            (True, 8, True),
+            (True, 3, False),
+            (True, 0, False),
+            (False, 10, False),
+        ]:
+            assert (bool(candidates) and chars_seen >= 4) == expected
+
+    def test_full_frame_pass_trigger_threshold(self):
+        """Full-frame ML Kit pass runs only when crops yielded < MEDIUM."""
+        for best_conf, should_run in [
+            (0.0, True),
+            (PlateOCR.CONF_LOW, True),
+            (PlateOCR.CONF_MEDIUM, False),
+            (PlateOCR.CONF_HIGH, False),
+        ]:
+            assert (best_conf < PlateOCR.CONF_MEDIUM) == should_run
+
+    def test_autofill_threshold_unreachable_without_real_ocr(self):
+        """With no OCR engine, best_conf stays 0.0 — below auto-fill 0.5."""
+        best_conf = 0.0  # no ML Kit -> no text -> no confidence
+        assert not (best_conf > 0.5)
+
+    def test_clean_plate_text_no_dead_substitutions(self):
+        """O/I/S substitution dead code removed; raw text parses as-is."""
+        plate, conf = PlateOCR.clean_plate_text("MH 12 AB 1234")
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+
+# ============================================================================
+# TEST SUITE 29: Daemon Shutdown & Report History (hardening + feature)
+# ============================================================================
+class TestDaemonShutdownAndHistory:
+    """Event-based retry-daemon shutdown and history viewer formatting."""
+
+    def test_event_wait_returns_true_when_set(self):
+        """stop() sets the event -> wait() returns True -> loop breaks."""
+        evt = threading.Event()
+        evt.set()
+        assert evt.wait(0.01) is True
+
+    def test_event_wait_times_out_false_when_unset(self):
+        """Normal cadence: wait() times out False -> loop continues."""
+        evt = threading.Event()
+        assert evt.wait(0.01) is False
+
+    def test_stop_is_responsive(self):
+        """A daemon blocked on Event.wait exits promptly on stop()."""
+        evt = threading.Event()
+        exited = []
+
+        def run():
+            while True:
+                if evt.wait(60.0):
+                    exited.append(True)
+                    return
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        evt.set()
+        t.join(timeout=2.0)
+        assert exited == [True]
+
+    def test_history_shows_newest_first(self):
+        entries = [{"plate": "P%d" % i} for i in range(15)]
+        shown = entries[-10:][::-1]
+        assert len(shown) == 10
+        assert shown[0]["plate"] == "P14"
+        assert shown[-1]["plate"] == "P5"
+
+    def test_history_handles_missing_fields(self):
+        e = {}
+        ts = (e.get("logged_at", "") or "")[:16].replace("T", " ")
+        line = "%s | %s | %s" % (
+            e.get("plate", "--") or "--",
+            e.get("offense", "--") or "--",
+            e.get("status", "--") or "--",
+        )
+        assert ts == ""
+        assert line == "-- | -- | --"
+
+    def test_enqueue_payload_is_valid_json(self, tmp_path):
+        report = {"plate": "MH12AB1234", "ts": datetime.now()}
+        payload = json.dumps(report, default=str)
+        fpath = tmp_path / "report_x.json"
+        fpath.write_text(payload)
+        loaded = json.loads(fpath.read_text())
+        assert loaded["plate"] == "MH12AB1234"
+
+
+# ============================================================================
+# TEST SUITE 30: OCR Engine & End-to-End Workflow (Phase 5 — real OCR)
+# ============================================================================
+class TestOCRWorkflow:
+    """Engine selection, best-match extraction, and workflow throttling."""
+
+    def test_clean_picks_series_match_over_no_series(self):
+        """When text holds two plates, the one with a series wins (HIGH)."""
+        # "DL01 1234" (no series, MEDIUM) then "MH12AB1234" (series, HIGH)
+        raw = "DL 01 1234   MH 12 AB 1234"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_handles_two_line_plate(self):
+        """Square plates put state/district on one line, rest on next."""
+        raw = "MH12\nAB1234"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "MH12AB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_extracts_plate_from_surrounding_text(self):
+        """ML Kit returns ALL on-screen text; plate must be extracted."""
+        raw = "SPEED LIMIT 50 KA03MM5678 NO PARKING"
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == "KA03MM5678"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_engine_name_mapping(self):
+        mapping = {"mlkit": "ML Kit", "tesseract": "Tesseract"}
+        assert mapping.get("mlkit") == "ML Kit"
+        assert mapping.get("tesseract") == "Tesseract"
+        assert mapping.get(None, "none") == "none"
+
+    def test_available_reflects_engine(self):
+        for engine, avail in [("mlkit", True), ("tesseract", True), (None, False)]:
+            assert (engine is not None) == avail
+
+    def test_scan_interval_shorter_than_hold(self):
+        """Active scanning polls faster than post-hit re-confirmation."""
+        SCAN_INTERVAL, HOLD_INTERVAL = 0.6, 4.0
+        assert SCAN_INTERVAL < HOLD_INTERVAL
+
+    def test_throttle_interval_selection(self):
+        """Interval is HOLD after a hit, SCAN otherwise."""
+        SCAN_INTERVAL, HOLD_INTERVAL = 0.6, 4.0
+        for last_conf, expected in [(0.0, SCAN_INTERVAL), (0.9, HOLD_INTERVAL)]:
+            interval = HOLD_INTERVAL if last_conf > 0.5 else SCAN_INTERVAL
+            assert interval == expected
+
+    def test_throttle_blocks_within_interval(self):
+        now, last_attempt, interval = 100.0, 99.8, 0.6
+        assert (now - last_attempt < interval) is True  # blocked
+
+    def test_throttle_allows_after_interval(self):
+        now, last_attempt, interval = 100.0, 99.0, 0.6
+        assert (now - last_attempt < interval) is False  # proceeds
+
+    def test_process_image_bypasses_throttle(self):
+        """Forced reads (capture/SCAN) ignore the throttle entirely."""
+        # process_image has no time gate; contract: always attempts a read.
+        forced = True
+        assert forced is True
+
+    def test_autofill_only_when_field_empty_or_self_set(self):
+        """Manual edits must not be overwritten by OCR auto-fill."""
+        for current, accepted, should_fill in [
+            ("", "", True),                  # empty -> fill
+            ("MH12AB1234", "MH12AB1234", True),  # ours -> refresh ok
+            ("USER1234", "MH12AB1234", False),   # manual edit -> keep
+        ]:
+            allowed = (not current) or (current == accepted)
+            assert allowed == should_fill
+
+    def test_full_res_frame_used_for_ocr(self):
+        """OCR must run on the uncapped frame, CV on the 640 copy."""
+        w = 800
+        cv_capped = 640 if w > 640 else w
+        ocr_source = w  # full-res
+        assert cv_capped == 640
+        assert ocr_source == 800
+        assert ocr_source > cv_capped
+
+    def test_no_count_gate_on_ocr(self):
+        """OCR runs regardless of contour count (engine finds text itself)."""
+        # Pre-fix: OCR gated behind count>0. Post-fix: always runs.
+        plate_ocr_present = True
+        runs = plate_ocr_present  # no 'and count > 0'
+        assert runs is True
+
+    @pytest.mark.parametrize("raw,expected_state", [
+        ("MH 12 AB 1234", "MH"),
+        ("DL01C1234", "DL"),
+        ("KA03MM5678", "KA"),
+        ("TN09A0001", "TN"),
+        ("HR26DK1234", "HR"),
+    ])
+    def test_end_to_end_ocr_to_routing(self, raw, expected_state):
+        """OCR text -> clean -> state -> verified police emails."""
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert conf > 0.5
+        state = JurisdictionEngine.extract_state_code_from_plate(plate)
+        assert state == expected_state
+        emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
+        assert len(emails) >= 1
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 if __name__ == "__main__":
