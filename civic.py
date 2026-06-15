@@ -384,3 +384,46 @@ class PrivacyBlur:
         except Exception:
             pass
         return bgr
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Over-the-air update manifest (pure logic; network/install live in main.py)
+# ─────────────────────────────────────────────────────────────────────────
+class UpdateManifest:
+    """Parses the update.json published by CI and decides if an update applies.
+
+    Fully silent forced updates are not possible for sideloaded Android apps
+    (only Play Store / MDM / root can do that), so the app uses this to detect a
+    newer build, then auto-downloads and prompts the user for a one-tap install.
+    """
+
+    # Stable URL of the latest published manifest (GitHub Releases "latest").
+    DEFAULT_URL = (
+        "https://github.com/ankitjha67/SentinelX-Build/releases/latest/download/update.json"
+    )
+
+    @staticmethod
+    def parse(data):
+        if not isinstance(data, dict):
+            return None
+        try:
+            return {
+                "version": str(data.get("version", "")),
+                "version_code": int(data.get("version_code") or 0),
+                "url": str(data.get("url", "")),
+                "notes": str(data.get("notes", "")),
+                "sha256": str(data.get("sha256", "")),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_newer(current_code, manifest):
+        """True only when the manifest has a strictly higher code and a URL."""
+        if not manifest:
+            return False
+        try:
+            return (int(manifest.get("version_code", 0)) > int(current_code or 0)
+                    and bool(manifest.get("url")))
+        except Exception:
+            return False

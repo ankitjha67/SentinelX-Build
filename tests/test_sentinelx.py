@@ -2253,6 +2253,37 @@ class TestHaversineAndPrivacy:
         assert civic.PrivacyBlur.blur_faces(sentinel) is sentinel or civic.cv2 is not None
 
 
+class TestUpdateManifest:
+    def test_parse_valid(self):
+        m = civic.UpdateManifest.parse({
+            "version": "1.6.0", "version_code": 42,
+            "url": "https://x/sentinelx.apk", "notes": "n",
+        })
+        assert m["version_code"] == 42 and m["url"].endswith(".apk")
+
+    def test_parse_bad(self):
+        assert civic.UpdateManifest.parse("nope") is None
+        assert civic.UpdateManifest.parse(None) is None
+
+    def test_is_newer_true(self):
+        m = {"version_code": 10, "url": "https://x/a.apk"}
+        assert civic.UpdateManifest.is_newer(9, m)
+
+    def test_is_newer_false_same_or_lower(self):
+        m = {"version_code": 10, "url": "https://x/a.apk"}
+        assert not civic.UpdateManifest.is_newer(10, m)
+        assert not civic.UpdateManifest.is_newer(11, m)
+
+    def test_is_newer_requires_url(self):
+        assert not civic.UpdateManifest.is_newer(0, {"version_code": 5, "url": ""})
+
+    def test_is_newer_handles_none(self):
+        assert not civic.UpdateManifest.is_newer(1, None)
+
+    def test_default_url_is_latest_release(self):
+        assert "releases/latest/download/update.json" in civic.UpdateManifest.DEFAULT_URL
+
+
 # ============================================================================
 # MAIN
 # ============================================================================

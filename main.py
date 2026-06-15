@@ -123,7 +123,7 @@ except Exception:
 # Phase 6 — citizen-empowerment logic (pure Python, Kivy-free, unit-tested)
 from civic import (
     CivicDirectory, ReportChannels, VehicleLookup, DuplicateGuard, I18N,
-    HazardReport, Emergency, ViolationHeatmap, PrivacyBlur,
+    HazardReport, Emergency, ViolationHeatmap, PrivacyBlur, UpdateManifest,
 )
 
 try:
@@ -2228,6 +2228,8 @@ class RootUI(BoxLayout):
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
+        # Phase 6: silent OTA update check shortly after launch
+        Clock.schedule_once(lambda _dt: self.check_for_updates(False), 4.0)
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
@@ -2790,6 +2792,7 @@ class RootUI(BoxLayout):
             ("Report a road hazard", self.report_hazard),
             ("SOS / Emergency", self.show_sos),
             ("Violation hotspots", self.show_hotspots),
+            ("Check for app updates", lambda: self.check_for_updates(True)),
             (blur_lbl, self.toggle_privacy_blur),
             (lang_lbl, self.toggle_language),
         ]
@@ -3022,6 +3025,123 @@ class RootUI(BoxLayout):
         self._close_menu()
         self._popup(I18N.tr("Ready"),
                     "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English"))
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Over-the-air auto-update (detect -> download -> one-tap install)
+    # ═════════════════════════════════════════════════════════════════════
+    def _current_version_code(self):
+        """Installed app versionCode via PackageManager (0 off-device)."""
+        if platform != "android" or autoclass is None:
+            return 0
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            pi = act.getPackageManager().getPackageInfo(act.getPackageName(), 0)
+            return int(pi.versionCode)
+        except Exception:
+            return 0
+
+    def check_for_updates(self, announce=False):
+        """Fetch the published manifest and compare with the installed build."""
+        self._close_menu()
+        threading.Thread(target=self._check_updates_worker,
+                         args=(announce,), daemon=True).start()
+
+    def _check_updates_worker(self, announce):
+        man = None
+        try:
+            import urllib.request
+            import json as _json
+            with urllib.request.urlopen(UpdateManifest.DEFAULT_URL, timeout=8) as r:
+                man = UpdateManifest.parse(_json.loads(r.read().decode("utf-8", "replace")))
+        except Exception:
+            man = None
+        cur = self._current_version_code()
+
+        def show(_dt):
+            if UpdateManifest.is_newer(cur, man):
+                self._prompt_update(man)
+            elif announce:
+                self._popup("Up to date", "You have the latest version.")
+        Clock.schedule_once(show, 0)
+
+    def _prompt_update(self, man):
+        from kivy.uix.button import Button
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(10))
+        box.add_widget(Label(
+            text="Version %s is available.\n\n%s" % (
+                man.get("version", "?"), man.get("notes", "") or "Tap Update to install."),
+            halign="left", valign="top", text_size=(dp(250), None),
+            font_size="13sp", color=(0.82, 0.84, 0.88, 1),
+        ))
+        btn = Button(
+            text="Update now", size_hint_y=None, height=dp(46), bold=True,
+            color=(1, 1, 1, 1), background_normal="", background_down="",
+            background_color=(0, 0.78, 0.33, 1),
+        )
+        btn.bind(on_release=lambda *_: (self._update_popup.dismiss(),
+                                        self._download_and_install(man.get("url", ""))))
+        box.add_widget(btn)
+        self._update_popup = Popup(
+            title="Update available", content=box, size_hint=(0.86, 0.42),
+            title_size="15sp", title_color=(0, 0.78, 0.33, 1),
+            separator_color=(0, 0.78, 0.33, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._update_popup.open()
+
+    def _download_and_install(self, url):
+        if not url:
+            return
+        if platform != "android" or autoclass is None:
+            self._open_url(url)  # desktop / fallback
+            return
+        try:
+            Uri = autoclass("android.net.Uri")
+            Request = autoclass("android.app.DownloadManager$Request")
+            Environment = autoclass("android.os.Environment")
+            Context = autoclass("android.content.Context")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            req = Request(Uri.parse(url))
+            req.setTitle("Sentinel-X update")
+            req.setMimeType("application/vnd.android.package-archive")
+            req.setNotificationVisibility(
+                Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            req.setDestinationInExternalFilesDir(
+                act, Environment.DIRECTORY_DOWNLOADS, "sentinelx-update.apk")
+            self._dl_dm = act.getSystemService(Context.DOWNLOAD_SERVICE)
+            self._dl_id = self._dl_dm.enqueue(req)
+            self._dl_tries = 0
+            self._popup("Updating", "Downloading the new version...")
+            Clock.schedule_interval(self._poll_download, 1.5)
+        except Exception:
+            # Fall back to opening the APK URL in the browser
+            self._open_url(url)
+
+    def _poll_download(self, _dt):
+        try:
+            uri = self._dl_dm.getUriForDownloadedFile(self._dl_id)
+            if uri is not None:
+                self._install_apk(uri)
+                return False
+        except Exception:
+            return False
+        self._dl_tries = getattr(self, "_dl_tries", 0) + 1
+        if self._dl_tries > 180:  # ~4.5 min cap
+            self._popup("Update", "Download is taking long. Check notifications.")
+            return False
+        return True
+
+    def _install_apk(self, uri):
+        try:
+            Intent = autoclass("android.content.Intent")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = Intent(Intent.ACTION_VIEW)
+            i.setDataAndType(uri, "application/vnd.android.package-archive")
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            act.startActivity(i)
+        except Exception:
+            self._popup("Update", "Downloaded. Open it from notifications to install.")
 
     def _popup(self, t, m, tall=False):
         # Determine accent color based on popup type

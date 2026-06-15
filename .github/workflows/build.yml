@@ -19,6 +19,8 @@ jobs:
     needs: test
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    permissions:
+      contents: write   # publish OTA releases
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -65,6 +67,18 @@ jobs:
           key: buildozer-p4a-v2024.01.21-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             buildozer-p4a-v2024.01.21-${{ runner.os }}-
+
+      # Inject a monotonic versionCode AFTER cache restore so the cache key
+      # (hash of the committed buildozer.spec) stays stable across runs. This
+      # versionCode is what each device compares against the published manifest.
+      - name: Set build version code
+        run: |
+          if grep -q '^android.numeric_version' buildozer.spec; then
+            sed -i "s/^android.numeric_version.*/android.numeric_version = ${{ github.run_number }}/" buildozer.spec
+          else
+            printf '\nandroid.numeric_version = %s\n' "${{ github.run_number }}" >> buildozer.spec
+          fi
+          grep -E '^version|^android.numeric_version' buildozer.spec
 
       - name: Build debug APK
         run: |
@@ -123,3 +137,26 @@ jobs:
           path: bin/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      # OTA: on a successful main build, publish a GitHub Release with the APK
+      # (fixed name) and update.json. Devices poll releases/latest/download/
+      # update.json, detect the higher version_code, and prompt to install.
+      # Gated to main so feature-branch builds never push updates to devices.
+      - name: Publish OTA release (main only)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          APK=$(ls bin/*.apk | head -1)
+          cp "$APK" sentinelx.apk
+          VC="${{ github.run_number }}"
+          VER=$(grep -E '^version' buildozer.spec | head -1 | cut -d'=' -f2 | tr -d ' ')
+          printf '{"version":"%s","version_code":%s,"url":"https://github.com/%s/releases/latest/download/sentinelx.apk","notes":"Automated build %s"}\n' \
+            "$VER" "$VC" "${{ github.repository }}" "$VC" > update.json
+          cat update.json
+          TAG="v${VER}-${VC}"
+          gh release create "$TAG" sentinelx.apk update.json \
+            --title "Sentinel-X ${VER} (build ${VC})" \
+            --notes "Automated OTA release. Installed apps auto-detect this and prompt to install." \
+            --latest
