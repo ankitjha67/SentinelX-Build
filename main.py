@@ -2227,12 +2227,35 @@ class RootUI(BoxLayout):
         # Phase 5: Plate OCR
         self._plate_ocr = PlateOCR()
         self._analytics.set_plate_ocr(self._plate_ocr)
+        # Phase 6: load VAHAN (Masters India) credentials from vahan.json if present
+        self._load_vahan_config()
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
         # Phase 6: silent update check shortly after launch (Play or GitHub OTA)
         Clock.schedule_once(lambda _dt: self._auto_update_check(False), 4.0)
+
+    def _load_vahan_config(self):
+        """Load Masters India VAHAN credentials from <data dir>/vahan.json."""
+        try:
+            base = App.get_running_app().user_data_dir
+        except Exception:
+            base = "."
+        for path in (os.path.join(base, "vahan.json"), "vahan.json"):
+            try:
+                if os.path.isfile(path):
+                    with open(path, "r") as f:
+                        cfg = json.load(f)
+                    VehicleLookup.set_credentials(
+                        jwt=cfg.get("jwt"), subid=cfg.get("subid"),
+                        productid=cfg.get("productid"), mode=cfg.get("mode"),
+                        url=cfg.get("url"))
+                    if cfg.get("endpoint"):
+                        VehicleLookup.set_endpoint(cfg.get("endpoint"))
+                    break
+            except Exception:
+                pass
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
@@ -2910,11 +2933,14 @@ class RootUI(BoxLayout):
             self._popup(
                 "Lookup",
                 "No vehicle-data provider configured.\n\n"
-                "Set SENTINELX_VAHAN_URL to an endpoint that accepts ?plate= "
-                "and returns JSON (RC, insurance, PUC).",
+                "Masters India VAHAN: drop a 'vahan.json' in the app folder with\n"
+                '{"jwt": "JWT <your-token>", "subid": "<your-subid>"}\n'
+                "(get these from your Masters India account), or set the\n"
+                "SENTINELX_MI_JWT / SENTINELX_MI_SUBID env vars.",
+                tall=True,
             )
             return
-        self._popup("Lookup", "Querying vehicle records for %s..." % plate)
+        self._popup("Lookup", "Querying VAHAN records for %s..." % plate)
         threading.Thread(target=self._vehicle_lookup_worker,
                          args=(plate,), daemon=True).start()
 
@@ -2925,15 +2951,26 @@ class RootUI(BoxLayout):
             if not res.get("ok"):
                 self._popup("Lookup failed", res.get("error", "unknown error"))
                 return
-            msg = "\n".join([
-                "Owner: %s" % (res.get("owner") or DASH),
-                "Model: %s" % (res.get("model") or DASH),
-                "RC: %s" % (res.get("rc_status") or DASH),
-                "Insurance: %s" % (res.get("insurance") or DASH),
-                "PUC: %s" % (res.get("puc") or DASH),
-                "Registered: %s" % (res.get("registered") or DASH),
-            ])
-            self._popup("Vehicle %s" % plate, msg, tall=True)
+            rows = [
+                ("Plate", res.get("plate")),
+                ("Owner", res.get("owner")),
+                ("Model", res.get("model")),
+                ("Class", res.get("vclass")),
+                ("RC status", res.get("rc_status")),
+                ("Registered", res.get("registered")),
+                ("RTO", res.get("registered_at")),
+                ("Insurance upto", res.get("insurance")),
+                ("Insurer", res.get("insurer")),
+                ("PUC upto", res.get("puc")),
+                ("Fitness upto", res.get("fitness")),
+                ("Financer", res.get("financer")),
+            ]
+            lines = ["%s: %s" % (k, v) for k, v in rows if v]
+            bl = (res.get("blacklist") or "").strip()
+            if bl:
+                lines.insert(0, "⚠ BLACKLIST: %s" % bl)
+            self._popup("Vehicle %s" % plate, "\n".join(lines) or "No fields returned.",
+                        tall=True)
         Clock.schedule_once(show, 0)
 
     # ── road-hazard reporting (municipal) ────────────────────────────────
@@ -3104,20 +3141,32 @@ class RootUI(BoxLayout):
 
     def _check_updates_worker(self, announce):
         man = None
+        err = ""
         try:
             import urllib.request
             import json as _json
             with urllib.request.urlopen(UpdateManifest.DEFAULT_URL, timeout=8) as r:
                 man = UpdateManifest.parse(_json.loads(r.read().decode("utf-8", "replace")))
-        except Exception:
-            man = None
+            if man is None:
+                err = "Malformed update manifest."
+        except Exception as e:
+            # 404 == no release published yet; other == network/parse failure
+            err = "No published release found yet." if "404" in str(e) \
+                else "Couldn't reach the update server."
         cur = self._current_version_code()
 
         def show(_dt):
             if UpdateManifest.is_newer(cur, man):
                 self._prompt_update(man)
-            elif announce:
-                self._popup("Up to date", "You have the latest version.")
+            elif not announce:
+                return  # silent startup check: say nothing unless asked
+            elif man is not None:
+                self._popup("Up to date",
+                            "You're on the latest version (build %d)." % cur)
+            else:
+                self._popup("Update check failed",
+                            "%s\n\nOTA releases are published from the main branch; "
+                            "make sure a release exists and you're online." % err)
         Clock.schedule_once(show, 0)
 
     def _prompt_update(self, man):
