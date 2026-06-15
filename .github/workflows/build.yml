@@ -64,13 +64,17 @@ jobs:
 
       - name: Build debug APK
         run: |
-          yes | buildozer -v android debug 2>&1 | tail -500
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee /tmp/build.log
         timeout-minutes: 45
 
+      - name: Build log tail (on failure)
+        if: failure()
+        run: tail -n 400 /tmp/build.log || true
+
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: sentinelx-apk-${{ github.sha }}
           path: bin/*.apk
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
