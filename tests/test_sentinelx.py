@@ -560,6 +560,7 @@ class IndiaGeocoder:
     _CENTROIDS = [
         (28.61, 77.21, "Delhi"),
         (29.06, 76.09, "Haryana"), (28.90, 76.61, "Haryana"),
+        (28.4595, 77.0266, "Haryana"), (28.4089, 77.3178, "Haryana"),  # Gurugram, Faridabad (NCR)
         (19.08, 72.88, "Maharashtra"), (18.52, 73.86, "Maharashtra"), (21.15, 79.09, "Maharashtra"),
         (12.97, 77.59, "Karnataka"), (15.36, 75.12, "Karnataka"), (12.30, 76.65, "Karnataka"),
         (13.08, 80.27, "Tamil Nadu"), (11.02, 76.96, "Tamil Nadu"), (9.92, 78.12, "Tamil Nadu"),
@@ -612,6 +613,9 @@ class TestIndiaGeocoder:
     # (lat, lon, expected state) — well-known city coordinates
     @pytest.mark.parametrize("lat,lon,state", [
         (28.6139, 77.2090, "Delhi"),          # New Delhi
+        (28.4595, 77.0266, "Haryana"),        # Gurugram (NCR, very close to Delhi)
+        (28.4041, 76.9657, "Haryana"),        # reported on-device coordinate
+        (28.4089, 77.3178, "Haryana"),        # Faridabad
         (19.0760, 72.8777, "Maharashtra"),    # Mumbai
         (12.9716, 77.5946, "Karnataka"),      # Bengaluru
         (13.0827, 80.2707, "Tamil Nadu"),     # Chennai

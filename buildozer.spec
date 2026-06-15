@@ -6,7 +6,10 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,json,txt,onnx
 
 version = 1.5.0
-orientation = portrait
+# 'all' lets the phone rotate to landscape for capturing wide number plates while
+# keeping the portrait form usable. p4a's activity sets a broad configChanges, so
+# rotating does not restart the app or the camera.
+orientation = all
 fullscreen = 0
 
 icon.filename = %(source.dir)s/icon.png
