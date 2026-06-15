@@ -48,6 +48,12 @@ jobs:
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "cython<3.0" buildozer
+          # Pin python-for-android to a release whose numpy recipe is 1.22.3,
+          # built via classic setup.py (NOT meson/ninja). The latest p4a ships
+          # numpy 2.3.0 which fails to cross-compile under NDK r25b's clang.
+          # Install AFTER buildozer so this pin wins over buildozer's dependency.
+          pip install "python-for-android==2024.1.21"
+          python -c "import pythonforandroid, sys; print('p4a', pythonforandroid.__version__)"
 
       - name: Setup project
         run: bash setup.sh
@@ -58,9 +64,10 @@ jobs:
           path: |
             .buildozer
             ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          # p4a pin is part of the key: switching p4a invalidates stale build artifacts
+          key: buildozer-p4a2024.1.21-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-p4a2024.1.21-${{ runner.os }}-
 
       - name: Build debug APK
         run: |
