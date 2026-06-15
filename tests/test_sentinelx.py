@@ -2088,6 +2088,172 @@ class TestOCRWorkflow:
 
 
 # ============================================================================
+# TEST SUITE: Phase 6 — civic.py citizen features (imported directly, Kivy-free)
+# ============================================================================
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import civic  # noqa: E402
+
+
+class TestReportChannels:
+    def test_compose_includes_plate_and_offense(self):
+        t = civic.ReportChannels.compose("MH12AB1234", "Dangerous Driving", "Pune, MH", "MH")
+        assert "MH12AB1234" in t and "Dangerous Driving" in t and "#RoadSafety" in t
+
+    def test_compose_adds_known_handle(self):
+        t = civic.ReportChannels.compose("DL01C1234", "Speeding", "Delhi", "DL")
+        assert "@dtptraffic" in t
+
+    def test_compose_handles_missing_handle(self):
+        t = civic.ReportChannels.compose("KL01AB1234", "Speeding", "Kochi", "KL")
+        assert "KL01AB1234" in t  # no handle for KL, still valid
+
+    def test_twitter_url_encodes(self):
+        u = civic.ReportChannels.twitter_url("hello world #x")
+        assert u.startswith("https://twitter.com/intent/tweet?text=")
+        assert " " not in u
+
+    def test_whatsapp_url_with_and_without_number(self):
+        assert civic.ReportChannels.whatsapp_url("hi", "+91 98765 43210").startswith(
+            "https://wa.me/919876543210?text=")
+        assert civic.ReportChannels.whatsapp_url("hi").startswith("https://wa.me/?text=")
+
+
+class TestCivicDirectory:
+    def test_handles_known_and_unknown(self):
+        assert civic.CivicDirectory.handles("DL") == ["@dtptraffic"]
+        assert civic.CivicDirectory.handles("ZZ") == []
+
+    def test_emergency_numbers(self):
+        assert civic.CivicDirectory.EMERGENCY == "112"
+        assert civic.CivicDirectory.AMBULANCE == "108"
+
+
+class TestVehicleLookup:
+    def test_normalize_plate(self):
+        assert civic.VehicleLookup.normalize_plate(" mh-12 ab 1234 ") == "MH12AB1234"
+
+    def test_lookup_empty_plate(self):
+        assert civic.VehicleLookup.lookup("")["ok"] is False
+
+    def test_lookup_no_provider(self):
+        civic.VehicleLookup.set_endpoint("")
+        r = civic.VehicleLookup.lookup("MH12AB1234")
+        assert r["ok"] is False and "provider" in r["error"]
+
+    def test_parse_maps_fields(self):
+        r = civic.VehicleLookup.parse({
+            "owner_name": "A Citizen", "maker_model": "Honda Activa",
+            "status": "ACTIVE", "insurance_upto": "2026-01-01",
+            "puc_upto": "2025-12-01", "registration_date": "2019-05-05",
+        })
+        assert r["ok"] and r["owner"] == "A Citizen" and r["model"] == "Honda Activa"
+        assert r["insurance"] == "2026-01-01" and r["puc"] == "2025-12-01"
+
+    def test_parse_bad_response(self):
+        assert civic.VehicleLookup.parse(["not", "a", "dict"])["ok"] is False
+
+
+class TestDuplicateGuard:
+    def _entry(self, plate, offense, lat, lon, ts):
+        return {"plate": plate, "offense": offense, "lat": lat, "lon": lon, "ts": ts}
+
+    def test_detects_duplicate(self):
+        now = 1000.0
+        entries = [self._entry("MH12AB1234", "DANGEROUS_184", 19.07, 72.87, now - 60)]
+        assert civic.DuplicateGuard.is_duplicate(
+            entries, "MH12AB1234", "DANGEROUS_184", 19.0701, 72.8701, now_ts=now)
+
+    def test_not_duplicate_different_plate(self):
+        now = 1000.0
+        entries = [self._entry("MH12AB1234", "DANGEROUS_184", 19.07, 72.87, now - 60)]
+        assert not civic.DuplicateGuard.is_duplicate(
+            entries, "DL01C1234", "DANGEROUS_184", 19.07, 72.87, now_ts=now)
+
+    def test_not_duplicate_old(self):
+        now = 1000.0
+        entries = [self._entry("MH12AB1234", "DANGEROUS_184", 19.07, 72.87, now - 5000)]
+        assert not civic.DuplicateGuard.is_duplicate(
+            entries, "MH12AB1234", "DANGEROUS_184", 19.07, 72.87, now_ts=now)
+
+    def test_not_duplicate_far(self):
+        now = 1000.0
+        entries = [self._entry("MH12AB1234", "DANGEROUS_184", 19.07, 72.87, now - 60)]
+        assert not civic.DuplicateGuard.is_duplicate(
+            entries, "MH12AB1234", "DANGEROUS_184", 28.61, 77.21, now_ts=now)
+
+
+class TestI18N:
+    def teardown_method(self):
+        civic.I18N.set_lang("en")
+
+    def test_default_english_passthrough(self):
+        civic.I18N.set_lang("en")
+        assert civic.I18N.tr("SEND") == "SEND"
+
+    def test_hindi_translation(self):
+        civic.I18N.set_lang("hi")
+        assert civic.I18N.tr("SEND") == "भेजें"
+
+    def test_unknown_key_passthrough(self):
+        civic.I18N.set_lang("hi")
+        assert civic.I18N.tr("NonExistentKey") == "NonExistentKey"
+
+    def test_invalid_lang_falls_back(self):
+        civic.I18N.set_lang("xx")
+        assert civic.I18N.LANG == "en"
+
+
+class TestHazardReport:
+    def test_categories_nonempty(self):
+        assert len(civic.HazardReport.CATEGORIES) >= 5
+
+    def test_subject_and_body(self):
+        s = civic.HazardReport.subject("Pothole / damaged road", "Pune")
+        assert "Pothole" in s
+        b = civic.HazardReport.body("Pothole / damaged road", 18.5, 73.8, "Pune", "deep")
+        assert "GPS: 18.500000, 73.800000" in b and "deep" in b
+
+
+class TestEmergency:
+    def test_maps_link(self):
+        assert civic.Emergency.maps_link(19.07, 72.87) == \
+            "https://maps.google.com/?q=19.070000,72.870000"
+
+    def test_sos_text(self):
+        assert "SOS" in civic.Emergency.sos_text(19.07, 72.87)
+
+    def test_good_samaritan_mentions_134a(self):
+        assert "134A" in civic.Emergency.good_samaritan_text(19.07, 72.87)
+
+
+class TestViolationHeatmap:
+    def test_hotspots_counts(self):
+        entries = [
+            {"lat": 19.070, "lon": 72.870}, {"lat": 19.071, "lon": 72.871},
+            {"lat": 28.610, "lon": 77.210},
+        ]
+        spots = civic.ViolationHeatmap.hotspots(entries, top=5)
+        assert spots[0]["count"] == 2  # the two Mumbai points share a cell
+
+    def test_hotspots_empty(self):
+        assert civic.ViolationHeatmap.hotspots([]) == []
+
+
+class TestHaversineAndPrivacy:
+    def test_haversine_zero(self):
+        assert civic.haversine_m(19.07, 72.87, 19.07, 72.87) == 0.0
+
+    def test_haversine_known(self):
+        d = civic.haversine_m(28.61, 77.21, 28.62, 77.21)
+        assert 1000 < d < 1300  # ~1.1 km per 0.01 deg latitude
+
+    def test_blur_faces_noop_without_cv2(self):
+        # Returns the input unchanged when cv2/cascade unavailable
+        sentinel = object()
+        assert civic.PrivacyBlur.blur_faces(sentinel) is sentinel or civic.cv2 is not None
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 if __name__ == "__main__":

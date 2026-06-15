@@ -120,6 +120,12 @@ except Exception:
         # On Android (and anywhere scipy is unavailable) use the bundled geocoder
         rg = IndiaGeocoder()
 
+# Phase 6 — citizen-empowerment logic (pure Python, Kivy-free, unit-tested)
+from civic import (
+    CivicDirectory, ReportChannels, VehicleLookup, DuplicateGuard, I18N,
+    HazardReport, Emergency, ViolationHeatmap, PrivacyBlur,
+)
+
 try:
     from plyer import email as plyer_email
 except Exception:
@@ -1696,18 +1702,27 @@ KV = """
             halign: "left"
             valign: "middle"
             text_size: self.size
-            size_hint_x: 0.5
-        Label:
-            text: "v1.5"
+            size_hint_x: 0.40
+        Button:
+            text: "MORE"
+            size_hint_x: 0.30
             font_size: "11sp"
-            color: C("#4A5270")
-            halign: "right"
-            valign: "middle"
-            text_size: self.size
-            size_hint_x: 0.25
+            bold: True
+            color: C("#FFD740")
+            background_normal: ""
+            background_down: ""
+            background_color: (0, 0, 0, 0)
+            on_release: root.show_more_menu()
+            canvas.before:
+                Color:
+                    rgba: C("#1A2035")
+                RoundedRectangle:
+                    pos: (self.x + dp(4), self.y + dp(4))
+                    size: (self.width - dp(8), self.height - dp(8))
+                    radius: [dp(8)]
         Button:
             text: "HISTORY"
-            size_hint_x: 0.25
+            size_hint_x: 0.30
             font_size: "11sp"
             bold: True
             color: C("#00E5FF")
@@ -2082,6 +2097,9 @@ class RootUI(BoxLayout):
         # Phase 5
         self._plate_ocr = None
         self._ocr_accepted_plate = ""
+        # Phase 6 — citizen features
+        self._privacy_blur = False
+        self._dup_ack = False
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -2339,6 +2357,17 @@ class RootUI(BoxLayout):
                         if img is not None:
                             enhanced = AnalyticsEngine.clahe(img)
                             cv2.imwrite(fpath, enhanced)
+                    except Exception:
+                        pass
+
+                # Phase 6: Optional privacy blur of bystander faces (opt-in via
+                # MORE menu; off by default because a rider's head can itself be
+                # evidence of a helmet/phone violation).
+                if getattr(self, "_privacy_blur", False) and cv2:
+                    try:
+                        img = cv2.imread(fpath)
+                        if img is not None:
+                            cv2.imwrite(fpath, PrivacyBlur.blur_faces(img))
                     except Exception:
                         pass
 
@@ -2610,6 +2639,22 @@ class RootUI(BoxLayout):
             self._popup("No route", "Unknown state code.")
             return
 
+        # Phase 6: warn on near-duplicate (same plate+offense, close in time/space)
+        if not getattr(self, "_dup_ack", False) and self._report_log:
+            try:
+                entries = self._report_log.read_all()
+            except Exception:
+                entries = []
+            if DuplicateGuard.is_duplicate(entries, plate, okey, lat, lon):
+                self._dup_ack = True
+                self._popup(
+                    "Duplicate",
+                    "A matching report for %s was just filed nearby.\n"
+                    "Tap SEND again to submit anyway." % plate,
+                )
+                return
+        self._dup_ack = False
+
         o = TrafficLawDB.OFFENSES[okey]
         anon = bool(self.ids.sw_anon.active)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2640,6 +2685,7 @@ class RootUI(BoxLayout):
             "plate": plate, "offense": okey, "section": o["section"],
             "lat": lat, "lon": lon, "speed_kmh": self.latest_speed * 3.6,
             "g_dyn": self.latest_g, "recipients": to, "subject": subj,
+            "ts": time.time(),  # for duplicate detection
             "evidence": self.evidence_path,
             "evidence_hash": EvidenceHasher.hash_file(self.evidence_path) if self.evidence_path else "",
         }
@@ -2715,6 +2761,267 @@ class RootUI(BoxLayout):
             ))
         title = "History (%d of %d)" % (min(len(entries), 10), len(entries))
         self._popup(title, "\n\n".join(lines), tall=True)
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Phase 6 — citizen features (menu + handlers)
+    # ═════════════════════════════════════════════════════════════════════
+    def _menu_button(self, text, cb):
+        from kivy.uix.button import Button
+        b = Button(
+            text=text, size_hint_y=None, height=dp(46), font_size="14sp",
+            bold=True, color=(0.9, 0.93, 0.97, 1),
+            background_normal="", background_down="",
+            background_color=(0.10, 0.12, 0.20, 1),
+        )
+        b.bind(on_release=lambda *_: cb())
+        return b
+
+    def show_more_menu(self):
+        from kivy.uix.scrollview import ScrollView
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        blur_lbl = "Privacy blur (faces): %s" % ("ON" if self._privacy_blur else "OFF")
+        lang_lbl = "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English")
+        items = [
+            ("Share to X / Twitter", self.share_twitter),
+            ("Share to WhatsApp", self.share_whatsapp),
+            ("Vehicle lookup (RC/Insurance/PUC)", self.vehicle_lookup),
+            ("Report a road hazard", self.report_hazard),
+            ("SOS / Emergency", self.show_sos),
+            ("Violation hotspots", self.show_hotspots),
+            (blur_lbl, self.toggle_privacy_blur),
+            (lang_lbl, self.toggle_language),
+        ]
+        for text, cb in items:
+            box.add_widget(self._menu_button(text, cb))
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        self._menu_popup = Popup(
+            title="More — Citizen Tools", content=scroll,
+            size_hint=(0.9, 0.8), title_size="15sp",
+            title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _close_menu(self):
+        if getattr(self, "_menu_popup", None):
+            try:
+                self._menu_popup.dismiss()
+            except Exception:
+                pass
+
+    # ── context helpers ──────────────────────────────────────────────────
+    def _ctx(self):
+        plate = self.ids.in_plate.text.strip()
+        okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
+        label = TrafficLawDB.OFFENSES.get(okey, {}).get("label", "")
+        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        sc = JurisdictionEngine.extract_state_code(plate) or \
+            JurisdictionEngine._resolve_state(float(self.latest_lat), float(self.latest_lon))
+        return plate, label, loc, sc
+
+    def _open_url(self, url):
+        """Open a URL via an Android intent, else the desktop browser."""
+        if platform == "android" and autoclass is not None:
+            try:
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                i = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                act.startActivity(i)
+                return True
+            except Exception:
+                return False
+        try:
+            import webbrowser
+            return webbrowser.open(url)
+        except Exception:
+            return False
+
+    def _android_intent(self, action, uri, extras=None):
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = Intent(action, Uri.parse(uri))
+            for k, v in (extras or {}).items():
+                i.putExtra(k, v)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            act.startActivity(i)
+            return True
+        except Exception:
+            return False
+
+    # ── share channels ───────────────────────────────────────────────────
+    def share_twitter(self):
+        self._close_menu()
+        plate, label, loc, sc = self._ctx()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        text = ReportChannels.compose(plate, label, loc, sc)
+        if not self._open_url(ReportChannels.twitter_url(text)):
+            self._popup("Unavailable", "Could not open X/Twitter.")
+
+    def share_whatsapp(self):
+        self._close_menu()
+        plate, label, loc, sc = self._ctx()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        text = ReportChannels.compose(plate, label, loc, sc)
+        if not self._open_url(ReportChannels.whatsapp_url(text)):
+            self._popup("Unavailable", "WhatsApp not installed.")
+
+    # ── vehicle lookup ───────────────────────────────────────────────────
+    def vehicle_lookup(self):
+        self._close_menu()
+        plate = self.ids.in_plate.text.strip()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        if not VehicleLookup.available():
+            self._popup(
+                "Lookup",
+                "No vehicle-data provider configured.\n\n"
+                "Set SENTINELX_VAHAN_URL to an endpoint that accepts ?plate= "
+                "and returns JSON (RC, insurance, PUC).",
+            )
+            return
+        self._popup("Lookup", "Querying vehicle records for %s..." % plate)
+        threading.Thread(target=self._vehicle_lookup_worker,
+                         args=(plate,), daemon=True).start()
+
+    def _vehicle_lookup_worker(self, plate):
+        res = VehicleLookup.lookup(plate)
+
+        def show(_dt):
+            if not res.get("ok"):
+                self._popup("Lookup failed", res.get("error", "unknown error"))
+                return
+            msg = "\n".join([
+                "Owner: %s" % (res.get("owner") or DASH),
+                "Model: %s" % (res.get("model") or DASH),
+                "RC: %s" % (res.get("rc_status") or DASH),
+                "Insurance: %s" % (res.get("insurance") or DASH),
+                "PUC: %s" % (res.get("puc") or DASH),
+                "Registered: %s" % (res.get("registered") or DASH),
+            ])
+            self._popup("Vehicle %s" % plate, msg, tall=True)
+        Clock.schedule_once(show, 0)
+
+    # ── road-hazard reporting (municipal) ────────────────────────────────
+    def report_hazard(self):
+        self._close_menu()
+        from kivy.uix.scrollview import ScrollView
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        for cat in HazardReport.CATEGORIES:
+            box.add_widget(self._menu_button(cat, lambda c=cat: self._send_hazard(c)))
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        self._menu_popup = Popup(
+            title="Report a hazard", content=scroll, size_hint=(0.9, 0.8),
+            title_size="15sp", title_color=(1, 0.84, 0.25, 1),
+            separator_color=(1, 0.84, 0.25, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _send_hazard(self, category):
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        notes = self.ids.in_notes.text.strip()
+        subj = HazardReport.subject(category, loc)
+        body = HazardReport.body(category, lat, lon, loc, notes)
+        opened = False
+        if plyer_email is not None:
+            try:
+                plyer_email.send(subject=subj, text=body, create_chooser=True)
+                opened = True
+            except Exception:
+                opened = False
+        if not opened:
+            # Fall back to the national grievance portal
+            self._open_url(HazardReport.CPGRAMS_PORTAL)
+        self._popup("Hazard", "Hazard report prepared:\n%s" % category)
+
+    # ── SOS / emergency ──────────────────────────────────────────────────
+    def show_sos(self):
+        self._close_menu()
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
+                        size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        actions = [
+            ("Call 112 (Emergency)", lambda: self._dial(CivicDirectory.EMERGENCY)),
+            ("Call 108 (Ambulance)", lambda: self._dial(CivicDirectory.AMBULANCE)),
+            ("Report accident (Good Samaritan)", self._good_samaritan),
+            ("Share my location (SMS)", lambda: self._sos_sms(lat, lon)),
+        ]
+        for text, cb in actions:
+            box.add_widget(self._menu_button(text, cb))
+        self._menu_popup = Popup(
+            title="SOS / Emergency", content=box, size_hint=(0.9, 0.55),
+            title_size="15sp", title_color=(1, 0.32, 0.32, 1),
+            separator_color=(1, 0.32, 0.32, 1),
+            background_color=(0.08, 0.09, 0.15, 0.96),
+        )
+        self._menu_popup.open()
+
+    def _dial(self, number):
+        # Intent action constants are plain strings, so no autoclass on desktop.
+        self._close_menu()
+        if not self._android_intent("android.intent.action.DIAL", "tel:" + str(number)):
+            self._popup("Dial", "Call %s" % number)
+
+    def _sos_sms(self, lat, lon):
+        self._close_menu()
+        text = Emergency.sos_text(lat, lon)
+        if not self._android_intent("android.intent.action.SENDTO", "smsto:",
+                                    {"sms_body": text}):
+            self._popup("SOS", text)
+
+    def _good_samaritan(self):
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        self._popup(
+            "Good Samaritan",
+            "Reporting an accident under Sec.134A protection.\n\n%s\n\n"
+            "Use SOS to call 112/108." % Emergency.good_samaritan_text(lat, lon),
+            tall=True,
+        )
+
+    # ── hotspots, privacy, language ──────────────────────────────────────
+    def show_hotspots(self):
+        self._close_menu()
+        entries = self._report_log.read_all() if self._report_log else []
+        spots = ViolationHeatmap.hotspots(entries)
+        if not spots:
+            self._popup("Hotspots", "Not enough reports yet to map hotspots.")
+            return
+        lines = ["%d report(s) near %.3f, %.3f" % (s["count"], s["lat"], s["lon"])
+                 for s in spots]
+        self._popup("Violation hotspots", "\n\n".join(lines), tall=True)
+
+    def toggle_privacy_blur(self):
+        self._privacy_blur = not self._privacy_blur
+        self._close_menu()
+        self._popup("Privacy", "Face blur on capture: %s"
+                    % ("ON" if self._privacy_blur else "OFF"))
+
+    def toggle_language(self):
+        I18N.set_lang("hi" if I18N.LANG == "en" else "en")
+        self._close_menu()
+        self._popup(I18N.tr("Ready"),
+                    "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English"))
 
     def _popup(self, t, m, tall=False):
         # Determine accent color based on popup type
