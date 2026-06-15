@@ -92,8 +92,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Annotations (visible on the run summary even without log access)
-          grep -i -E "$PAT" /tmp/build.log | tail -n 8 | while IFS= read -r line; do
+          # Identify the failing package: context just before the build failure
+          FAILLINE=$(grep -n -E "ninja: build stopped|Backend subprocess exited|Command failed" /tmp/build.log | head -n 1 | cut -d: -f1)
+          if [ -n "$FAILLINE" ]; then
+            START=$(( FAILLINE > 60 ? FAILLINE - 60 : 1 ))
+            echo "===================== CONTEXT BEFORE FAILURE ====================="
+            sed -n "${START},${FAILLINE}p" /tmp/build.log
+            {
+              echo "### Context before failure (60 lines)"
+              echo '```'
+              sed -n "${START},${FAILLINE}p" /tmp/build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Annotations: package-identifying lines + error lines (readable without log access)
+          grep -E "Building wheel|Preparing metadata|other_builds/|python-installs|Building recipe|Cythonizing|Downloading .*\.(tar|whl|zip)|Getting build dependencies|^Processing |Building compiled components|recipe .* for" /tmp/build.log \
+            | tail -n 6 | while IFS= read -r line; do echo "::error::PKG: ${line}"; done || true
+          grep -i -E "$PAT" /tmp/build.log | tail -n 6 | while IFS= read -r line; do
             echo "::error::${line}"
           done || true
 
