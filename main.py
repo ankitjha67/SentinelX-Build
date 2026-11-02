@@ -661,7 +661,7 @@ class PlateOCR:
     def candidates(self):
         """Distinct plates from recent live reads, most frequent first."""
         with self._lock:
-            votes = list(self._votes)
+            votes = [v for v in self._votes if v]
         return sorted(set(votes), key=lambda p: (-votes.count(p), votes[::-1].index(p)))
 
     def box(self):
@@ -1003,8 +1003,11 @@ class PlateOCR:
 
         with self._lock:
             self._region_found = chars >= 4
+            # Every completed read advances the window (None = no plate), so
+            # an old one-off misread ages out instead of pairing with a match
+            # read much later.
+            self._votes.append(plate if conf > 0.5 else None)
             if conf > 0.5:
-                self._votes.append(plate)
                 confirmed = self._votes.count(plate) >= self.VOTES_NEEDED
                 if confirmed:
                     self._last_plate = plate
@@ -1313,8 +1316,12 @@ class DashcamRecorder:
         writer, no ffmpeg needed). Returns (path, frame_count) or ("", 0)."""
         if cv2 is None:
             return "", 0
+        # The deque bounds frame count, not age: after recording pauses
+        # (power saving) it still holds old frames, which must not be saved
+        # under a new incident timestamp.
+        cutoff = time.time() - self.CLIP_SECONDS
         with self._clip_lock:
-            frames = list(self._clip)
+            frames = [f for f in self._clip if f[0] >= cutoff]
         if len(frames) < 2:
             return "", 0
         try:
@@ -3403,6 +3410,9 @@ class RootUI(BoxLayout):
             "ts": time.time(),  # for duplicate detection
             "evidence": self.evidence_path,
             "evidence_hash": EvidenceHasher.hash_file(self.evidence_path) if self.evidence_path else "",
+            # Lets a queued retry re-attach THIS report's photo
+            "evidence_uri": (self._evidence_uri.toString()
+                             if getattr(self, "_evidence_uri", None) is not None else ""),
         }
 
         if self._send_email(to, subj, body, getattr(self, "_evidence_uri", None)):
@@ -3422,6 +3432,22 @@ class RootUI(BoxLayout):
             self._popup("Failed", "No email app available.")
 
     # ── Phase 3: Queued report sender callback ──────────────────────────
+    def _queued_evidence_uri(self, report):
+        """Content URI for a queued report's own photo: the URI saved with
+        it, else re-publish its evidence file. Never the current form's
+        photo, which may belong to a different report."""
+        if platform != "android" or autoclass is None:
+            return None
+        try:
+            if report.get("evidence_uri"):
+                return autoclass("android.net.Uri").parse(report["evidence_uri"])
+            path = report.get("evidence") or ""
+            if path and os.path.isfile(path):
+                return self._publish_to_gallery(path)
+        except Exception:
+            pass
+        return None
+
     def _send_queued_report(self, report):
         """Attempt to send a queued report. Returns True on success."""
         try:
@@ -3430,7 +3456,7 @@ class RootUI(BoxLayout):
             body = report.get("body", "")
             if not to or not body:
                 return False
-            if not self._send_email(to, subj, body):
+            if not self._send_email(to, subj, body, self._queued_evidence_uri(report)):
                 return False
             # Log the sent report
             if self._report_log:
