@@ -80,27 +80,33 @@ jobs:
           fi
           grep -E '^version|^android.numeric_version' buildozer.spec
 
-      # Every fresh runner generates a new ~/.android/debug.keystore, so each
-      # build had a different signature and could not install over the
-      # previous one (OTA updates failed with "App not installed"). Restore a
-      # persistent key from a repository secret instead.
-      - name: Stable signing key
-        env:
-          DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
-        run: |
-          mkdir -p ~/.android
-          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
-            echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
-            echo "Using the persistent signing key from secrets."
-          else
-            echo "::warning::ANDROID_DEBUG_KEYSTORE_B64 secret is not set - this APK is signed with a throwaway key and cannot update a previously installed build."
-          fi
-
       - name: Build debug APK
         run: |
           set -o pipefail
           buildozer -v android debug 2>&1 | tee /tmp/build.log
         timeout-minutes: 45
+
+      # Gradle signs with a debug key it generates fresh on every runner, so
+      # each build had a different signature and could not install over the
+      # previous one (OTA updates failed with "App not installed"). Re-sign
+      # the APK with a persistent key kept in a repository secret.
+      - name: Sign APK with the persistent key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "::warning::ANDROID_DEBUG_KEYSTORE_B64 secret is not set - this APK is signed with a throwaway key and cannot update a previously installed build."
+            exit 0
+          fi
+          BT=$(ls -d ~/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+          KS=$(mktemp)
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$KS"
+          for apk in bin/*.apk; do
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android \
+              --ks-key-alias androiddebugkey --key-pass pass:android "$apk"
+            "$BT/apksigner" verify --print-certs "$apk" | grep -E "DN|SHA-256"
+          done
+          rm -f "$KS"
 
       - name: Build log diagnostics (on failure)
         if: failure()

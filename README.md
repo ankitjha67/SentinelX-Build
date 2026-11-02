@@ -103,7 +103,7 @@ setup.py build — newer p4a ships numpy 2.x which fails to cross-compile on NDK
 - **Hands-free flag** -- Double-press a volume key to save the last 15 s clip with no screen interaction
 - **Accident help** -- SOS shows the cashless-treatment entitlement (Rs 1.5 lakh / 7 days), a nearest-hospital map, and a Rah-Veer (Rs 25,000 Good Samaritan award) helper that records signed accident/hospital timestamps and drafts the application
 - **RTI + PDF evidence pack** -- RTI Act s.6(1) request draft for any report; one-file PDF with the summary, original photo and signed proof (`Download/SentinelX`)
-- **Stable APK signing in CI** -- Set the `ANDROID_DEBUG_KEYSTORE_B64` repository secret so every build is signed with the same key; otherwise builds cannot update each other (OTA fails)
+- **Stable APK signing in CI** -- CI re-signs the APK with the keystore in the `ANDROID_DEBUG_KEYSTORE_B64` repository secret (alias `androiddebugkey`), so every build can update the previous one; without it Gradle signs with a fresh throwaway key and OTA updates fail
 
 ### UI/UX
 - **Dark Theme** -- Custom design system (#0B0E17 background, cyan/green/amber/red accents)
