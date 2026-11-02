@@ -28,11 +28,176 @@ except Exception:
 # Directories: action-oriented reporting channels + emergency numbers
 # ─────────────────────────────────────────────────────────────────────────
 class CivicDirectory:
-    """Extra reporting channels and helplines for citizen reports."""
+    """Police reporting channels per state/UT, keyed by RTO registration code.
 
-    # Verified, widely-used traffic-police X/Twitter handles. Tagging these is
-    # the channel that most reliably gets action in Indian cities. Best-effort;
-    # empty entries simply omit a handle from the post.
+    Every email below was seen on an official government page (Nov 2026),
+    recorded in SOURCES. Where a state publishes no traffic-specific inbox,
+    the closest official channel is used and labelled in the comment. Some
+    official channels are Gmail addresses (e.g. Goa's Traffic Sentinel
+    scheme); they are included only because an official page lists them.
+    States with no published email at all are in NO_EMAIL, never guessed.
+    """
+
+    EMAILS = {
+        # ── States with a traffic-branch address ─────────────────────────
+        "DL": ["grievance.traffic@delhipolice.gov.in"],               # Delhi Traffic Police grievances
+        "MH": ["cp.mumbai.jtcp.traf@mahapolice.gov.in",               # Jt CP Traffic, Mumbai
+               "adg.traffic.hsp@mahapolice.gov.in"],                  # ADGP Traffic (Highway Police), statewide
+        "KA": ["automationpubbcp@ksp.gov.in"],                        # Bengaluru TP citizen violation inbox
+        "UP": ["dirtraffic@nic.in"],                                  # UP Traffic Directorate (traffic/challan complaints)
+        "HR": ["sp.traffic@hry.nic.in",                               # SP Traffic, Haryana
+               "dcp.trafficggn@hry.nic.in"],                          # DCP Traffic, Gurugram
+        "KL": ["sptrafficsz.pol@kerala.gov.in",                       # SP Traffic, South Zone
+               "sptrafficnz.pol@kerala.gov.in"],                      # SP Traffic, North Zone
+        "GJ": ["dcp-traffic-ahd@gujarat.gov.in",                      # DCP Traffic, Ahmedabad
+               "dgp-stb-br@gujarat.gov.in"],                          # IGP State Traffic Branch
+        "WB": ["dctp@kolkatatrafficpolice.gov.in"],                   # DC Traffic, Kolkata
+        "TS": ["jtcp-trf-hyd@tspolice.gov.in",                        # Jt CP Traffic, Hyderabad
+               "jtcp-cyb@tspolice.gov.in"],                           # Jt CP Traffic, Cyberabad
+        "PB": ["igp.traffic.police@punjab.gov.in",                    # IGP Traffic, Punjab
+               "tfcwing.police@punjab.gov.in"],                       # Punjab Police Traffic Wing
+        "RJ": ["adgp.traffic@rajpolice.gov.in"],                      # ADGP Traffic, Rajasthan
+        "GA": ["sptrafficgoa@gmail.com"],                             # Goa Traffic Sentinel scheme (official)
+        "MP": ["dcp.traffic.bhopal@mppolice.gov.in",                  # DCP Traffic, Bhopal
+               "dcp.traffic.indore@mppolice.gov.in"],                 # DCP Traffic, Indore
+        "UK": ["sptrfdad.ukp@uttarakhandpolice.uk.gov.in"],           # SP Traffic, Dehradun
+        "CH": ["psspst@chd.nic.in"],                                  # SSP Security & Traffic, Chandigarh
+        "JK": ["igtraffic@jkpolice.gov.in"],                          # IGP Traffic, J&K
+        "LA": ["sp-traffic@police.ladakh.gov.in"],                    # Traffic Police, Leh
+        "BR": ["adgtraffic-bih@gov.in",                               # ADG Traffic, Bihar
+               "sptraffic-bih@gov.in"],                               # SP Traffic, Patna
+        "JH": ["sptraffic-ranchi@jhpolice.gov.in"],                   # SP Traffic, Ranchi
+        "OD": ["dcp-traffic.odpol@od.gov.in"],                        # DCP Traffic, Bhubaneswar-Cuttack
+        "TR": ["traffic@tripurapolice.nic.in"],                       # Tripura Traffic Police
+        "PY": ["ssptraffic@py.gov.in"],                               # SSP Traffic, Puducherry
+        # ── No traffic inbox published: nearest official police channel ──
+        "AP": ["cp@vza.appolice.gov.in",                              # Commissioner, Vijayawada
+               "cp@vspc.appolice.gov.in"],                            # Commissioner, Visakhapatnam
+        "AS": ["jcp-guw@assampolice.gov.in"],                         # Joint CP, Guwahati
+        "HP": ["dgp-hp@nic.in"],                                      # DGP office, HP
+        "SK": ["pcr@sikkimpolice.nic.in"],                            # Police Control Room, Sikkim
+        "ML": ["phq-meg@nic.in"],                                     # Police HQ, Meghalaya
+        "AR": ["cc-polita-arn@nic.in"],                               # Police HQ control room, Itanagar
+        "MN": ["dgcrmanipur100@gmail.com"],                           # DG Control Room, Imphal (official)
+        "NL": ["scrb-ngl@nic.in"],                                    # Police HQ, Kohima
+        "LD": ["lak-sop@nic.in"],                                     # SP Lakshadweep
+        "DD": ["sp-daman-dd@nic.in",                                  # SP Daman
+               "sp-sil-dnh@nic.in"],                                  # SP Dadra & Nagar Haveli
+    }
+
+    # City traffic offices that differ from the state default. Inside a
+    # city's radius the report goes to that city's traffic wing instead of
+    # the state list (e.g. Pune vs Mumbai, Cyberabad vs Hyderabad).
+    # (name, state, lat, lon, radius_km, emails, official source)
+    CITIES = [
+        ("Mumbai", "MH", 19.0760, 72.8777, 25, ["cp.mumbai.jtcp.traf@mahapolice.gov.in",
+                                              "multimediacell.traffic@mahapolice.gov.in"],
+         "https://trafficpolicemumbai.maharashtra.gov.in/en/contact-us/"),
+        ("Pune", "MH", 18.5204, 73.8567, 20, ["dcptraffic.pune@nic.in"],
+         "https://punepolice.gov.in/about-us/senior-officers"),
+        ("Bengaluru", "KA", 12.9716, 77.5946, 25, ["automationpubbcp@ksp.gov.in"],
+         "https://btp.karnataka.gov.in/105/contactless-enforcement/en"),
+        ("Hyderabad", "TS", 17.3850, 78.4867, 10, ["jtcp-trf-hyd@tspolice.gov.in"],
+         "https://www.hyderabadpolice.gov.in/Important_Contacts.html"),
+        ("Cyberabad", "TS", 17.4483, 78.3915, 15, ["jtcp-cyb@tspolice.gov.in"],
+         "https://cyberabadpolice.gov.in/Preview?page_id=54"),
+        ("Ahmedabad", "GJ", 23.0225, 72.5714, 20, ["dcp-traffic-ahd@gujarat.gov.in",
+                                                 "adcp-traffic-ahd@gujarat.gov.in"],
+         "https://police.gujarat.gov.in/upload/IPS_Civil_List-2026_Web18022026.pdf"),
+        ("Surat", "GJ", 21.1702, 72.8311, 18, ["dcp-traffic-sur@gujarat.gov.in"],
+         "https://police.gujarat.gov.in/upload/IPS_Civil_List-2026_Web18022026.pdf"),
+        ("Rajkot", "GJ", 22.3039, 70.8022, 15, ["dcp-trf-raj@gujarat.gov.in"],
+         "https://police.gujarat.gov.in/upload/IPS_Civil_List-2026_Web18022026.pdf"),
+        ("Bhopal", "MP", 23.2599, 77.4126, 18, ["dcp.traffic.bhopal@mppolice.gov.in"],
+         "https://bhopal.mppolice.gov.in/contact/"),
+        ("Indore", "MP", 22.7196, 75.8577, 18, ["dcp.traffic.indore@mppolice.gov.in"],
+         "https://indore.mppolice.gov.in/contact/"),
+        ("Gurugram", "HR", 28.4595, 77.0266, 15, ["dcp.trafficggn@hry.nic.in"],
+         "https://haryanapolice.gov.in/static/TelephoneDirectory_cpggn.aspx"),
+        ("Kochi", "KL", 9.9312, 76.2673, 15, ["dcpekm.pol@kerala.gov.in"],
+         "https://kochicity.keralapolice.gov.in/contacts"),
+        ("Thiruvananthapuram", "KL", 8.5241, 76.9366, 12, ["dcptvclo.pol@kerala.gov.in"],
+         "https://tvmcity.keralapolice.gov.in/contacts"),
+        ("Patna", "BR", 25.5941, 85.1376, 15, ["sptraffic-bih@gov.in"],
+         "https://police.bihar.gov.in/En/Traffic.aspx"),
+        ("Ranchi", "JH", 23.3441, 85.3096, 15, ["sptraffic-ranchi@jhpolice.gov.in"],
+         "https://www.jhpolice.gov.in/imp-contacts"),
+        ("Bhubaneswar-Cuttack", "OD", 20.3700, 85.8500, 22, ["dcp-traffic.odpol@od.gov.in"],
+         "https://bhubaneswarcuttackpolice.gov.in/important-contact-number"),
+        ("Dehradun", "UK", 30.3165, 78.0322, 12, ["sptrfdad.ukp@uttarakhandpolice.uk.gov.in"],
+         "https://dehraduntrafficpolice.uk.gov.in/WebInformationManager"),
+        ("Kolkata", "WB", 22.5726, 88.3639, 15, ["dctp@kolkatatrafficpolice.gov.in"],
+         "https://www.kolkatatrafficpolice.gov.in/"),
+        ("Vijayawada", "AP", 16.5062, 80.6480, 15, ["cp@vza.appolice.gov.in"],
+         "https://ntr.ap.gov.in/about-district/whos-who/"),
+        ("Visakhapatnam", "AP", 17.6868, 83.2185, 18, ["cp@vspc.appolice.gov.in"],
+         "https://negd.gov.in/isl/Directory/statedata/716"),
+        ("Guwahati", "AS", 26.1445, 91.7362, 15, ["jcp-guw@assampolice.gov.in"],
+         "https://police.assam.gov.in/contact-us"),
+        ("Jaipur", "RJ", 26.9124, 75.7873, 18, ["cp.jaipur@rajpolice.gov.in"],
+         "https://police.rajasthan.gov.in/portal/Directory"),
+    ]
+
+    # Official WhatsApp numbers for photo reports (international format).
+    WHATSAPP = {
+        "GA": ("917875756110", "Goa Traffic Sentinel scheme, citizen.goapolice.gov.in"),
+        "TR": ("919402303100", "https://trafficpolice.tripura.gov.in/contact-us"),
+        "DL": ("918750871493", "Delhi Traffic Police official Facebook page"),
+    }
+
+    # No official email found anywhere: point the reporter to these instead.
+    NO_EMAIL = {
+        "TN": "Greater Chennai Traffic Police on X (@ChennaiTraffic) or the "
+              "TN Police citizen portal (police.tn.gov.in/citizenportal)",
+        "CG": "Chhattisgarh Police traffic helpline 1073 or CPGRAMS",
+        "MZ": "Mizoram Police feedback form (police.mizoram.gov.in) or CPGRAMS",
+        "AN": "A&N Traffic Police WhatsApp 9531892228 or CPGRAMS",
+    }
+
+    CPGRAMS_PORTAL = "https://pgportal.gov.in/"
+
+    SOURCES = {
+        "DL": "https://traffic.delhipolice.gov.in/en/contact-us",
+        "MH": "https://trafficpolicemumbai.maharashtra.gov.in/en/contact-us/ ; "
+              "https://highwaypolice.maharashtra.gov.in/contact-us/",
+        "KA": "https://btp.karnataka.gov.in/105/contactless-enforcement/en",
+        "UP": "https://uppolice.gov.in/pages/en/topmenu/en-contact-us/en-contact-us",
+        "HR": "https://haryanapolice.gov.in/static/TelephoneDirectory_Traffic.aspx ; "
+              "https://haryanapolice.gov.in/static/TelephoneDirectory_cpggn.aspx",
+        "KL": "https://keralapolice.gov.in/page/rank-wise-details",
+        "GJ": "https://police.gujarat.gov.in/upload/IPS_Civil_List-2026_Web18022026.pdf",
+        "WB": "https://www.kolkatatrafficpolice.gov.in/",
+        "TS": "https://www.hyderabadpolice.gov.in/Important_Contacts.html ; "
+              "https://cyberabadpolice.gov.in/Preview?page_id=54",
+        "PB": "https://www.punjabpolice.gov.in/en/contact-us/punjab-police-officer/",
+        "RJ": "https://police.rajasthan.gov.in/portal/Directory",
+        "GA": "https://citizen.goapolice.gov.in/ (Traffic Sentinel Scheme FAQ)",
+        "MP": "https://bhopal.mppolice.gov.in/contact/ ; https://indore.mppolice.gov.in/contact/",
+        "UK": "https://dehraduntrafficpolice.uk.gov.in/WebInformationManager",
+        "CH": "https://negd.gov.in/isl/Directory/statedata/572",
+        "JK": "https://jkpolice.gov.in/JK-Traffic-Police",
+        "LA": "https://police.ladakh.gov.in/pages/contact.html",
+        "BR": "https://police.bihar.gov.in/En/Traffic.aspx",
+        "JH": "https://www.jhpolice.gov.in/imp-contacts",
+        "OD": "https://bhubaneswarcuttackpolice.gov.in/important-contact-number",
+        "TR": "https://trafficpolice.tripura.gov.in/contact-us",
+        "PY": "https://police.py.gov.in/senior-officer-address.php",
+        "AP": "https://ntr.ap.gov.in/about-district/whos-who/ ; "
+              "https://negd.gov.in/isl/Directory/statedata/716",
+        "AS": "https://police.assam.gov.in/contact-us",
+        "HP": "https://citizenportal.hppolice.gov.in/citizen/contactus.htm",
+        "SK": "https://police.sikkim.gov.in/visitor/citizencharter",
+        "ML": "https://megpolice.gov.in/telephone-directory",
+        "AR": "https://arunpol.nic.in/contactus.html",
+        "MN": "https://manipurpolice.gov.in/",
+        "NL": "https://police.nagaland.gov.in/contact-us/",
+        "LD": "https://www.lakshadweeppolice.gov.in/downloads/citizen_charter_v2.pdf",
+        "DD": "https://police.ddd.gov.in/?p=194",
+    }
+
+    # Traffic / state police X handles. Tagging these is the channel that
+    # most reliably gets action. New entries are handles linked from the
+    # force's own official website; empty lists simply omit a tag.
     TWITTER = {
         "DL": ["@dtptraffic"],
         "MH": ["@MTPHereToHelp"],
@@ -47,7 +212,39 @@ class CivicDirectory:
         "PB": [],
         "RJ": ["@jaipur_police"],
         "GA": ["@Goapolice"],
+        "MP": ["@MPPoliceDeptt"],
+        "UK": ["@sptrafficdoon", "@uttarakhandcops"],
+        "HP": ["@himachalpolice"],
+        "CH": ["@ChdPol"],
+        "LA": ["@trafficpoliceLA"],
+        "BR": ["@bihar_police"],
+        "JH": ["@jharkhandpolice"],
+        "SK": ["@sikkim_police"],
+        "ML": ["@MeghalayaPolice"],
+        "AR": ["@dgppradesh"],
+        "MN": ["@manipur_police"],
+        "PY": ["@PuducheryPolice"],
+        "DD": ["@dddutpolice"],
     }
+
+    STATE_NAME_TO_CODE = {
+        "Delhi": "DL", "National Capital Territory of Delhi": "DL",
+        "Maharashtra": "MH", "Karnataka": "KA", "Tamil Nadu": "TN",
+        "Uttar Pradesh": "UP", "Haryana": "HR", "Kerala": "KL",
+        "Gujarat": "GJ", "West Bengal": "WB", "Telangana": "TS",
+        "Punjab": "PB", "Rajasthan": "RJ", "Goa": "GA",
+        "Madhya Pradesh": "MP", "Chhattisgarh": "CG", "Himachal Pradesh": "HP",
+        "Uttarakhand": "UK", "Chandigarh": "CH", "Jammu and Kashmir": "JK",
+        "Ladakh": "LA", "Bihar": "BR", "Jharkhand": "JH", "Odisha": "OD",
+        "Assam": "AS", "Sikkim": "SK", "Meghalaya": "ML", "Tripura": "TR",
+        "Manipur": "MN", "Mizoram": "MZ", "Nagaland": "NL",
+        "Arunachal Pradesh": "AR", "Andhra Pradesh": "AP", "Puducherry": "PY",
+        "Andaman and Nicobar Islands": "AN", "Lakshadweep": "LD",
+        "Dadra and Nagar Haveli and Daman and Diu": "DD",
+    }
+    # Legacy registration codes that route like their canonical state
+    # (Odisha plates before 2012 read "OR"; old DNH plates read "DN").
+    CODE_ALIASES = {"OR": "OD", "DN": "DD"}
 
     # National emergency / helpline numbers
     EMERGENCY = "112"        # unified emergency
@@ -56,8 +253,93 @@ class CivicDirectory:
     WOMEN = "1091"           # women's helpline
 
     @staticmethod
+    def canonical(state_code):
+        sc = (state_code or "").upper()
+        return CivicDirectory.CODE_ALIASES.get(sc, sc)
+
+    @staticmethod
+    def emails(state_code):
+        return list(CivicDirectory.EMAILS.get(CivicDirectory.canonical(state_code), []))
+
+    # ── Over-the-air directory updates ───────────────────────────────────
+    # CI publishes this file with each release (see export_directory), so a
+    # changed police address reaches devices without a new APK.
+    DIRECTORY_URL = ("https://github.com/ankitjha67/SentinelX-Build/releases/"
+                     "latest/download/directory.json")
+    _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+    @classmethod
+    def export_directory(cls):
+        return {
+            "schema": 1,
+            "emails": cls.EMAILS,
+            "no_email": cls.NO_EMAIL,
+            "whatsapp": {k: list(v) for k, v in cls.WHATSAPP.items()},
+            "cities": [list(c) for c in cls.CITIES],
+        }
+
+    @classmethod
+    def apply_overrides(cls, data):
+        """Validate and apply a downloaded directory. Anything malformed is
+        rejected wholesale (returns False) so a bad file can never blank or
+        corrupt routing; unknown state codes are ignored."""
+        try:
+            if not isinstance(data, dict) or data.get("schema") != 1:
+                return False
+            codes = set(cls.STATE_NAME_TO_CODE.values())
+            emails = {}
+            for code, lst in data.get("emails", {}).items():
+                if code not in codes:
+                    continue
+                if (not isinstance(lst, list) or not 1 <= len(lst) <= 5
+                        or not all(isinstance(e, str) and cls._EMAIL_RE.match(e)
+                                   for e in lst)):
+                    return False
+                emails[code] = list(lst)
+            if len(emails) < len(cls.EMAILS) // 2:
+                return False  # suspiciously small: keep the built-in copy
+            cities = []
+            for c in data.get("cities", []):
+                name, state, la, lo, rad, lst, src = c
+                if (state not in codes or not 1 <= float(rad) <= 60
+                        or not all(cls._EMAIL_RE.match(e) for e in lst)):
+                    return False
+                cities.append((str(name), state, float(la), float(lo), float(rad),
+                               list(lst), str(src)))
+            wa = {}
+            for code, (num, src) in data.get("whatsapp", {}).items():
+                if code in codes and re.match(r"^\d{11,13}$", str(num)):
+                    wa[code] = (str(num), str(src))
+            no_email = {k: str(v) for k, v in data.get("no_email", {}).items()
+                        if k in codes and k not in emails}
+        except Exception:
+            return False
+        cls.EMAILS.clear()
+        cls.EMAILS.update(emails)
+        cls.NO_EMAIL.clear()
+        cls.NO_EMAIL.update(no_email)
+        cls.WHATSAPP.clear()
+        cls.WHATSAPP.update(wa)
+        if cities:
+            cls.CITIES[:] = cities
+        return True
+
+    @staticmethod
+    def city_for(lat, lon):
+        """Nearest configured city whose radius contains (lat, lon), as a
+        dict, or None. Overlapping cities resolve to the closer centre."""
+        best, best_d = None, float("inf")
+        for name, state, cla, clo, rad_km, emails, src in CivicDirectory.CITIES:
+            d = haversine_m(lat, lon, cla, clo)
+            if d <= rad_km * 1000.0 and d < best_d:
+                best_d = d
+                best = {"name": name, "state": state, "emails": list(emails),
+                        "source": src, "distance_m": d}
+        return best
+
+    @staticmethod
     def handles(state_code):
-        return list(CivicDirectory.TWITTER.get((state_code or "").upper(), []))
+        return list(CivicDirectory.TWITTER.get(CivicDirectory.canonical(state_code), []))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -330,27 +612,165 @@ class DuplicateGuard:
 # Localisation (English + Hindi for key strings)
 # ─────────────────────────────────────────────────────────────────────────
 class I18N:
-    """Minimal runtime translation for Python-set strings (popups, labels)."""
+    """Runtime UI translation: English, Hindi, Marathi, Tamil, Kannada, Bengali.
+
+    Kivy's default font has no Indic glyphs and its renderer only shapes
+    Indic scripts when given a HarfBuzz script tag, so each language carries
+    the Android system Noto font and script code to render it with. Those
+    fonts have no Latin letters, so translations must not contain any (the
+    unit tests enforce this); text with plates/emails stays in the Latin
+    font (see main.RootUI._popup).
+    """
 
     LANG = "en"
-    SUPPORTED = ("en", "hi")
+    # code: (native name, Noto font family, HarfBuzz/ISO-15924 script)
+    LANGS = {
+        "en": ("English", None, "Zyyy"),
+        "hi": ("हिंदी", "Devanagari", "Deva"),
+        "mr": ("मराठी", "Devanagari", "Deva"),
+        "ta": ("தமிழ்", "Tamil", "Taml"),
+        "kn": ("ಕನ್ನಡ", "Kannada", "Knda"),
+        "bn": ("বাংলা", "Bengali", "Beng"),
+    }
+    SUPPORTED = tuple(LANGS)
+    FONT_DIR = "/system/fonts"
+
     STRINGS = {
         "hi": {
-            "Plate": "नंबर प्लेट",
-            "Offense": "अपराध",
-            "Notes": "टिप्पणी",
-            "SCAN": "स्कैन",
-            "CAPTURE": "कैप्चर",
-            "SEND": "भेजें",
-            "CLEAR": "साफ़ करें",
-            "Missing": "अधूरा",
+            "MORE": "और", "HISTORY": "इतिहास", "SETTINGS": "सेटिंग्स",
+            "Anonymous Reporter": "गुमनाम रिपोर्टर", "Night Mode": "रात्रि मोड",
+            "CV Assist": "दृष्टि सहायता", "Plate OCR": "प्लेट पहचान",
+            "VIOLATION REPORT": "उल्लंघन रिपोर्ट", "Plate": "नंबर प्लेट",
+            "Offense": "अपराध", "Sign": "संकेत", "Notes": "टिप्पणी",
+            "JURISDICTION ROUTING": "क्षेत्राधिकार", "SCAN": "स्कैन",
+            "CAPTURE": "फ़ोटो", "SEND": "भेजें", "CLEAR": "साफ़ करें",
+            "Plate OCR: standby": "प्लेट पहचान: तैयार", "Close": "बंद करें",
+            "OK": "ठीक है", "Missing": "अधूरा",
             "Enter plate number.": "नंबर प्लेट दर्ज करें।",
-            "Select a violation.": "उल्लंघन चुनें।",
-            "Ready": "तैयार",
-            "Email app opened.": "ईमेल ऐप खुल गया।",
-            "Duplicate": "डुप्लिकेट",
-            "Saved!": "सहेजा गया!",
-            "No route": "कोई मार्ग नहीं",
+            "Select a violation.": "उल्लंघन चुनें।", "Ready": "तैयार",
+            "Email app opened.": "ईमेल ऐप खुल गया।", "Saved!": "सहेजा गया!",
+            "Duplicate": "डुप्लिकेट", "No route": "कोई मार्ग नहीं",
+            "History": "इतिहास", "No reports sent yet.": "अभी तक कोई रिपोर्ट नहीं भेजी गई।",
+            "Language": "भाषा", "More - Citizen Tools": "और - नागरिक सुविधाएँ",
+            "Share to X / Twitter": "एक्स / ट्विटर पर साझा करें",
+            "Share to WhatsApp": "व्हाट्सऐप पर साझा करें",
+            "WhatsApp traffic police (official no.)": "ट्रैफ़िक पुलिस व्हाट्सऐप (आधिकारिक नंबर)",
+            "Vehicle lookup (RC/Insurance/PUC)": "वाहन जानकारी (आरसी/बीमा/प्रदूषण)",
+            "Report a road hazard": "सड़क खतरे की रिपोर्ट",
+            "SOS / Emergency": "आपातकाल", "Violation hotspots": "उल्लंघन हॉटस्पॉट",
+            "Save last 15 s as video clip": "पिछले 15 सेकंड का वीडियो सहेजें",
+            "Emergency contact (crash SOS)": "आपातकालीन संपर्क (दुर्घटना)",
+            "Check for app updates": "ऐप अपडेट जाँचें",
+            "Privacy blur (faces)": "चेहरे धुंधले करें", "ON": "चालू", "OFF": "बंद",
+        },
+        "mr": {
+            "MORE": "अधिक", "HISTORY": "इतिहास", "SETTINGS": "सेटिंग्ज",
+            "Anonymous Reporter": "निनावी तक्रारदार", "Night Mode": "रात्र मोड",
+            "CV Assist": "दृष्टी सहाय्य", "Plate OCR": "प्लेट ओळख",
+            "VIOLATION REPORT": "उल्लंघन अहवाल", "Plate": "नंबर प्लेट",
+            "Offense": "गुन्हा", "Sign": "चिन्ह", "Notes": "टीप",
+            "JURISDICTION ROUTING": "कार्यक्षेत्र", "SCAN": "स्कॅन",
+            "CAPTURE": "फोटो", "SEND": "पाठवा", "CLEAR": "पुसा",
+            "Plate OCR: standby": "प्लेट ओळख: तयार", "Close": "बंद करा",
+            "OK": "ठीक आहे", "Missing": "अपूर्ण",
+            "Enter plate number.": "नंबर प्लेट टाका.",
+            "Select a violation.": "उल्लंघन निवडा.", "Ready": "तयार",
+            "Email app opened.": "ईमेल ॲप उघडले.", "Saved!": "जतन केले!",
+            "Duplicate": "पुनरावृत्ती", "No route": "मार्ग नाही",
+            "History": "इतिहास", "No reports sent yet.": "अद्याप एकही अहवाल पाठवला नाही.",
+            "Language": "भाषा", "More - Citizen Tools": "अधिक - नागरिक सुविधा",
+            "Share to X / Twitter": "एक्स / ट्विटरवर शेअर करा",
+            "Share to WhatsApp": "व्हॉट्सॲपवर शेअर करा",
+            "WhatsApp traffic police (official no.)": "वाहतूक पोलीस व्हॉट्सॲप (अधिकृत क्रमांक)",
+            "Vehicle lookup (RC/Insurance/PUC)": "वाहन माहिती (आरसी/विमा/प्रदूषण)",
+            "Report a road hazard": "रस्त्यावरील धोक्याची तक्रार",
+            "SOS / Emergency": "आणीबाणी", "Violation hotspots": "उल्लंघन ठिकाणे",
+            "Save last 15 s as video clip": "मागील 15 सेकंदांचा व्हिडिओ जतन करा",
+            "Emergency contact (crash SOS)": "आपत्कालीन संपर्क (अपघात)",
+            "Check for app updates": "ॲप अपडेट तपासा",
+            "Privacy blur (faces)": "चेहरे अस्पष्ट करा", "ON": "चालू", "OFF": "बंद",
+        },
+        "ta": {
+            "MORE": "மேலும்", "HISTORY": "வரலாறு", "SETTINGS": "அமைப்புகள்",
+            "Anonymous Reporter": "பெயரில்லா புகார்தாரர்", "Night Mode": "இரவு முறை",
+            "CV Assist": "பார்வை உதவி", "Plate OCR": "பலகை அறிதல்",
+            "VIOLATION REPORT": "விதிமீறல் புகார்", "Plate": "எண் பலகை",
+            "Offense": "குற்றம்", "Sign": "அடையாளம்", "Notes": "குறிப்பு",
+            "JURISDICTION ROUTING": "அதிகார வரம்பு", "SCAN": "ஸ்கேன்",
+            "CAPTURE": "படம்", "SEND": "அனுப்பு", "CLEAR": "அழி",
+            "Plate OCR: standby": "பலகை அறிதல்: தயார்", "Close": "மூடு",
+            "OK": "சரி", "Missing": "குறைவு",
+            "Enter plate number.": "வாகன எண்ணை உள்ளிடவும்.",
+            "Select a violation.": "விதிமீறலைத் தேர்ந்தெடுக்கவும்.", "Ready": "தயார்",
+            "Email app opened.": "மின்னஞ்சல் செயலி திறக்கப்பட்டது.",
+            "Saved!": "சேமிக்கப்பட்டது!", "Duplicate": "நகல்",
+            "No route": "வழி இல்லை", "History": "வரலாறு",
+            "No reports sent yet.": "இதுவரை புகார் எதுவும் அனுப்பப்படவில்லை.",
+            "Language": "மொழி", "More - Citizen Tools": "மேலும் - குடிமக்கள் கருவிகள்",
+            "Share to X / Twitter": "எக்ஸ் / ட்விட்டரில் பகிர்",
+            "Share to WhatsApp": "வாட்ஸ்அப்பில் பகிர்",
+            "WhatsApp traffic police (official no.)": "போக்குவரத்து காவல் வாட்ஸ்அப் (அதிகாரப்பூர்வ எண்)",
+            "Vehicle lookup (RC/Insurance/PUC)": "வாகன விவரம் (பதிவு/காப்பீடு/மாசு)",
+            "Report a road hazard": "சாலை ஆபத்தைப் புகாரளி",
+            "SOS / Emergency": "அவசரம்", "Violation hotspots": "விதிமீறல் இடங்கள்",
+            "Save last 15 s as video clip": "கடைசி 15 விநாடி காணொளியைச் சேமி",
+            "Emergency contact (crash SOS)": "அவசரத் தொடர்பு (விபத்து)",
+            "Check for app updates": "செயலி புதுப்பிப்பைச் சரிபார்",
+            "Privacy blur (faces)": "முகங்களை மங்கலாக்கு", "ON": "இயக்கு", "OFF": "அணை",
+        },
+        "kn": {
+            "MORE": "ಇನ್ನಷ್ಟು", "HISTORY": "ಇತಿಹಾಸ", "SETTINGS": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು",
+            "Anonymous Reporter": "ಅನಾಮಧೇಯ ದೂರುದಾರ", "Night Mode": "ರಾತ್ರಿ ಮೋಡ್",
+            "CV Assist": "ದೃಷ್ಟಿ ನೆರವು", "Plate OCR": "ಫಲಕ ಗುರುತಿಸುವಿಕೆ",
+            "VIOLATION REPORT": "ಉಲ್ಲಂಘನೆ ವರದಿ", "Plate": "ನಂಬರ್ ಪ್ಲೇಟ್",
+            "Offense": "ಅಪರಾಧ", "Sign": "ಚಿಹ್ನೆ", "Notes": "ಟಿಪ್ಪಣಿ",
+            "JURISDICTION ROUTING": "ವ್ಯಾಪ್ತಿ", "SCAN": "ಸ್ಕ್ಯಾನ್",
+            "CAPTURE": "ಫೋಟೋ", "SEND": "ಕಳುಹಿಸು", "CLEAR": "ಅಳಿಸು",
+            "Plate OCR: standby": "ಫಲಕ ಗುರುತಿಸುವಿಕೆ: ಸಿದ್ಧ", "Close": "ಮುಚ್ಚು",
+            "OK": "ಸರಿ", "Missing": "ಅಪೂರ್ಣ",
+            "Enter plate number.": "ನಂಬರ್ ಪ್ಲೇಟ್ ನಮೂದಿಸಿ.",
+            "Select a violation.": "ಉಲ್ಲಂಘನೆ ಆಯ್ಕೆಮಾಡಿ.", "Ready": "ಸಿದ್ಧ",
+            "Email app opened.": "ಇಮೇಲ್ ಆ್ಯಪ್ ತೆರೆಯಲಾಗಿದೆ.", "Saved!": "ಉಳಿಸಲಾಗಿದೆ!",
+            "Duplicate": "ನಕಲು", "No route": "ಮಾರ್ಗವಿಲ್ಲ", "History": "ಇತಿಹಾಸ",
+            "No reports sent yet.": "ಇನ್ನೂ ಯಾವುದೇ ವರದಿ ಕಳುಹಿಸಿಲ್ಲ.",
+            "Language": "ಭಾಷೆ", "More - Citizen Tools": "ಇನ್ನಷ್ಟು - ನಾಗರಿಕ ಸಾಧನಗಳು",
+            "Share to X / Twitter": "ಎಕ್ಸ್ / ಟ್ವಿಟರ್‌ನಲ್ಲಿ ಹಂಚಿಕೊಳ್ಳಿ",
+            "Share to WhatsApp": "ವಾಟ್ಸ್‌ಆ್ಯಪ್‌ನಲ್ಲಿ ಹಂಚಿಕೊಳ್ಳಿ",
+            "WhatsApp traffic police (official no.)": "ಸಂಚಾರ ಪೊಲೀಸ್ ವಾಟ್ಸ್‌ಆ್ಯಪ್ (ಅಧಿಕೃತ ಸಂಖ್ಯೆ)",
+            "Vehicle lookup (RC/Insurance/PUC)": "ವಾಹನ ಮಾಹಿತಿ (ನೋಂದಣಿ/ವಿಮೆ/ಮಾಲಿನ್ಯ)",
+            "Report a road hazard": "ರಸ್ತೆ ಅಪಾಯ ವರದಿ ಮಾಡಿ",
+            "SOS / Emergency": "ತುರ್ತು", "Violation hotspots": "ಉಲ್ಲಂಘನೆ ತಾಣಗಳು",
+            "Save last 15 s as video clip": "ಕೊನೆಯ 15 ಸೆಕೆಂಡ್ ವೀಡಿಯೊ ಉಳಿಸಿ",
+            "Emergency contact (crash SOS)": "ತುರ್ತು ಸಂಪರ್ಕ (ಅಪಘಾತ)",
+            "Check for app updates": "ಆ್ಯಪ್ ನವೀಕರಣ ಪರಿಶೀಲಿಸಿ",
+            "Privacy blur (faces)": "ಮುಖಗಳನ್ನು ಮಸುಕುಗೊಳಿಸಿ", "ON": "ಆನ್", "OFF": "ಆಫ್",
+        },
+        "bn": {
+            "MORE": "আরও", "HISTORY": "ইতিহাস", "SETTINGS": "সেটিংস",
+            "Anonymous Reporter": "বেনামী অভিযোগকারী", "Night Mode": "রাত্রি মোড",
+            "CV Assist": "দৃষ্টি সহায়তা", "Plate OCR": "প্লেট শনাক্তকরণ",
+            "VIOLATION REPORT": "লঙ্ঘনের রিপোর্ট", "Plate": "নম্বর প্লেট",
+            "Offense": "অপরাধ", "Sign": "চিহ্ন", "Notes": "মন্তব্য",
+            "JURISDICTION ROUTING": "এখতিয়ার", "SCAN": "স্ক্যান",
+            "CAPTURE": "ছবি", "SEND": "পাঠান", "CLEAR": "মুছুন",
+            "Plate OCR: standby": "প্লেট শনাক্তকরণ: প্রস্তুত", "Close": "বন্ধ করুন",
+            "OK": "ঠিক আছে", "Missing": "অসম্পূর্ণ",
+            "Enter plate number.": "নম্বর প্লেট লিখুন।",
+            "Select a violation.": "লঙ্ঘন বেছে নিন।", "Ready": "প্রস্তুত",
+            "Email app opened.": "ইমেল অ্যাপ খোলা হয়েছে।", "Saved!": "সংরক্ষিত!",
+            "Duplicate": "পুনরাবৃত্তি", "No route": "কোনো পথ নেই",
+            "History": "ইতিহাস", "No reports sent yet.": "এখনও কোনো রিপোর্ট পাঠানো হয়নি।",
+            "Language": "ভাষা", "More - Citizen Tools": "আরও - নাগরিক পরিষেবা",
+            "Share to X / Twitter": "এক্স / টুইটারে শেয়ার করুন",
+            "Share to WhatsApp": "হোয়াটসঅ্যাপে শেয়ার করুন",
+            "WhatsApp traffic police (official no.)": "ট্রাফিক পুলিশ হোয়াটসঅ্যাপ (সরকারি নম্বর)",
+            "Vehicle lookup (RC/Insurance/PUC)": "গাড়ির তথ্য (নিবন্ধন/বিমা/দূষণ)",
+            "Report a road hazard": "রাস্তার বিপদ জানান",
+            "SOS / Emergency": "জরুরি", "Violation hotspots": "লঙ্ঘনের স্থান",
+            "Save last 15 s as video clip": "শেষ 15 সেকেন্ডের ভিডিও সংরক্ষণ করুন",
+            "Emergency contact (crash SOS)": "জরুরি যোগাযোগ (দুর্ঘটনা)",
+            "Check for app updates": "অ্যাপ আপডেট দেখুন",
+            "Privacy blur (faces)": "মুখ ঝাপসা করুন", "ON": "চালু", "OFF": "বন্ধ",
         },
     }
 
@@ -359,10 +779,36 @@ class I18N:
         cls.LANG = lang if lang in cls.SUPPORTED else "en"
 
     @classmethod
-    def tr(cls, s):
-        if cls.LANG == "en":
+    def tr(cls, s, lang=None):
+        """Translate `s` (lang defaults to the current one). The explicit
+        `lang` argument lets KV rules re-evaluate when the language changes."""
+        lang = cls.LANG if lang is None else lang
+        if lang == "en":
             return s
-        return cls.STRINGS.get(cls.LANG, {}).get(s, s)
+        return cls.STRINGS.get(lang, {}).get(s, s)
+
+    @classmethod
+    def next_lang(cls, lang=None):
+        order = list(cls.SUPPORTED)
+        cur = cls.LANG if lang is None else lang
+        return order[(order.index(cur) + 1) % len(order)] if cur in order else "en"
+
+    @classmethod
+    def font_for(cls, lang=None):
+        """(font path or "Roboto", script tag) to render `lang` with; falls
+        back to the Latin default if the device lacks the Noto font."""
+        lang = cls.LANG if lang is None else lang
+        _name, family, script = cls.LANGS.get(lang, cls.LANGS["en"])
+        if family:
+            for suffix in ("-VF.ttf", "-Regular.ttf", "UI-VF.ttf", "UI-Regular.ttf"):
+                path = os.path.join(cls.FONT_DIR, "NotoSans%s%s" % (family, suffix))
+                if os.path.isfile(path):
+                    return path, script
+        return "Roboto", "Zyyy"
+
+    @staticmethod
+    def has_latin(s):
+        return any("A" <= c <= "Z" or "a" <= c <= "z" for c in (s or ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -423,11 +869,71 @@ class Emergency:
         return ("SOS - I need help. Live location: %s (sent via Sentinel-X)"
                 % Emergency.maps_link(lat, lon))
 
+    # Crash only counts if the phone was moving at vehicle speed just before,
+    # so dropping the phone on a desk or while walking doesn't trigger SOS.
+    CRASH_MIN_SPEED_KMH = 15.0
+    CRASH_SPEED_WINDOW_S = 15.0
+    SOS_COUNTDOWN_S = 15
+
+    @staticmethod
+    def is_crash(g_dyn, last_moving_ts, now_ts):
+        return (g_dyn >= Emergency.CRASH_G
+                and now_ts - last_moving_ts <= Emergency.CRASH_SPEED_WINDOW_S)
+
+    @staticmethod
+    def crash_text(lat, lon):
+        return ("Possible road accident detected by Sentinel-X. I may need help. "
+                "Location: %s" % Emergency.maps_link(lat, lon))
+
     @staticmethod
     def good_samaritan_text(lat, lon):
         return ("Accident reported. Location: %s. Reporting under Good Samaritan "
                 "protection (MVA Sec.134A). Please dispatch help."
                 % Emergency.maps_link(lat, lon))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Follow-up reminders: escalate reports with no visible action
+# ─────────────────────────────────────────────────────────────────────────
+class FollowUp:
+    """Finds sent reports old enough to escalate and drafts the grievance."""
+
+    DAYS = 7
+    MAX_SHOWN = 3
+
+    @staticmethod
+    def key(entry):
+        return "%s|%s" % (entry.get("plate", ""), entry.get("ts", ""))
+
+    @staticmethod
+    def due(entries, done_keys, now_ts=None, days=None):
+        now_ts = time.time() if now_ts is None else now_ts
+        age = (FollowUp.DAYS if days is None else days) * 86400
+        out = []
+        for e in entries or []:
+            ts = e.get("ts")
+            if ts is None or not str(e.get("status", "")).startswith("sent"):
+                continue
+            if now_ts - float(ts) >= age and FollowUp.key(e) not in done_keys:
+                out.append(e)
+        return out
+
+    @staticmethod
+    def draft(entry):
+        when = time.strftime("%d %b %Y", time.localtime(float(entry.get("ts", 0))))
+        return (
+            "Subject: No action on traffic violation report - vehicle %s\n\n"
+            "On %s I reported vehicle %s for %s (%s) at GPS %.6f, %.6f to %s, "
+            "with photo evidence. I have not received any acknowledgement or "
+            "information on action taken. I request that the complaint be "
+            "acted upon and the status communicated.\n\n"
+            "This report was made under the Good Samaritan protection of "
+            "Section 134A of the Motor Vehicles Act, 1988."
+            % (entry.get("plate", "?"), when, entry.get("plate", "?"),
+               entry.get("offense", "?"), entry.get("section", ""),
+               float(entry.get("lat", 0.0)), float(entry.get("lon", 0.0)),
+               ", ".join(entry.get("recipients", []) or ["the traffic police"]))
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -465,18 +971,48 @@ class ViolationHeatmap:
 class PrivacyBlur:
     """Blur faces (and optionally other plates) in evidence before sharing."""
 
+    CASCADE = "haarcascade_frontalface_default.xml"
+    _cascade = None
+
     @staticmethod
     def _face_cascade():
+        """Face detector, cached. The p4a OpenCV build ships only cv2.so (no
+        cv2.data), so the cascade bundled in assets/ is tried first;
+        without it face blur silently did nothing on Android."""
         if cv2 is None:
             return None
-        try:
-            base = getattr(getattr(cv2, "data", None), "haarcascades", None)
-            if not base:
-                return None
-            casc = cv2.CascadeClassifier(base + "haarcascade_frontalface_default.xml")
-            return None if casc.empty() else casc
-        except Exception:
-            return None
+        if PrivacyBlur._cascade is not None:
+            return PrivacyBlur._cascade
+        here = os.path.dirname(os.path.abspath(__file__))
+        paths = [os.path.join(here, "assets", PrivacyBlur.CASCADE)]
+        base = getattr(getattr(cv2, "data", None), "haarcascades", None)
+        if base:
+            paths.append(os.path.join(base, PrivacyBlur.CASCADE))
+        for p in paths:
+            try:
+                if os.path.isfile(p):
+                    casc = cv2.CascadeClassifier(p)
+                    if not casc.empty():
+                        PrivacyBlur._cascade = casc
+                        return casc
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def blur_regions(bgr, boxes):
+        """Blur each (x, y, w, h) box. Returns the image."""
+        if cv2 is None or bgr is None:
+            return bgr
+        for (x, y, w, h) in boxes:
+            bgr = PrivacyBlur._blur_region(bgr, x, y, w, h)
+        return bgr
+
+    @staticmethod
+    def overlaps(a, b):
+        """True if two (x, y, w, h) boxes intersect."""
+        return not (a[0] + a[2] <= b[0] or b[0] + b[2] <= a[0]
+                    or a[1] + a[3] <= b[1] or b[1] + b[3] <= a[1])
 
     @staticmethod
     def _blur_region(img, x, y, w, h):

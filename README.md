@@ -18,7 +18,7 @@ setup.py build — newer p4a ships numpy 2.x which fails to cross-compile on NDK
 - **Dual Routing** -- Reports sent to BOTH location-based AND plate-based police authorities
 - **Good Samaritan** -- Anonymous reporting with Section 134A legal protection in every email
 - **7 MVA 2019 Offenses** -- Sections 183, 184, 194B, 194C, 194D, 194E
-- **13 State Police Directories** -- DL, MH, KA, TN, UP, HR, KL, GJ, WB, TS, PB, RJ, GA
+- **All 36 States & UTs** -- Police email directory verified against official sites (`civic.CivicDirectory`, source URL per state); states with no published email point to their official alternative channel
 
 ### Phase 1 -- Recording & Resilience
 - **Dashcam Recording** -- Continuous JPEG capture in 2-minute segments with 5-segment ring buffer (~10 min)
@@ -68,6 +68,29 @@ setup.py build — newer p4a ships numpy 2.x which fails to cross-compile on NDK
 - **GitHub OTA** (sideloaded) -- Each successful `main` build publishes a GitHub Release with `sentinelx.apk` + `update.json`. The app auto-detects a higher versionCode on launch, downloads via Android DownloadManager, and prompts a one-tap install.
 - **Play In-App Updates** (Play installs) -- Java helper (`java_src/.../InAppUpdate.java`) drives the Play Core FLEXIBLE flow: background download + auto-install.
 - **Auto-routing** -- App detects its install source (`getInstallerPackageName`) and uses Play updates on Play installs, GitHub OTA otherwise -- no double prompts.
+
+### Phase 7 -- Accuracy, Evidence & Safety
+- **Multi-frame plate voting** -- Live auto-fill needs the same plate in 2 of the last 5 reads; a one-frame misread never reaches the form
+- **Plate overlay + chips** -- Detected plate outlined on the preview (amber = seen once, green = confirmed); when several plates are in view, tap a chip to pick
+- **Bharat-series plates** -- `22 BH 1234 AA` format recognised (routes by location)
+- **City-level routing** -- Inside 22 major cities the report goes to that city's traffic wing (e.g. Pune vs Mumbai, Cyberabad vs Hyderabad), else the state list
+- **Official WhatsApp channels** -- MORE > "WhatsApp traffic police" sends the original photo + report to the force's published number (Goa, Tripura, Delhi)
+- **Directory OTA** -- CI publishes `directory.json` with each release; the app validates and applies it, so address changes need no new APK
+- **Privacy-safe sharing** -- X/WhatsApp shares get a copy with faces and bystander plates blurred; the offender's plate and the original evidence are untouched. (Face cascade is bundled in `assets/` -- p4a's OpenCV ships without `cv2.data`, so face blur previously did nothing on Android)
+- **Signed evidence proof** -- Every capture writes `<photo>.proof.json`: SHA-256, UTC time, GPS fix with accuracy and satellite fix time, device -- signed with an EC P-256 key held in the Android Keystore. Verify:
+  ```python
+  import json, base64
+  from cryptography.hazmat.primitives.serialization import load_der_public_key
+  from cryptography.hazmat.primitives import hashes
+  from cryptography.hazmat.primitives.asymmetric import ec
+  p = json.load(open("SentinelX_....png.proof.json"))
+  load_der_public_key(base64.b64decode(p["public_key_b64"])).verify(
+      base64.b64decode(p["signature_b64"]), p["payload"].encode(), ec.ECDSA(hashes.SHA256()))
+  ```
+- **15 s video clips** -- MORE > "Save last 15 s" writes the dashcam's rolling 4 fps buffer as an MJPEG AVI to `Movies/SentinelX`
+- **Crash SOS** -- Crash-level G-force shortly after moving at >= 15 km/h opens a 15 s cancellable countdown, then a pre-filled SMS to your emergency contact (or the 112 dialer)
+- **Follow-up reminders** -- Reports older than 7 days prompt an escalation; a CPGRAMS complaint draft is copied to the clipboard
+- **6 UI languages** -- English, Hindi, Marathi, Tamil, Kannada, Bengali, rendered with the phone's Noto fonts + HarfBuzz script shaping (MORE > Language)
 
 ### UI/UX
 - **Dark Theme** -- Custom design system (#0B0E17 background, cyan/green/amber/red accents)

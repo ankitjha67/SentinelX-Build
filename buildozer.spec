@@ -3,7 +3,7 @@ title = Sentinel-X
 package.name = sentinelx
 package.domain = org.sentinelx
 source.dir = .
-source.include_exts = py,png,jpg,kv,json,txt,onnx
+source.include_exts = py,png,jpg,kv,json,txt,onnx,xml
 
 version = 1.6.0
 # 'all' lets the phone rotate to landscape for capturing wide number plates while

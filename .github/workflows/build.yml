@@ -155,8 +155,10 @@ jobs:
           printf '{"version":"%s","version_code":%s,"url":"https://github.com/%s/releases/latest/download/sentinelx.apk","notes":"Automated build %s"}\n' \
             "$VER" "$VC" "${{ github.repository }}" "$VC" > update.json
           cat update.json
+          # Police directory for over-the-air updates (no APK needed)
+          python -c "import json, civic; json.dump(civic.CivicDirectory.export_directory(), open('directory.json', 'w'), indent=1)"
           TAG="v${VER}-${VC}"
-          gh release create "$TAG" sentinelx.apk update.json \
+          gh release create "$TAG" sentinelx.apk update.json directory.json \
             --title "Sentinel-X ${VER} (build ${VC})" \
             --notes "Automated OTA release. Installed apps auto-detect this and prompt to install." \
             --latest
