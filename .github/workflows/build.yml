@@ -71,14 +71,20 @@ jobs:
       # Inject a monotonic versionCode AFTER cache restore so the cache key
       # (hash of the committed buildozer.spec) stays stable across runs. This
       # versionCode is what each device compares against the published manifest.
+      # The key must sit in the [app] section: appending it to the end of the
+      # file put it under [buildozer], where it was ignored, so every APK got
+      # the computed code 102610600 while update.json advertised the run
+      # number (OTA never saw an update). The 200000000 base keeps codes above
+      # that computed value, so new builds install as upgrades, not downgrades.
       - name: Set build version code
         run: |
-          if grep -q '^android.numeric_version' buildozer.spec; then
-            sed -i "s/^android.numeric_version.*/android.numeric_version = ${{ github.run_number }}/" buildozer.spec
-          else
-            printf '\nandroid.numeric_version = %s\n' "${{ github.run_number }}" >> buildozer.spec
-          fi
+          VC=$((200000000 + ${{ github.run_number }}))
+          echo "VERSION_CODE=$VC" >> "$GITHUB_ENV"
+          sed -i '/^android.numeric_version/d' buildozer.spec
+          sed -i "/^version = /a android.numeric_version = $VC" buildozer.spec
           grep -E '^version|^android.numeric_version' buildozer.spec
+          # fail loudly if it didn't land in [app]
+          awk '/^\[/{s=$0} /^android.numeric_version/{print s}' buildozer.spec | grep -qx '\[app\]'
 
       - name: Build debug APK
         run: |
@@ -174,8 +180,9 @@ jobs:
           cp "$APK" sentinelx.apk
           VC="${{ github.run_number }}"
           VER=$(grep -E '^version' buildozer.spec | head -1 | cut -d'=' -f2 | tr -d ' ')
+          # version_code must equal the APK's versionCode (set above)
           printf '{"version":"%s","version_code":%s,"url":"https://github.com/%s/releases/latest/download/sentinelx.apk","notes":"Automated build %s"}\n' \
-            "$VER" "$VC" "${{ github.repository }}" "$VC" > update.json
+            "$VER" "$VERSION_CODE" "${{ github.repository }}" "$VC" > update.json
           cat update.json
           # Police directory for over-the-air updates (no APK needed)
           python -c "import json, civic; json.dump(civic.CivicDirectory.export_directory(), open('directory.json', 'w'), indent=1)"
