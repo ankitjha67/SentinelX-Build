@@ -27,6 +27,9 @@ from unittest.mock import patch, MagicMock
 # We test the pure logic classes directly by extracting them
 # from main.py without triggering Kivy imports
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import civic  # noqa: E402  (pure Python; holds the police email directory)
+
 # ---- TrafficLawDB (pure data, no deps) ----
 
 class TrafficLawDB:
@@ -94,29 +97,9 @@ class TrafficLawDB:
         "information and shall not be compelled to be a witness or disclose personal identity."
     )
 
-    VERIFIED_EMAILS_2025 = {
-        "DL": ["addlcp.tfchq@delhipolice.gov.in"],
-        "MH": ["sp.hsp.hq@mahapolice.gov.in", "cp.mumbai.jtcp.traf@mahapolice.gov.in"],
-        "KA": ["bangloretrafficpolice@gmail.com"],
-        "TN": ["cctnstn@tn.gov.in"],
-        "UP": ["traffic_dir@uppolice.gov.in"],
-        "HR": ["igp.lo@hry.nic.in", "dcp.trafficggn@hry.nic.in"],
-        "KL": ["sptrafficsz.pol@kerala.gov.in"],
-        "GJ": ["dig-traffic-ahd@gujarat.gov.in"],
-        "WB": ["dctp@kolkatatrafficpolice.gov.in"],
-        "TS": ["addlcptraffic@hyd.tspolice.gov.in"],
-        "PB": ["trafficpolicepunjab@gmail.com"],
-        "RJ": ["adgp.traffic@rajpolice.gov.in"],
-        "GA": ["sp_traffic@goapolice.gov.in"],
-    }
-
-    STATE_NAME_TO_CODE = {
-        "Delhi": "DL", "National Capital Territory of Delhi": "DL",
-        "Maharashtra": "MH", "Karnataka": "KA", "Tamil Nadu": "TN",
-        "Uttar Pradesh": "UP", "Haryana": "HR", "Kerala": "KL",
-        "Gujarat": "GJ", "West Bengal": "WB", "Telangana": "TS",
-        "Punjab": "PB", "Rajasthan": "RJ", "Goa": "GA",
-    }
+    # The app's real directory (civic.py is Kivy-free), not a hand-kept copy.
+    VERIFIED_EMAILS_2025 = civic.CivicDirectory.EMAILS
+    STATE_NAME_TO_CODE = civic.CivicDirectory.STATE_NAME_TO_CODE
 
 
 class JurisdictionEngine:
@@ -199,9 +182,33 @@ class TestTrafficLawDB:
         assert "134A" in TrafficLawDB.GOOD_SAMARITAN_FOOTER
         assert "Motor Vehicles Act" in TrafficLawDB.GOOD_SAMARITAN_FOOTER
 
-    def test_verified_emails_cover_all_13_states(self):
-        expected_states = {"DL", "MH", "KA", "TN", "UP", "HR", "KL", "GJ", "WB", "TS", "PB", "RJ", "GA"}
-        assert set(TrafficLawDB.VERIFIED_EMAILS_2025.keys()) == expected_states
+    def test_every_state_and_ut_has_a_channel(self):
+        """All 36 states/UTs either route to an email or name an official
+        alternative channel; none is silently missing."""
+        d = civic.CivicDirectory
+        all_codes = set(d.STATE_NAME_TO_CODE.values())
+        assert len(all_codes) == 36
+        assert all_codes == set(d.EMAILS) | set(d.NO_EMAIL)
+        assert not set(d.EMAILS) & set(d.NO_EMAIL)
+
+    def test_every_email_state_has_official_source(self):
+        d = civic.CivicDirectory
+        assert set(d.SOURCES) == set(d.EMAILS)
+        for code, url in d.SOURCES.items():
+            assert url.startswith("https://"), code
+
+    def test_previously_unverified_addresses_removed(self):
+        """Addresses that could not be found on any official page."""
+        dead = {"addlcp.tfchq@delhipolice.gov.in", "bangloretrafficpolice@gmail.com",
+                "cctnstn@tn.gov.in", "traffic_dir@uppolice.gov.in", "igp.lo@hry.nic.in",
+                "dig-traffic-ahd@gujarat.gov.in", "addlcptraffic@hyd.tspolice.gov.in",
+                "trafficpolicepunjab@gmail.com", "sp_traffic@goapolice.gov.in"}
+        live = {e for v in civic.CivicDirectory.EMAILS.values() for e in v}
+        assert not dead & live
+
+    def test_legacy_plate_codes_alias(self):
+        assert civic.CivicDirectory.emails("OR") == civic.CivicDirectory.emails("OD")
+        assert civic.CivicDirectory.emails("DN") == civic.CivicDirectory.emails("DD")
 
     def test_all_emails_are_valid_format(self):
         email_re = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
@@ -274,7 +281,7 @@ class TestJurisdictionRouting:
     def test_plate_only_routing(self):
         result = JurisdictionEngine.recipients_for_report(0, 0, "DL01C1234")
         assert result["plate_code"] == "DL"
-        assert "addlcp.tfchq@delhipolice.gov.in" in result["recipients"]
+        assert "grievance.traffic@delhipolice.gov.in" in result["recipients"]
 
     def test_unknown_state_no_recipients(self):
         result = JurisdictionEngine.recipients_for_report(0, 0, "XX99ZZ9999")
@@ -345,9 +352,9 @@ class TestServicePhysics:
             "speed_mps": 16.67,
             "x": 0.1, "y": 0.2, "z": 9.81,
             "g_total": 9.81, "g_dyn": 0.02,
-            "harsh_brake": False,
+            "harsh_brake": False, "accel_ok": True,
         }
-        required_keys = {"ts", "lat", "lon", "speed_mps", "x", "y", "z", "g_total", "g_dyn", "harsh_brake"}
+        required_keys = {"ts", "lat", "lon", "speed_mps", "x", "y", "z", "g_total", "g_dyn", "harsh_brake", "accel_ok"}
         assert required_keys == set(payload.keys())
 
     def test_speed_conversion_mps_to_kmh(self):
@@ -952,11 +959,11 @@ class TestTelemetryReceiver:
     def test_telemetry_payload_keys_match_service(self):
         """Verify receiver expects same keys service.py sends."""
         service_keys = {"ts", "lat", "lon", "speed_mps", "x", "y", "z",
-                        "g_total", "g_dyn", "harsh_brake"}
+                        "g_total", "g_dyn", "harsh_brake", "accel_ok"}
         payload = {
             "ts": 0, "lat": 0, "lon": 0, "speed_mps": 0,
             "x": 0, "y": 0, "z": 0, "g_total": 0, "g_dyn": 0,
-            "harsh_brake": False,
+            "harsh_brake": False, "accel_ok": False,
         }
         assert set(payload.keys()) == service_keys
 
@@ -1548,6 +1555,11 @@ class PlateOCR:
     CONF_HIGH = 0.85
     CONF_MEDIUM = 0.6
     CONF_LOW = 0.35
+    BH_PLATE_RE = re.compile(r"(\d{2})\s*BH\s*(\d{4})\s*([A-Z]{1,2})\b", re.I)
+    STATE_CODES = frozenset(
+        "AN AP AR AS BR CG CH DD DL DN GA GJ HP HR JH JK KA KL LA LD MH ML MN "
+        "MP MZ NL OD OR PB PY RJ SK TN TR TS UK UP WB".split()
+    )
 
     @staticmethod
     def clean_plate_text(raw):
@@ -1557,15 +1569,25 @@ class PlateOCR:
         text = re.sub(r"[^A-Z0-9\s]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
         best_plate, best_conf = "", 0.0
-        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
-            state = m.group(1).upper()
-            dist = m.group(2)
-            series = m.group(3).upper()
-            num = m.group(4)
-            plate = "%s%s%s%s" % (state, dist, series, num)
-            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
-            if conf > best_conf:
-                best_plate, best_conf = plate, conf
+        for cand in (text, text.replace(" ", "")):
+            for m in PlateOCR.INDIAN_PLATE_RE.finditer(cand):
+                state = m.group(1).upper()
+                dist = m.group(2)
+                series = m.group(3).upper()
+                num = m.group(4)
+                plate = "%s%s%s%s" % (state, dist, series, num)
+                conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+                if state not in PlateOCR.STATE_CODES:
+                    conf -= 0.25
+                if len(num) == 3:
+                    conf -= 0.05
+                if conf > best_conf:
+                    best_plate, best_conf = plate, conf
+        for cand in (text, text.replace(" ", "")):
+            for m in PlateOCR.BH_PLATE_RE.finditer(cand):
+                plate = "%sBH%s%s" % (m.group(1), m.group(2), m.group(3).upper())
+                if PlateOCR.CONF_HIGH > best_conf:
+                    best_plate, best_conf = plate, PlateOCR.CONF_HIGH
         if best_plate:
             return best_plate, best_conf
         cleaned = re.sub(r"[^A-Z0-9]", "", text)
@@ -1660,7 +1682,7 @@ class TestPlateOCRRoutingSuggestion:
         state = JurisdictionEngine.extract_state_code_from_plate(plate)
         assert state == "DL"
         emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
-        assert "addlcp.tfchq@delhipolice.gov.in" in emails
+        assert "grievance.traffic@delhipolice.gov.in" in emails
 
     def test_ocr_plate_routes_to_maharashtra(self):
         plate = "MH12AB1234"
@@ -1674,13 +1696,13 @@ class TestPlateOCRRoutingSuggestion:
         state = JurisdictionEngine.extract_state_code_from_plate(plate)
         assert state == "KA"
         emails = TrafficLawDB.VERIFIED_EMAILS_2025.get(state, [])
-        assert "bangloretrafficpolice@gmail.com" in emails
+        assert "automationpubbcp@ksp.gov.in" in emails
 
     @pytest.mark.parametrize("plate,expected_state,has_emails", [
         ("DL01C1234", "DL", True),
         ("MH12AB1234", "MH", True),
         ("KA03MM5678", "KA", True),
-        ("TN09A0001", "TN", True),
+        ("TN09A0001", "TN", False),  # TN publishes no police email
         ("UP16AB1234", "UP", True),
         ("HR26DK1234", "HR", True),
         ("KL01AB1234", "KL", True),
@@ -1834,7 +1856,6 @@ class TestPlateOCRPipeline:
             assert len(emails) == expected_email_count
 
     @pytest.mark.parametrize("raw_ocr,expected_state", [
-        ("TN 09 A 0001", "TN"),
         ("UP 16 AB 1234", "UP"),
         ("KL 01 AB 1234", "KL"),
         ("GJ 01 AB 1234", "GJ"),
@@ -2001,6 +2022,34 @@ class TestOCRWorkflow:
         assert plate == "MH12AB1234"
         assert conf == PlateOCR.CONF_HIGH
 
+    def test_clean_two_line_plate_split_series(self):
+        """ML Kit output for a two-line bike plate splits the series across
+        the line break ("DL 3C" / "AB 1234"); must not yield "AB1234"."""
+        plate, conf = PlateOCR.clean_plate_text("DL 3C\nAB 1234")
+        assert plate == "DL3CAB1234"
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_prefers_four_digit_reading(self):
+        """When ML Kit returns two readings of the same plate, the one with a
+        4-digit number beats a misread that pulled a digit into the series."""
+        plate, _ = PlateOCR.clean_plate_text("KA 41EVZ011 KA 41EV 4011")
+        assert plate == "KA41EV4011"
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("22 BH 1234 AA", "22BH1234AA"),
+        ("23BH0042C", "23BH0042C"),
+    ])
+    def test_clean_bharat_series(self, raw, expected):
+        """Bharat-series plates have no state code and a different layout."""
+        plate, conf = PlateOCR.clean_plate_text(raw)
+        assert plate == expected
+        assert conf == PlateOCR.CONF_HIGH
+
+    def test_clean_unknown_state_code_below_autofill(self):
+        """Two letters that aren't an RTO state code can't auto-fill."""
+        _, conf = PlateOCR.clean_plate_text("AB 1234")
+        assert conf < 0.5
+
     def test_clean_extracts_plate_from_surrounding_text(self):
         """ML Kit returns ALL on-screen text; plate must be extracted."""
         raw = "SPEED LIMIT 50 KA03MM5678 NO PARKING"
@@ -2074,7 +2123,7 @@ class TestOCRWorkflow:
         ("MH 12 AB 1234", "MH"),
         ("DL01C1234", "DL"),
         ("KA03MM5678", "KA"),
-        ("TN09A0001", "TN"),
+        
         ("HR26DK1234", "HR"),
     ])
     def test_end_to_end_ocr_to_routing(self, raw, expected_state):
@@ -2262,6 +2311,150 @@ class TestI18N:
     def test_invalid_lang_falls_back(self):
         civic.I18N.set_lang("xx")
         assert civic.I18N.LANG == "en"
+
+    def test_all_languages_translate_every_key(self):
+        keys = set(civic.I18N.STRINGS["hi"])
+        for lang, table in civic.I18N.STRINGS.items():
+            assert set(table) == keys, lang
+
+    def test_translations_contain_no_latin_letters(self):
+        """The Indic Noto fonts have no Latin glyphs: any Latin letter in a
+        translation would render as a box on Android."""
+        for lang, table in civic.I18N.STRINGS.items():
+            for key, val in table.items():
+                assert not civic.I18N.has_latin(val), (lang, key, val)
+
+    def test_explicit_lang_argument(self):
+        civic.I18N.set_lang("en")
+        assert civic.I18N.tr("SEND", "ta") == "அனுப்பு"
+
+    def test_next_lang_cycles_through_all(self):
+        seen, lang = [], "en"
+        for _ in civic.I18N.SUPPORTED:
+            seen.append(lang)
+            lang = civic.I18N.next_lang(lang)
+        assert lang == "en" and set(seen) == set(civic.I18N.SUPPORTED)
+
+    def test_font_falls_back_without_noto(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(civic.I18N, "FONT_DIR", str(tmp_path))
+        assert civic.I18N.font_for("hi") == ("Roboto", "Zyyy")
+        (tmp_path / "NotoSansDevanagari-VF.ttf").write_bytes(b"x")
+        assert civic.I18N.font_for("hi")[1] == "Deva"
+
+
+class TestCityRoutingAndChannels:
+    def test_city_routing(self):
+        d = civic.CivicDirectory
+        assert d.city_for(18.52, 73.86)["name"] == "Pune"
+        assert d.city_for(17.4435, 78.3772)["name"] == "Cyberabad"
+        assert d.city_for(17.3616, 78.4747)["name"] == "Hyderabad"
+        assert d.city_for(19.9, 75.3) is None  # rural Maharashtra -> state list
+
+    def test_city_entries_valid(self):
+        d = civic.CivicDirectory
+        codes = set(d.STATE_NAME_TO_CODE.values())
+        for name, state, la, lo, rad, emails, src in d.CITIES:
+            assert state in codes and src.startswith("https://") and emails, name
+
+    def test_official_police_app_lookup(self):
+        d = civic.CivicDirectory
+        assert d.police_app_for("DL")[0] == "com.dtp.trafficsentinel"
+        assert d.police_app_for("KA", "Bengaluru")[0] == "com.BTPASTraM"
+        assert d.police_app_for("KA") is None          # app is Bengaluru-only
+        assert d.police_app_for("HR", "Gurugram") is None
+
+    def test_civic_channel_lookup(self):
+        d = civic.CivicDirectory
+        assert d.civic_channel_for(28.70, 77.10, "DL")["phone"] == "155305"
+        assert d.civic_channel_for(13.06, 80.25, "TN")["phone"] == "1913"
+        assert d.civic_channel_for(19.9, 75.3, "MH") is None
+
+    def test_quality_flags_stale_gps(self):
+        issues = civic.QualityCheck.issues(True, sharpness=200, gps_age_s=5 * 86400)
+        assert len(issues) == 1 and "120 h" in issues[0]
+
+    def test_whatsapp_numbers_international_format(self):
+        for code, (num, _src) in civic.CivicDirectory.WHATSAPP.items():
+            assert num.isdigit() and num.startswith("91") and len(num) == 12, code
+
+    def test_directory_roundtrip_and_rejects_bad(self):
+        import copy
+        import json
+        d = civic.CivicDirectory
+        saved = (copy.deepcopy(d.EMAILS), copy.deepcopy(d.NO_EMAIL),
+                 copy.deepcopy(d.WHATSAPP), list(d.CITIES))
+        try:
+            exp = json.loads(json.dumps(d.export_directory()))
+            assert d.apply_overrides(exp)
+            bad = copy.deepcopy(exp)
+            bad["emails"]["DL"] = ["not-an-email"]
+            assert not d.apply_overrides(bad)
+            assert not d.apply_overrides({"schema": 1, "emails": {"DL": ["a@b.in"]}})
+            assert d.EMAILS["DL"] == saved[0]["DL"]
+        finally:
+            d.EMAILS.clear(); d.EMAILS.update(saved[0])
+            d.NO_EMAIL.clear(); d.NO_EMAIL.update(saved[1])
+            d.WHATSAPP.clear(); d.WHATSAPP.update(saved[2])
+            d.CITIES[:] = saved[3]
+
+
+class TestSafetyFeatures:
+    def test_crash_requires_recent_vehicle_speed(self):
+        E = civic.Emergency
+        assert E.is_crash(E.CRASH_G + 1, last_moving_ts=100.0, now_ts=105.0)
+        assert not E.is_crash(E.CRASH_G + 1, last_moving_ts=0.0, now_ts=105.0)
+        assert not E.is_crash(E.CRASH_G - 1, last_moving_ts=100.0, now_ts=101.0)
+
+    def test_quality_check_flags_common_rejections(self):
+        Q = civic.QualityCheck
+        assert Q.issues(True, sharpness=200, gps_accuracy_m=8, plate_conf=0.85) == []
+        assert len(Q.issues(False, plate_conf=0.85)) == 1
+        issues = Q.issues(True, sharpness=20, gps_accuracy_m=120, plate_conf=0.3)
+        assert len(issues) == 3 and "blurry" in issues[0]
+
+    def test_power_policy_hysteresis(self):
+        P = civic.PowerPolicy
+        assert P.should_save(10, False, 30, saving=False)          # low battery
+        assert not P.should_save(10, True, 30, saving=False)       # charging
+        assert P.should_save(80, True, 45, saving=False)           # hot
+        assert P.should_save(17, False, 30, saving=True)           # not yet resumed
+        assert not P.should_save(25, False, 39, saving=True)       # recovered
+        assert P.should_save(50, False, 42.5, saving=True)         # still warm
+
+    def test_flag_gesture_double_press(self):
+        g = civic.FlagGesture()
+        assert not g.press(100.0)
+        assert g.press(100.8)            # second press within the window
+        assert not g.press(101.0)        # cooldown
+        assert not g.press(103.0)
+        assert not g.press(105.0)        # presses too far apart
+        assert g.press(111.0) is False and g.press(111.5) is True
+
+    def test_rahveer_application_and_golden_hour(self):
+        A = civic.AccidentHelp
+        acc = {"ts": 1_000_000.0, "lat": 28.6, "lon": 77.2}
+        hosp = {"ts": 1_000_000.0 + 40 * 60, "lat": 28.62, "lon": 77.21}
+        assert A.within_golden_hour(acc["ts"], hosp["ts"])
+        assert not A.within_golden_hour(acc["ts"], acc["ts"] + 2 * 3600)
+        text = A.rahveer_application("A Kumar", "9999999999", acc, hosp, "AIIMS")
+        assert "40 minutes" in text and "within the golden hour" in text and "AIIMS" in text
+
+    def test_rti_draft(self):
+        e = {"plate": "DL3CAB1234", "ts": 1_000_000.0, "offense": "HELMET",
+             "section": "S.194D", "lat": 28.6, "lon": 77.2, "recipients": ["a@b.in"]}
+        d = civic.RTIRequest.draft(e)
+        assert "Section 6(1)" in d and "DL3CAB1234" in d and "challan" in d
+
+    def test_followups_due_after_a_week(self):
+        F = civic.FollowUp
+        now = 1_000_000.0
+        old = {"plate": "MH12AB1234", "ts": now - 8 * 86400, "status": "sent",
+               "offense": "HELMET", "lat": 19.0, "lon": 72.8, "recipients": ["x@y.in"]}
+        new = dict(old, ts=now - 86400)
+        assert F.due([old, new], set(), now) == [old]
+        assert F.due([old], {F.key(old)}, now) == []
+        draft = F.draft(old)
+        assert "MH12AB1234" in draft and "134A" in draft
 
 
 class TestHazardReport:

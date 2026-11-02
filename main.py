@@ -87,6 +87,31 @@ class IndiaGeocoder:
         (30.32, 78.03, "Uttarakhand"),
         (31.10, 77.17, "Himachal Pradesh"),
         (34.08, 74.80, "Jammu and Kashmir"), (32.73, 74.86, "Jammu and Kashmir"),
+        # Remaining states/UTs (capital + a second anchor for large ones), so
+        # GPS anywhere in India resolves to the right jurisdiction.
+        (23.18, 79.95, "Madhya Pradesh"),                      # Jabalpur
+        (26.80, 84.50, "Bihar"),
+        (22.80, 86.18, "Jharkhand"),                           # Jamshedpur
+        (19.31, 84.79, "Odisha"),                              # Berhampur
+        (27.48, 94.91, "Assam"),                               # Dibrugarh
+        (19.08, 82.03, "Chhattisgarh"),                        # Jagdalpur
+        (29.96, 78.16, "Uttarakhand"),                         # Haridwar
+        (32.22, 76.32, "Himachal Pradesh"),                    # Dharamshala
+        (14.47, 78.82, "Andhra Pradesh"), (13.63, 79.42, "Andhra Pradesh"),  # Kadapa, Tirupati
+        (30.73, 76.78, "Chandigarh"),
+        (34.15, 77.58, "Ladakh"),
+        (27.33, 88.61, "Sikkim"),
+        (25.57, 91.88, "Meghalaya"),
+        (23.83, 91.28, "Tripura"),
+        (24.82, 93.94, "Manipur"),
+        (23.73, 92.72, "Mizoram"),
+        (25.67, 94.11, "Nagaland"),
+        (27.08, 93.61, "Arunachal Pradesh"),
+        (11.94, 79.81, "Puducherry"),
+        (11.62, 92.73, "Andaman and Nicobar Islands"),
+        (10.57, 72.64, "Lakshadweep"),
+        (20.27, 73.02, "Dadra and Nagar Haveli and Daman and Diu"),
+        (20.40, 72.83, "Dadra and Nagar Haveli and Daman and Diu"),
     ]
 
     @staticmethod
@@ -127,6 +152,7 @@ except Exception:
 from civic import (
     CivicDirectory, ReportChannels, VehicleLookup, DuplicateGuard, I18N,
     HazardReport, Emergency, ViolationHeatmap, PrivacyBlur, UpdateManifest,
+    FollowUp, QualityCheck, PowerPolicy, FlagGesture, AccidentHelp, RTIRequest,
 )
 
 try:
@@ -161,18 +187,75 @@ except Exception:
     pass
 
 DASH = "--"
+APP_VERSION = "1.6.0"  # keep in sync with buildozer.spec
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # GPS via pyjnius — directly calls Android LocationManager Java API
 # This is far more reliable than plyer.gps
 # ═════════════════════════════════════════════════════════════════════════
+_LocationListener = None
+try:
+    if platform == "android":
+        from jnius import PythonJavaClass, java_method
+
+        class _LocationListener(PythonJavaClass):
+            """Receives live fixes; callbacks run on the Android main looper."""
+            __javainterfaces__ = ["android/location/LocationListener"]
+
+            def __init__(self, sink):
+                super().__init__()
+                self._sink = sink
+
+            @java_method("(Landroid/location/Location;)V")
+            def onLocationChanged(self, location):
+                self._sink(location)
+
+            # Android 12+ batches fixes through this overload (a default
+            # method, but pyjnius proxies must implement every call).
+            @java_method("(Ljava/util/List;)V", name="onLocationChanged")
+            def onLocationChangedList(self, locations):
+                for i in range(locations.size()):
+                    self._sink(locations.get(i))
+
+            @java_method("(I)V")
+            def onFlushComplete(self, request_code):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderEnabled(self, provider):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderDisabled(self, provider):
+                pass
+
+            @java_method("(Ljava/lang/String;ILandroid/os/Bundle;)V")
+            def onStatusChanged(self, provider, status, extras):
+                pass
+except Exception:
+    _LocationListener = None
+
+
 class AndroidGPS:
-    """Direct access to Android LocationManager via pyjnius."""
+    """Android location via pyjnius, with live updates.
+
+    getLastKnownLocation alone can be days old (seen on device: a 5-day-old
+    fix stamped onto fresh evidence), so live GPS + network updates are
+    requested and the freshest fix wins.
+    """
+
+    MIN_TIME_MS = 1000
 
     def __init__(self):
         self._lm = None
         self._available = False
+        self._live = None          # newest Location from the listener
+        self._listener = None
+        # Details of the last fix for evidence proofs: accuracy (m), fix time
+        # (ms since epoch, from the GNSS/network fix rather than the phone
+        # clock), age (s) and provider.
+        self.last_fix = {}
         if platform == "android" and autoclass is not None:
             try:
                 PythonActivity = autoclass("org.kivy.android.PythonActivity")
@@ -182,30 +265,74 @@ class AndroidGPS:
                 self._available = True
             except Exception:
                 self._available = False
+            self._start_updates()
+
+    def _on_location(self, loc):
+        cur = self._live
+        # Prefer GPS; accept a network fix only if no recent GPS fix exists
+        if (cur is None or str(loc.getProvider()) == "gps"
+                or int(loc.getTime()) - int(cur.getTime()) > 10000):
+            self._live = loc
+
+    def _start_updates(self):
+        if not self._available or _LocationListener is None:
+            return
+        try:
+            LocationManager = autoclass("android.location.LocationManager")
+            Looper = autoclass("android.os.Looper")
+            self._listener = _LocationListener(self._on_location)
+            for provider in (LocationManager.GPS_PROVIDER,
+                             LocationManager.NETWORK_PROVIDER):
+                try:
+                    if self._lm.isProviderEnabled(provider):
+                        self._lm.requestLocationUpdates(
+                            provider, self.MIN_TIME_MS, 0.0, self._listener,
+                            Looper.getMainLooper())
+                except Exception:
+                    continue
+        except Exception:
+            self._listener = None
+
+    def stop(self):
+        try:
+            if self._listener is not None:
+                self._lm.removeUpdates(self._listener)
+        except Exception:
+            pass
 
     def get_location(self):
-        """Returns (lat, lon, speed) from last known GPS or network location."""
+        """Returns (lat, lon, speed) from the freshest live or last-known fix."""
         if not self._available or self._lm is None:
             return 0.0, 0.0, 0.0
         try:
             LocationManager = autoclass("android.location.LocationManager")
-            # Try GPS first, then network
-            loc = None
+            cands = [self._live] if self._live is not None else []
             for provider in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
                 try:
                     loc = self._lm.getLastKnownLocation(provider)
                     if loc is not None:
-                        break
+                        cands.append(loc)
                 except Exception:
                     continue
-            if loc is None:
+            if not cands:
                 return 0.0, 0.0, 0.0
+            loc = max(cands, key=lambda l: int(l.getTime()))
             lat = float(loc.getLatitude())
             lon = float(loc.getLongitude())
             speed = 0.0
             try:
                 if loc.hasSpeed():
                     speed = float(loc.getSpeed())
+            except Exception:
+                pass
+            try:
+                fix_ms = int(loc.getTime())
+                self.last_fix = {
+                    "accuracy_m": float(loc.getAccuracy()) if loc.hasAccuracy() else None,
+                    "fix_time_ms": fix_ms,
+                    "age_s": max(0.0, time.time() - fix_ms / 1000.0),
+                    "provider": str(loc.getProvider()),
+                }
             except Exception:
                 pass
             return lat, lon, speed
@@ -242,28 +369,12 @@ class TrafficLawDB:
         "MoRTH. The reporter voluntarily provides this information and shall not "
         "be compelled to be a witness or disclose personal identity."
     )
-    VERIFIED_EMAILS = {
-        "DL": ["addlcp.tfchq@delhipolice.gov.in"],
-        "MH": ["sp.hsp.hq@mahapolice.gov.in", "cp.mumbai.jtcp.traf@mahapolice.gov.in"],
-        "KA": ["bangloretrafficpolice@gmail.com"],
-        "TN": ["cctnstn@tn.gov.in"],
-        "UP": ["traffic_dir@uppolice.gov.in"],
-        "HR": ["igp.lo@hry.nic.in", "dcp.trafficggn@hry.nic.in"],
-        "KL": ["sptrafficsz.pol@kerala.gov.in"],
-        "GJ": ["dig-traffic-ahd@gujarat.gov.in"],
-        "WB": ["dctp@kolkatatrafficpolice.gov.in"],
-        "TS": ["addlcptraffic@hyd.tspolice.gov.in"],
-        "PB": ["trafficpolicepunjab@gmail.com"],
-        "RJ": ["adgp.traffic@rajpolice.gov.in"],
-        "GA": ["sp_traffic@goapolice.gov.in"],
-    }
-    STATE_NAME_TO_CODE = {
-        "Delhi": "DL", "National Capital Territory of Delhi": "DL",
-        "Maharashtra": "MH", "Karnataka": "KA", "Tamil Nadu": "TN",
-        "Uttar Pradesh": "UP", "Haryana": "HR", "Kerala": "KL",
-        "Gujarat": "GJ", "West Bengal": "WB", "Telangana": "TS",
-        "Punjab": "PB", "Rajasthan": "RJ", "Goa": "GA",
-    }
+    # Police email directory (36 states/UTs, each verified on an official
+    # page; sources in civic.CivicDirectory.SOURCES). Kept in civic.py so the
+    # app and the unit tests share one copy.
+    VERIFIED_EMAILS = CivicDirectory.EMAILS
+    STATE_NAME_TO_CODE = CivicDirectory.STATE_NAME_TO_CODE
+    CODE_ALIASES = CivicDirectory.CODE_ALIASES
 
 
 class JurisdictionEngine:
@@ -312,14 +423,21 @@ class JurisdictionEngine:
     def route(lat, lon, plate):
         lc = JurisdictionEngine._resolve_state(lat, lon)
         pc = JurisdictionEngine.extract_state_code(plate)
-        le = TrafficLawDB.VERIFIED_EMAILS.get(lc, []) if lc else []
+        pc = TrafficLawDB.CODE_ALIASES.get(pc, pc)
+        # Inside a major city, the city's traffic wing handles the road.
+        city = CivicDirectory.city_for(lat, lon) if lc else None
+        if city:
+            le = city["emails"]
+        else:
+            le = TrafficLawDB.VERIFIED_EMAILS.get(lc, []) if lc else []
         pe = TrafficLawDB.VERIFIED_EMAILS.get(pc, []) if pc else []
         seen, out = set(), []
         for e in le + pe:
             if e and e not in seen:
                 seen.add(e)
                 out.append(e)
-        return {"lc": lc, "pc": pc, "le": le, "pe": pe, "all": out}
+        return {"lc": lc, "pc": pc, "le": le, "pe": pe, "all": out,
+                "city": city["name"] if city else ""}
 
 
 class AnalyticsEngine:
@@ -346,8 +464,10 @@ class AnalyticsEngine:
         except Exception:
             return img
 
+    paused = False  # set by the power-saving policy
+
     def analyze_frame(self, pixels, image_size, image_pos=None, scale=None, mirror=False):
-        if cv2 is None or np is None:
+        if cv2 is None or np is None or self.paused:
             return
         self._skip += 1
         if self._skip % 3 != 0:
@@ -411,18 +531,37 @@ class PlateOCR:
     CONF_HIGH = 0.85   # Strong regex match with all groups
     CONF_MEDIUM = 0.6  # Partial match
     CONF_LOW = 0.35    # Alphanumeric fallback
+    # Valid RTO state/UT codes. A regex hit on any other two letters (e.g.
+    # "AB 1234" from the second line of a two-line plate) is demoted below
+    # the auto-fill threshold.
+    STATE_CODES = frozenset(
+        "AN AP AR AS BR CG CH DD DL DN GA GJ HP HR JH JK KA KL LA LD MH ML MN "
+        "MP MZ NL OD OR PB PY RJ SK TN TR TS UK UP WB".split()
+    )
+    # Bharat-series (BH) plates carry no state: "22 BH 1234 AA"
+    # (registration year, BH, 4-digit number, 1-2 letters).
+    BH_PLATE_RE = re.compile(r"(\d{2})\s*BH\s*(\d{4})\s*([A-Z]{1,2})\b", re.I)
     # Wall-clock throttle so heavy OCR runs at most a couple times per second
     SCAN_INTERVAL = 0.6    # actively searching
-    HOLD_INTERVAL = 4.0    # re-confirm interval after a successful read
+    HOLD_INTERVAL = 1.5    # re-confirm interval after a confirmed read
+    # Live auto-fill needs the same plate in VOTES_NEEDED of the last
+    # VOTE_WINDOW reads, so a one-frame misread (e.g. "4" read as "Z")
+    # never reaches the form. SCAN/CAPTURE reads stay single-shot.
+    VOTES_NEEDED = 2
+    VOTE_WINDOW = 5
+    BOX_TTL = 1.5          # seconds a plate box stays drawn on the preview
 
     def __init__(self):
         self._engine = None        # "mlkit" | "tesseract" | None
         self._recognizer = None    # ML Kit client
+        self._jc = {}              # Java classes cached for worker threads
         self._tess = None          # pytesseract module
         self._last_plate = ""
         self._last_confidence = 0.0
         self._last_attempt = 0.0
         self._region_found = False
+        self._votes = collections.deque(maxlen=self.VOTE_WINDOW)
+        self._box = None           # (x, y, w, h, frame_w, frame_h, ts, confirmed)
         self._lock = threading.Lock()
         self._init_engines()
 
@@ -456,6 +595,26 @@ class PlateOCR:
                 )
                 options = Builder().build()
             self._recognizer = TextRecognition.getClient(options)
+            # Resolve every class _ocr_mlkit needs NOW, on the main thread.
+            # OCR runs on worker threads, where pyjnius' autoclass() falls back
+            # to the system class loader and cannot see the APK's bundled ML
+            # Kit / GMS classes (ClassNotFoundException for InputImage), which
+            # silently turned every OCR attempt into "".
+            self._jc = {
+                "Bitmap": autoclass("android.graphics.Bitmap"),
+                "BitmapConfig": autoclass("android.graphics.Bitmap$Config"),
+                "InputImage": autoclass("com.google.mlkit.vision.common.InputImage"),
+                "Tasks": autoclass("com.google.android.gms.tasks.Tasks"),
+                "TimeUnit": autoclass("java.util.concurrent.TimeUnit"),
+                "ByteBuffer": autoclass("java.nio.ByteBuffer"),
+                # Never called directly, but pyjnius wraps returned objects
+                # by class name; pre-registering them here keeps that lookup
+                # off the worker thread's class loader.
+                "Task": autoclass("com.google.android.gms.tasks.Task"),
+                "Text": autoclass("com.google.mlkit.vision.text.Text"),
+                "TextBlock": autoclass("com.google.mlkit.vision.text.Text$TextBlock"),
+                "TextLine": autoclass("com.google.mlkit.vision.text.Text$Line"),
+            }
             return self._recognizer is not None
         except Exception:
             return False
@@ -498,6 +657,21 @@ class PlateOCR:
         with self._lock:
             return self._region_found
 
+    @property
+    def candidates(self):
+        """Distinct plates from recent live reads, most frequent first."""
+        with self._lock:
+            votes = [v for v in self._votes if v]
+        return sorted(set(votes), key=lambda p: (-votes.count(p), votes[::-1].index(p)))
+
+    def box(self):
+        """Recent plate box for the preview overlay, or None when stale."""
+        with self._lock:
+            b = self._box
+        if b is None or time.time() - b[6] > self.BOX_TTL:
+            return None
+        return b
+
     def reset(self):
         """Clear last detection state."""
         with self._lock:
@@ -505,6 +679,8 @@ class PlateOCR:
             self._last_confidence = 0.0
             self._last_attempt = 0.0
             self._region_found = False
+            self._votes.clear()
+            self._box = None
 
     # ── Plate candidate cropping ─────────────────────────────────────────
     @staticmethod
@@ -613,15 +789,31 @@ class PlateOCR:
         text = re.sub(r"\s+", " ", text).strip()
 
         best_plate, best_conf = "", 0.0
-        for m in PlateOCR.INDIAN_PLATE_RE.finditer(text):
-            state = m.group(1).upper()
-            dist = m.group(2)
-            series = m.group(3).upper()
-            num = m.group(4)
-            plate = "%s%s%s%s" % (state, dist, series, num)
-            conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
-            if conf > best_conf:
-                best_plate, best_conf = plate, conf
+        # Also try the text with spaces removed: ML Kit returns two-line
+        # plates as "DL 3C\nAB 1234", where the series is split across the
+        # break and the spaced form only matches the bogus "AB1234".
+        for cand in (text, text.replace(" ", "")):
+            for m in PlateOCR.INDIAN_PLATE_RE.finditer(cand):
+                state = m.group(1).upper()
+                dist = m.group(2)
+                series = m.group(3).upper()
+                num = m.group(4)
+                plate = "%s%s%s%s" % (state, dist, series, num)
+                conf = PlateOCR.CONF_HIGH if series else PlateOCR.CONF_MEDIUM
+                if state not in PlateOCR.STATE_CODES:
+                    conf -= 0.25
+                # Current plates always print a 4-digit number; a 3-digit
+                # block usually means a digit was misread as a letter and
+                # absorbed into the series ("EV4011" -> "EVZ011").
+                if len(num) == 3:
+                    conf -= 0.05
+                if conf > best_conf:
+                    best_plate, best_conf = plate, conf
+        for cand in (text, text.replace(" ", "")):
+            for m in PlateOCR.BH_PLATE_RE.finditer(cand):
+                plate = "%sBH%s%s" % (m.group(1), m.group(2), m.group(3).upper())
+                if PlateOCR.CONF_HIGH > best_conf:
+                    best_plate, best_conf = plate, PlateOCR.CONF_HIGH
         if best_plate:
             return best_plate, best_conf
 
@@ -636,17 +828,16 @@ class PlateOCR:
         """Run Google ML Kit text recognition on a BGR image.
 
         Must run on a background thread — ML Kit's Tasks.await raises if
-        called on the Android main thread. Returns raw text or "".
+        called on the Android main thread. Returns (raw text, lines) where
+        lines is [(line_text, (x, y, w, h)), ...] in image pixels.
         """
-        if self._recognizer is None or autoclass is None:
-            return ""
+        if self._recognizer is None or not self._jc:
+            return "", []
         try:
-            Bitmap = autoclass("android.graphics.Bitmap")
-            BitmapConfig = autoclass("android.graphics.Bitmap$Config")
-            InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
-            Tasks = autoclass("com.google.android.gms.tasks.Tasks")
-            TimeUnit = autoclass("java.util.concurrent.TimeUnit")
-            ByteBuffer = autoclass("java.nio.ByteBuffer")
+            jc = self._jc  # resolved on the main thread in _init_mlkit
+            Bitmap, BitmapConfig = jc["Bitmap"], jc["BitmapConfig"]
+            InputImage, Tasks = jc["InputImage"], jc["Tasks"]
+            TimeUnit, ByteBuffer = jc["TimeUnit"], jc["ByteBuffer"]
 
             h, w = bgr.shape[:2]
             rgba = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA)
@@ -660,33 +851,63 @@ class PlateOCR:
             tasks_await = getattr(Tasks, "await")
             result = tasks_await(task, 5, TimeUnit.SECONDS)
             raw = result.getText() if result else ""
+            lines = []
+            try:
+                blocks = result.getTextBlocks()
+                for bi in range(blocks.size()):
+                    lns = blocks.get(bi).getLines()
+                    for li in range(lns.size()):
+                        ln = lns.get(li)
+                        r = ln.getBoundingBox()
+                        if r is not None:
+                            lines.append((ln.getText() or "",
+                                          (r.left, r.top, r.width(), r.height())))
+            except Exception:
+                lines = []
             bitmap.recycle()
-            return raw or ""
+            return raw or "", lines
         except Exception:
-            return ""
+            return "", []
 
     # ── Tesseract OCR (desktop / dev) ────────────────────────────────────
     def _ocr_tesseract(self, bgr):
-        """Run pytesseract on a BGR image. Returns raw text or ""."""
+        """Run pytesseract on a BGR image. Returns (raw text, [])."""
         if self._tess is None or cv2 is None:
-            return ""
+            return "", []
         try:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             # PSM 6/11 work well for plates; restrict charset.
             cfg = ("--oem 1 --psm 6 -c "
                    "tessedit_char_whitelist="
                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-            return self._tess.image_to_string(rgb, config=cfg) or ""
+            return self._tess.image_to_string(rgb, config=cfg) or "", []
         except Exception:
-            return ""
+            return "", []
 
     def _ocr(self, bgr):
-        """Dispatch to the active OCR engine."""
+        """Dispatch to the active OCR engine. Returns (raw, lines)."""
         if self._engine == "mlkit":
             return self._ocr_mlkit(bgr)
         if self._engine == "tesseract":
             return self._ocr_tesseract(bgr)
-        return ""
+        return "", []
+
+    @staticmethod
+    def plate_box(plate, lines, scale=1.0, offset=(0, 0)):
+        """Union box of the OCR lines that make up `plate` (two-line plates
+        span two lines), mapped back by 1/scale + offset. None if unmatched."""
+        boxes = []
+        for text, (x, y, w, h) in lines:
+            t = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+            if len(t) >= 3 and (t in plate or plate in t):
+                boxes.append((x, y, x + w, y + h))
+        if not boxes:
+            return None
+        x1 = min(b[0] for b in boxes) / scale + offset[0]
+        y1 = min(b[1] for b in boxes) / scale + offset[1]
+        x2 = max(b[2] for b in boxes) / scale + offset[0]
+        y2 = max(b[3] for b in boxes) / scale + offset[1]
+        return (x1, y1, x2 - x1, y2 - y1)
 
     # ── OpenCV character-region detector (signal only, NOT text OCR) ──────
     @staticmethod
@@ -722,24 +943,36 @@ class PlateOCR:
 
     # ── Core read: full-frame first, then crop refinement ────────────────
     def _read_best(self, bgr):
-        """Read the best plate from an image. Returns (plate, conf, chars)."""
-        best_plate, best_conf, chars_seen = "", 0.0, 0
+        """Read the best plate from an image.
+
+        Returns (plate, conf, chars, box); box is (x, y, w, h) in `bgr`
+        pixels or None.
+        """
+        best_plate, best_conf, chars_seen, best_box = "", 0.0, 0, None
         if self._engine is not None:
             # 1. Full-frame OCR — the engine locates text itself, which is
             #    far more robust than relying on contour cropping.
-            raw = self._ocr(self.enhance_for_ocr(bgr))
+            enh = self.enhance_for_ocr(bgr)
+            raw, lines = self._ocr(enh)
             if raw:
                 plate, conf = self.clean_plate_text(raw)
                 if conf > best_conf:
                     best_plate, best_conf = plate, conf
+                    best_box = self.plate_box(
+                        plate, lines, enh.shape[1] / float(bgr.shape[1]))
             # 2. Cropped-candidate refinement when the full frame was weak.
             if best_conf < self.CONF_HIGH:
-                for crop, _bbox in self.crop_plate_candidates(bgr):
-                    raw = self._ocr(self.enhance_for_ocr(crop))
+                for crop, (cx, cy, _cw, _ch) in self.crop_plate_candidates(bgr):
+                    enh = self.enhance_for_ocr(crop)
+                    raw, lines = self._ocr(enh)
                     if raw:
                         plate, conf = self.clean_plate_text(raw)
                         if conf > best_conf:
                             best_plate, best_conf = plate, conf
+                            pad = 6  # crop_plate_candidates pads by 6px
+                            best_box = self.plate_box(
+                                plate, lines, enh.shape[1] / float(crop.shape[1]),
+                                (max(0, cx - pad), max(0, cy - pad)))
                             if conf >= self.CONF_HIGH:
                                 break
                     if best_conf < self.CONF_MEDIUM:
@@ -750,11 +983,14 @@ class PlateOCR:
             # No OCR engine: only report whether a plate region is visible.
             for crop, _bbox in self.crop_plate_candidates(bgr):
                 chars_seen = max(chars_seen, self._detect_char_regions(crop))
-        return best_plate, best_conf, chars_seen
+        return best_plate, best_conf, chars_seen, best_box
 
     # ── Live pipeline (throttled, called from the analysis worker) ───────
     def process_frame(self, bgr):
-        """Throttled live OCR. Returns (plate, confidence)."""
+        """Throttled live OCR with multi-frame voting.
+
+        Returns (plate, confidence) of the last *confirmed* plate.
+        """
         now = time.time()
         with self._lock:
             interval = (self.HOLD_INTERVAL if self._last_confidence > 0.5
@@ -763,19 +999,28 @@ class PlateOCR:
                 return self._last_plate, self._last_confidence
             self._last_attempt = now
 
-        plate, conf, chars = self._read_best(bgr)
+        plate, conf, chars, box = self._read_best(bgr)
 
         with self._lock:
             self._region_found = chars >= 4
+            # Every completed read advances the window (None = no plate), so
+            # an old one-off misread ages out instead of pairing with a match
+            # read much later.
+            self._votes.append(plate if conf > 0.5 else None)
             if conf > 0.5:
-                self._last_plate = plate
-                self._last_confidence = conf
+                confirmed = self._votes.count(plate) >= self.VOTES_NEEDED
+                if confirmed:
+                    self._last_plate = plate
+                    self._last_confidence = conf
+                if box is not None:
+                    h, w = bgr.shape[:2]
+                    self._box = box + (w, h, now, confirmed)
             return self._last_plate, self._last_confidence
 
     # ── Forced pipeline (capture / on-demand scan; bg thread) ────────────
     def process_image(self, bgr):
         """Force a fresh full read, bypassing throttle. Returns (plate, conf)."""
-        plate, conf, chars = self._read_best(bgr)
+        plate, conf, chars, _box = self._read_best(bgr)
         with self._lock:
             self._region_found = chars >= 4
             if conf > 0.5:
@@ -913,9 +1158,7 @@ class CameraWatchdog:
 
     def frame_received(self):
         self._last_frame_ts = time.time()
-        if self._reconnecting:
-            self._reconnecting = False
-            self._backoff = 2.0
+        self._backoff = 2.0
 
     def _check(self, _dt):
         if self._reconnecting:
@@ -927,10 +1170,19 @@ class CameraWatchdog:
             self._backoff = min(self._backoff * 2, self._max_backoff)
 
     def _do_reconnect(self):
-        try:
-            self._reconnect_cb()
-        except Exception:
-            pass
+        # Frames may have resumed during the backoff delay; don't bounce a
+        # healthy camera.
+        if time.time() - self._last_frame_ts > 5.0:
+            try:
+                self._reconnect_cb()
+            except Exception:
+                pass
+        # Re-arm: give the new connection a fresh 5s grace window, and let
+        # _check schedule another (backed-off) attempt if frames still don't
+        # arrive. Without this a failed reconnect left _reconnecting stuck True
+        # and the watchdog never retried again.
+        self._last_frame_ts = time.time()
+        self._reconnecting = False
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -945,6 +1197,8 @@ class DashcamRecorder:
     SEGMENT_DURATION = 120   # seconds per segment
     MAX_SEGMENTS = 5         # keep at most 5 segments (~10 min)
     FRAME_INTERVAL = 1.0     # save 1 frame per second
+    CLIP_FPS = 4             # in-memory ring for "save last N s" clips
+    CLIP_SECONDS = 15
 
     def __init__(self, frame_buffer, base_dir):
         self._buffer = frame_buffer
@@ -956,6 +1210,10 @@ class DashcamRecorder:
         self._last_save_ts = 0
         self._recording = False
         self._frame_count = 0
+        # (timestamp, JPEG bytes) for the last CLIP_SECONDS at CLIP_FPS
+        self._clip = collections.deque(maxlen=self.CLIP_FPS * self.CLIP_SECONDS)
+        self._clip_lock = threading.Lock()
+        self._last_clip_ts = 0
 
     def start(self):
         self._running = True
@@ -991,14 +1249,22 @@ class DashcamRecorder:
                 time.sleep(0.1)
                 continue
             now = time.time()
+            if now - self._last_clip_ts < 1.0 / self.CLIP_FPS:
+                time.sleep(0.03)
+                continue
+            self._last_clip_ts = now
+            jpeg = self._encode(frame)
+            if jpeg is None:
+                continue
+            with self._clip_lock:
+                self._clip.append((now, jpeg))
             if now - self._last_save_ts < self.FRAME_INTERVAL:
-                time.sleep(0.05)
                 continue
             # Rotate segment if needed
             if (self._current_segment_dir is None or
                     now - self._segment_start >= self.SEGMENT_DURATION):
                 self._new_segment()
-            self._save_frame(frame)
+            self._save_frame(jpeg)
             self._last_save_ts = now
 
     def _new_segment(self):
@@ -1022,24 +1288,59 @@ class DashcamRecorder:
         except Exception:
             pass
 
-    def _save_frame(self, frame):
+    @staticmethod
+    def _encode(frame):
+        """RGBA ring-buffer frame -> JPEG ndarray (or None)."""
         if cv2 is None or np is None:
-            return
+            return None
         try:
             _ts, pixels, image_size = frame
             w, h = image_size
             arr = np.frombuffer(pixels, dtype=np.uint8).reshape((h, w, 4))
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            return buf if ok else None
+        except Exception:
+            return None
+
+    def _save_frame(self, jpeg):
+        try:
             fname = "f_%s.jpg" % datetime.now().strftime("%H%M%S_%f")
-            fpath = os.path.join(self._current_segment_dir, fname)
-            ok, buf = cv2.imencode(
-                ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )
-            if ok:
-                buf.tofile(fpath)
-                self._frame_count += 1
+            jpeg.tofile(os.path.join(self._current_segment_dir, fname))
+            self._frame_count += 1
         except Exception:
             pass
+
+    def save_clip(self, out_path):
+        """Write the last CLIP_SECONDS as a Motion-JPEG AVI (OpenCV's built-in
+        writer, no ffmpeg needed). Returns (path, frame_count) or ("", 0)."""
+        if cv2 is None:
+            return "", 0
+        # The deque bounds frame count, not age: after recording pauses
+        # (power saving) it still holds old frames, which must not be saved
+        # under a new incident timestamp.
+        cutoff = time.time() - self.CLIP_SECONDS
+        with self._clip_lock:
+            frames = [f for f in self._clip if f[0] >= cutoff]
+        if len(frames) < 2:
+            return "", 0
+        try:
+            first = cv2.imdecode(frames[0][1], cv2.IMREAD_COLOR)
+            h, w = first.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            vw = cv2.VideoWriter(out_path, fourcc, float(self.CLIP_FPS), (w, h))
+            if not vw.isOpened():
+                return "", 0
+            n = 0
+            for _ts, jpeg in frames:
+                img = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)
+                if img is not None and img.shape[:2] == (h, w):
+                    vw.write(img)
+                    n += 1
+            vw.release()
+            return (out_path, n) if n else ("", 0)
+        except Exception:
+            return "", 0
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1149,6 +1450,86 @@ class EvidenceHasher:
             return EvidenceHasher.hash_file(filepath) == stored
         except Exception:
             return None
+
+
+class EvidenceProof:
+    """Signed provenance record (<image>.proof.json) for an evidence photo.
+
+    The payload (file SHA-256, capture time, GPS fix with accuracy and the
+    fix's own satellite/network timestamp, device, app version) is signed
+    with an EC P-256 key generated inside the Android Keystore. The private
+    key never leaves the secure hardware, so a matching signature shows the
+    record was produced on this device and not edited afterwards. Verify
+    with the embedded public key (SHA256withECDSA over the payload bytes).
+    """
+
+    ALIAS = "sentinelx_evidence_v1"
+    ALGORITHM = "SHA256withECDSA"
+
+    @staticmethod
+    def build_payload(path, digest, lat, lon, fix, device="", app_version=""):
+        fix = fix or {}
+        return {
+            "file": os.path.basename(path),
+            "sha256": digest,
+            "captured_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lat": round(float(lat), 6), "lon": round(float(lon), 6),
+            "gps_accuracy_m": fix.get("accuracy_m"),
+            "gps_fix_time_ms": fix.get("fix_time_ms"),
+            "gps_provider": fix.get("provider"),
+            "device": device, "app_version": app_version,
+        }
+
+    @staticmethod
+    def _key():
+        """(private key, public key bytes), creating the key on first use."""
+        KeyStore = autoclass("java.security.KeyStore")
+        ks = KeyStore.getInstance("AndroidKeyStore")
+        ks.load(None, None)
+        if not ks.containsAlias(EvidenceProof.ALIAS):
+            KPG = autoclass("java.security.KeyPairGenerator")
+            Props = autoclass("android.security.keystore.KeyProperties")
+            Spec = autoclass("android.security.keystore.KeyGenParameterSpec$Builder")
+            kpg = KPG.getInstance("EC", "AndroidKeyStore")
+            # setDigests is Java varargs: pass the value itself. A Python
+            # list gets wrapped into String[][] and aborts the JVM
+            # (ArrayStoreException surfaced as a JNI abort, not catchable).
+            spec = Spec(EvidenceProof.ALIAS, Props.PURPOSE_SIGN) \
+                .setDigests(Props.DIGEST_SHA256).build()
+            kpg.initialize(spec)
+            kpg.generateKeyPair()
+        from jnius import cast
+        priv = cast("java.security.PrivateKey", ks.getKey(EvidenceProof.ALIAS, None))
+        pub = bytes(ks.getCertificate(EvidenceProof.ALIAS).getPublicKey().getEncoded())
+        return priv, pub
+
+    @staticmethod
+    def write(path, payload):
+        """Sign `payload` and write <path>.proof.json. Returns the proof path,
+        or "" off-device / on failure (the photo itself is unaffected)."""
+        if platform != "android" or autoclass is None:
+            return ""
+        try:
+            import base64
+            body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            priv, pub = EvidenceProof._key()
+            sig = autoclass("java.security.Signature").getInstance(EvidenceProof.ALGORITHM)
+            sig.initSign(priv)
+            sig.update(body.encode("utf-8"))
+            signature = bytes(sig.sign())
+            proof = {
+                "payload": body,
+                "algorithm": EvidenceProof.ALGORITHM,
+                "signature_b64": base64.b64encode(signature).decode("ascii"),
+                "public_key_b64": base64.b64encode(pub).decode("ascii"),
+                "key_store": "AndroidKeyStore",
+            }
+            ppath = path + ".proof.json"
+            with open(ppath, "w") as f:
+                json.dump(proof, f, indent=1)
+            return ppath
+        except Exception:
+            return ""
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1546,13 +1927,40 @@ if Preview is not None:
         _frame_buffer = None
         _watchdog = None
 
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            # camera4kivy recomputes the view only in on_size. When layout
+            # moves the widget without resizing it, the camera image stayed
+            # at the old position (drawn below the box, over the form).
+            inner = getattr(self, "preview", None)
+            if inner is not None and hasattr(inner, "on_size"):
+                inner.bind(pos=lambda w, _p: w.on_size(w, w.size))
+
         def analyze_pixels_callback(self, pixels, image_size, image_pos, scale, mirror):
             if self._watchdog:
                 self._watchdog.frame_received()
-            if self._frame_buffer:
+            # "is not None": FrameRingBuffer defines __len__, so an empty buffer
+            # is falsy and a plain truth test would never push the first frame.
+            if self._frame_buffer is not None:
                 self._frame_buffer.push(time.time(), bytes(pixels), image_size)
             elif self._analytics:
                 self._analytics.analyze_frame(pixels, image_size)
+
+        _plate_ocr = None
+
+        def canvas_instructions_callback(self, texture, tex_size, tex_pos):
+            """Outline the detected plate on the live preview (runs inside
+            the preview's canvas each frame). Amber = seen once, green =
+            confirmed by voting and used for auto-fill."""
+            b = self._plate_ocr.box() if self._plate_ocr else None
+            if not b:
+                return
+            x, y, w, h, fw, fh, _ts, confirmed = b
+            sx, sy = tex_size[0] / float(fw), tex_size[1] / float(fh)
+            Color(*((0, 0.9, 0.46, 1) if confirmed else (1, 0.84, 0.25, 1)))
+            # Analysis pixels are top-down; Kivy's y axis points up.
+            Line(rectangle=(tex_pos[0] + x * sx, tex_pos[1] + (fh - y - h) * sy,
+                            w * sx, h * sy), width=dp(1.6))
     SentinelPreview = _SentinelPreview
 
 
@@ -1560,6 +1968,7 @@ KV = """
 #:import dp kivy.metrics.dp
 #:import sp kivy.metrics.sp
 #:import C kivy.utils.get_color_from_hex
+#:import I18N civic.I18N
 
 # ─── Color Palette ───────────────────────────────────────────────────────
 # bg_primary:     #0B0E17   deep space navy
@@ -1577,6 +1986,9 @@ KV = """
 <Card@BoxLayout>:
     orientation: "vertical"
     size_hint_y: None
+    # Fit content exactly; hand-tuned heights drifted from the children and
+    # either overflowed (Settings) or left a gap above the title.
+    height: self.minimum_height
     padding: dp(12), dp(8)
     spacing: dp(4)
     canvas.before:
@@ -1599,7 +2011,14 @@ KV = """
     padding: dp(4), 0
 
 # ─── Section Header Label ───────────────────────────────────────────────
+# Translated text: render with the current language's Noto font + script
+<TrLabel@Label>:
+    font_name: app.ui_font
+    font_script_name: app.ui_script
+
 <SectionLabel@Label>:
+    font_name: app.ui_font
+    font_script_name: app.ui_script
     size_hint_y: None
     height: dp(22)
     font_size: "11sp"
@@ -1610,19 +2029,19 @@ KV = """
     text_size: self.size
 
 # ─── Styled Text Input ──────────────────────────────────────────────────
+# The fill uses TextInput's own background (flat image + tint) and the border
+# goes in canvas.after. Drawing them in canvas.before appends AFTER the base
+# TextInput instructions, which tinted the typed text with the border colour
+# and painted the fill over the cursor.
 <StyledInput@TextInput>:
-    background_color: (0, 0, 0, 0)
+    background_normal: ""
+    background_active: ""
+    background_color: C("#1A2035")
     foreground_color: C("#E8EAF0")
     cursor_color: C("#00E5FF")
     hint_text_color: (0.45, 0.5, 0.6, 0.7)
     padding: [dp(10), dp(8)]
-    canvas.before:
-        Color:
-            rgba: C("#1A2035")
-        RoundedRectangle:
-            pos: self.pos
-            size: self.size
-            radius: [dp(8)]
+    canvas.after:
         Color:
             rgba: C("#253050") if not self.focus else C("#00E5FF")
         Line:
@@ -1649,6 +2068,8 @@ KV = """
 
 # ─── Action Button ──────────────────────────────────────────────────────
 <ActionBtn@Button>:
+    font_name: app.ui_font
+    font_script_name: app.ui_script
     background_normal: ""
     background_down: ""
     background_color: (0, 0, 0, 0)
@@ -1707,7 +2128,9 @@ KV = """
             text_size: self.size
             size_hint_x: 0.40
         Button:
-            text: "MORE"
+            text: I18N.tr("MORE", app.lang)
+            font_name: app.ui_font
+            font_script_name: app.ui_script
             size_hint_x: 0.30
             font_size: "11sp"
             bold: True
@@ -1724,7 +2147,9 @@ KV = """
                     size: (self.width - dp(8), self.height - dp(8))
                     radius: [dp(8)]
         Button:
-            text: "HISTORY"
+            text: I18N.tr("HISTORY", app.lang)
+            font_name: app.ui_font
+            font_script_name: app.ui_script
             size_hint_x: 0.30
             font_size: "11sp"
             bold: True
@@ -1750,7 +2175,10 @@ KV = """
     BoxLayout:
         id: camera_box
         size_hint_y: None
-        height: dp(210)
+        # Exactly fits the full-width 4:3 landscape preview (plates are wide);
+        # capped when the phone itself is rotated so header + status + action
+        # bar (148dp) still leave a scrollable strip of the form visible.
+        height: min((self.width - dp(20)) * 0.75 + dp(12), max(root.height * 0.45, root.height - dp(300)))
         padding: dp(10), dp(6)
         canvas.before:
             Color:
@@ -1811,30 +2239,39 @@ KV = """
 
             # ── OCR Detection Card ───────────────────────────────────────
             Card:
-                height: dp(34) if not root.ocr_suggest_text else dp(50)
                 Label:
                     id: lbl_ocr_suggest
                     size_hint_y: None
                     height: dp(16) if not root.ocr_suggest_text else dp(32)
-                    text: root.ocr_suggest_text if root.ocr_suggest_text else "Plate OCR: standby"
+                    text: root.ocr_suggest_text if root.ocr_suggest_text else I18N.tr("Plate OCR: standby", app.lang)
+                    font_name: "Roboto" if root.ocr_suggest_text else app.ui_font
+                    font_script_name: "Zyyy" if root.ocr_suggest_text else app.ui_script
                     font_size: "11sp"
                     color: C("#00E676") if root.ocr_suggest_text else C("#4A5270")
                     halign: "left"
+                    valign: "middle"
                     text_size: self.size
+                # Candidate chips: shown when several plates were read
+                # recently; tap one to put it in the Plate field.
+                BoxLayout:
+                    id: ocr_chips
+                    size_hint_y: None
+                    height: dp(34) if self.children else 0
+                    spacing: dp(6)
 
             # ── Settings Card ────────────────────────────────────────────
             Card:
-                height: dp(178)
 
                 SectionLabel:
-                    text: "SETTINGS"
+                    text: I18N.tr("SETTINGS", app.lang)
 
                 ToggleRow:
-                    Label:
-                        text: "Anonymous Reporter"
+                    TrLabel:
+                        text: I18N.tr("Anonymous Reporter", app.lang)
                         font_size: "13sp"
                         color: C("#C8CDDA")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                         size_hint_x: 0.65
                     Switch:
@@ -1843,11 +2280,12 @@ KV = """
                         size_hint_x: 0.35
 
                 ToggleRow:
-                    Label:
-                        text: "CLAHE Night Mode"
+                    TrLabel:
+                        text: I18N.tr("Night Mode", app.lang)
                         font_size: "13sp"
                         color: C("#C8CDDA")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                         size_hint_x: 0.65
                     Switch:
@@ -1856,11 +2294,12 @@ KV = """
                         size_hint_x: 0.35
 
                 ToggleRow:
-                    Label:
-                        text: "CV Assist"
+                    TrLabel:
+                        text: I18N.tr("CV Assist", app.lang)
                         font_size: "13sp"
                         color: C("#C8CDDA")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                         size_hint_x: 0.65
                     Switch:
@@ -1869,11 +2308,12 @@ KV = """
                         size_hint_x: 0.35
 
                 ToggleRow:
-                    Label:
-                        text: "Plate OCR"
+                    TrLabel:
+                        text: I18N.tr("Plate OCR", app.lang)
                         font_size: "13sp"
                         color: C("#C8CDDA")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                         size_hint_x: 0.65
                     Switch:
@@ -1883,23 +2323,23 @@ KV = """
 
             # ── Report Form Card ─────────────────────────────────────────
             Card:
-                height: dp(310)
 
                 SectionLabel:
-                    text: "VIOLATION REPORT"
+                    text: I18N.tr("VIOLATION REPORT", app.lang)
 
                 # Plate input
                 BoxLayout:
                     size_hint_y: None
                     height: dp(40)
                     spacing: dp(8)
-                    Label:
-                        text: "Plate"
+                    TrLabel:
+                        text: I18N.tr("Plate", app.lang)
                         size_hint_x: 0.18
                         font_size: "13sp"
                         bold: True
                         color: C("#00E5FF")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                     StyledInput:
                         id: in_plate
@@ -1913,13 +2353,14 @@ KV = """
                     size_hint_y: None
                     height: dp(40)
                     spacing: dp(8)
-                    Label:
-                        text: "Offense"
+                    TrLabel:
+                        text: I18N.tr("Offense", app.lang)
                         size_hint_x: 0.18
                         font_size: "13sp"
                         bold: True
                         color: C("#00E5FF")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                     StyledSpinner:
                         id: sp_offense
@@ -1937,6 +2378,7 @@ KV = """
                     font_size: "11sp"
                     color: C("#FFD740")
                     halign: "left"
+                    valign: "middle"
                     text_size: self.size
                     padding: dp(4), 0
 
@@ -1945,12 +2387,13 @@ KV = """
                     size_hint_y: None
                     height: dp(40)
                     spacing: dp(6)
-                    Label:
-                        text: "Sign"
+                    TrLabel:
+                        text: I18N.tr("Sign", app.lang)
                         size_hint_x: 0.18
                         font_size: "13sp"
                         color: C("#8892A8")
                         halign: "left"
+                        valign: "middle"
                         text_size: self.size
                     StyledSpinner:
                         id: sp_sign_group
@@ -1971,8 +2414,8 @@ KV = """
                     size_hint_y: None
                     height: dp(62)
                     spacing: dp(8)
-                    Label:
-                        text: "Notes"
+                    TrLabel:
+                        text: I18N.tr("Notes", app.lang)
                         size_hint_x: 0.18
                         font_size: "13sp"
                         color: C("#8892A8")
@@ -1994,15 +2437,15 @@ KV = """
                     font_size: "10sp"
                     color: C("#00E5FF")
                     halign: "left"
+                    valign: "middle"
                     text_size: self.size
                     padding: dp(4), 0
 
             # ── Routing Card ─────────────────────────────────────────────
             Card:
-                height: dp(72)
 
                 SectionLabel:
-                    text: "JURISDICTION ROUTING"
+                    text: I18N.tr("JURISDICTION ROUTING", app.lang)
 
                 Label:
                     size_hint_y: None
@@ -2011,6 +2454,7 @@ KV = """
                     font_size: "11sp"
                     color: C("#00E676")
                     halign: "left"
+                    valign: "middle"
                     text_size: self.size
                     markup: True
 
@@ -2039,22 +2483,22 @@ KV = """
                 size: (self.width, dp(1))
 
         ActionBtn:
-            text: "SCAN"
+            text: I18N.tr("SCAN", app.lang)
             _bg: C("#7C3AED")
             on_release: root.scan_now()
 
         ActionBtn:
-            text: "CAPTURE"
+            text: I18N.tr("CAPTURE", app.lang)
             _bg: C("#0078D4")
             on_release: root.capture_evidence()
 
         ActionBtn:
-            text: "SEND"
+            text: I18N.tr("SEND", app.lang)
             _bg: C("#00C853")
             on_release: root.send_report()
 
         ActionBtn:
-            text: "CLEAR"
+            text: I18N.tr("CLEAR", app.lang)
             _bg: C("#37474F")
             on_release: root.clear_form()
 """
@@ -2086,6 +2530,7 @@ class RootUI(BoxLayout):
         self._watchdog = None
         self._dashcam = None
         self._telemetry = None
+        self._service_cls = None  # p4a ServiceService class, for stop()
         # Phase 2
         self._report_log = None
         # Phase 3
@@ -2103,28 +2548,20 @@ class RootUI(BoxLayout):
         # Phase 6 — citizen features
         self._privacy_blur = False
         self._dup_ack = False
+        self._evidence_uri = None  # MediaStore copy of the last capture
+        self._evidence_annotated = ""
+        self._evidence_quality = {}
+        self._quality_ack = False
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
-        """Get a writable, user-visible evidence folder."""
-        # Try shared Pictures/SentinelX first (visible in gallery)
-        if platform == "android":
-            try:
-                Environment = autoclass("android.os.Environment")
-                pic_dir = Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_PICTURES
-                ).getAbsolutePath()
-                d = os.path.join(pic_dir, "SentinelX")
-                os.makedirs(d, exist_ok=True)
-                # Test write
-                test = os.path.join(d, ".test")
-                with open(test, "w") as f:
-                    f.write("ok")
-                os.remove(test)
-                return d
-            except Exception:
-                pass
-        # Fallback: app private dir
+        """App-private working folder for evidence, logs, queue and dashcam.
+
+        Shared Pictures/ can't be written with plain file I/O under scoped
+        storage (targetSdk 33), and logs/queue JSON don't belong in a media
+        folder anyway. Captured photos are additionally published to the
+        gallery via MediaStore (see _publish_to_gallery).
+        """
         try:
             base = App.get_running_app().user_data_dir
         except Exception:
@@ -2204,6 +2641,7 @@ class RootUI(BoxLayout):
                         continue
                 if svc is not None:
                     svc.start(mActivity, "")
+                    self._service_cls = svc
             except Exception:
                 pass
         # Phase 2: Report log
@@ -2227,14 +2665,54 @@ class RootUI(BoxLayout):
         # Phase 5: Plate OCR
         self._plate_ocr = PlateOCR()
         self._analytics.set_plate_ocr(self._plate_ocr)
+        if self._preview is not None:
+            self._preview._plate_ocr = self._plate_ocr
         # Phase 6: load VAHAN (Masters India) credentials from vahan.json if present
         self._load_vahan_config()
+        # Police directory: apply the last downloaded copy, then refresh it
+        self._load_directory_updates()
+        # Battery / heat watch for the always-on camera pipeline
+        self._power_saving = False
+        Clock.schedule_interval(self._check_power, 30.0)
+        Clock.schedule_once(self._check_power, 5.0)
+        # Hands-free incident flag: double-press a volume key
+        self._start_flag_gesture()
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
         Clock.schedule_interval(self._tick_ui, 1.0)
         # Phase 6: silent update check shortly after launch (Play or GitHub OTA)
         Clock.schedule_once(lambda _dt: self._auto_update_check(False), 4.0)
+        # Remind about week-old reports that may need escalation
+        Clock.schedule_once(lambda _dt: self._check_followups(), 8.0)
+
+    def _load_directory_updates(self):
+        """Apply the cached police directory, then fetch the latest one
+        published with the newest release (validated before use)."""
+        try:
+            path = os.path.join(App.get_running_app().user_data_dir, "directory.json")
+        except Exception:
+            return
+        try:
+            if os.path.isfile(path):
+                with open(path, "r") as f:
+                    CivicDirectory.apply_overrides(json.load(f))
+        except Exception:
+            pass
+
+        def fetch():
+            try:
+                import urllib.request
+                with urllib.request.urlopen(CivicDirectory.DIRECTORY_URL, timeout=10) as r:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+                if CivicDirectory.apply_overrides(data):
+                    tmp = path + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, path)
+            except Exception:
+                pass  # offline / no release yet: keep the built-in copy
+        threading.Thread(target=fetch, daemon=True).start()
 
     def _load_vahan_config(self):
         """Load Masters India VAHAN credentials from <data dir>/vahan.json."""
@@ -2259,6 +2737,14 @@ class RootUI(BoxLayout):
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
+        # A fresh live fix beats the service's telemetry, which only reads
+        # the (possibly days-old) last-known location.
+        if self._gps is not None:
+            lat, lon, speed = self._gps.get_location()
+            if lat and lon and self._gps.last_fix.get("age_s", 1e9) < 15:
+                self.latest_lat, self.latest_lon = lat, lon
+                self.latest_speed = speed
+                return
         t = self._telemetry.latest if self._telemetry else {}
         if t.get("lat", 0) != 0 and t.get("lon", 0) != 0:
             self.latest_lat = t["lat"]
@@ -2279,7 +2765,9 @@ class RootUI(BoxLayout):
     # ── Accelerometer polling (prefer service telemetry) ──────────────
     def _poll_accel(self, _dt):
         t = self._telemetry.latest if self._telemetry else {}
-        if "g_dyn" in t:
+        # Only trust the service's g_dyn when it reports a live sensor; older
+        # service builds sent a constant (0, 0, 9.81) fallback (g_dyn == 0).
+        if t.get("accel_ok") and "g_dyn" in t:
             self.latest_g = t["g_dyn"]
         else:
             # Fallback to direct plyer
@@ -2287,12 +2775,13 @@ class RootUI(BoxLayout):
                 return
             try:
                 val = plyer_accel.acceleration
-                if val and val[0] is not None:
-                    x, y, z = float(val[0]), float(val[1]), float(val[2] or 9.81)
+                if val and None not in val[:3]:
+                    x, y, z = float(val[0]), float(val[1]), float(val[2])
                     g_total = math.sqrt(x * x + y * y + z * z)
                     self.latest_g = abs(g_total - 9.81)
             except Exception:
                 pass
+        self._check_crash()
         # Phase 4: Record harsh braking events (debounce 5s)
         now = time.time()
         if (self.latest_g > 4.0 and self._harsh_brake_log and
@@ -2319,7 +2808,11 @@ class RootUI(BoxLayout):
             ))
             return
         try:
-            self._preview = SentinelPreview()
+            # Landscape 4:3 view across the full width: a portrait preview in a
+            # wide box was a narrow strip with black bars, too small to frame
+            # a whole number plate.
+            self._preview = SentinelPreview(aspect_ratio="4:3",
+                                            orientation="landscape")
             self._preview._analytics = self._analytics
             self.ids.camera_box.add_widget(self._preview)
             Clock.schedule_once(lambda dt: self._connect_cam(), 0.5)
@@ -2345,9 +2838,9 @@ class RootUI(BoxLayout):
             except Exception:
                 pass
         # Phase 1: Start watchdog after camera connects
-        if self._cam_ok:
-            if self._watchdog:
-                self._watchdog.stop()
+        # Reuse the existing watchdog across reconnects so its exponential
+        # backoff state survives (a fresh one would always restart at 2s).
+        if self._cam_ok and self._watchdog is None:
             self._watchdog = CameraWatchdog(self._reconnect_camera)
             self._preview._watchdog = self._watchdog
             self._watchdog.start()
@@ -2376,63 +2869,76 @@ class RootUI(BoxLayout):
         try:
             # export_to_png grabs current frame from the preview texture
             self._preview.export_to_png(fpath)
-
-            if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
-                # Apply CLAHE if enabled
-                if self.ids.sw_clahe.active and cv2:
-                    try:
-                        img = cv2.imread(fpath)
-                        if img is not None:
-                            enhanced = AnalyticsEngine.clahe(img)
-                            cv2.imwrite(fpath, enhanced)
-                    except Exception:
-                        pass
-
-                # Phase 6: Optional privacy blur of bystander faces (opt-in via
-                # MORE menu; off by default because a rider's head can itself be
-                # evidence of a helmet/phone violation).
-                if getattr(self, "_privacy_blur", False) and cv2:
-                    try:
-                        img = cv2.imread(fpath)
-                        if img is not None:
-                            cv2.imwrite(fpath, PrivacyBlur.blur_faces(img))
-                    except Exception:
-                        pass
-
-                # Phase 2: Watermark evidence with metadata
-                plate = self.ids.in_plate.text.strip()
-                EvidenceWatermark.apply(
-                    fpath, float(self.latest_lat), float(self.latest_lon),
-                    ts, plate
-                )
-                # Phase 2: Hash evidence for tamper detection
-                EvidenceHasher.write_hashfile(fpath)
-                self.evidence_path = fpath
-                self.evidence_status = "Evidence: %s" % fname
-                self._popup("Saved!", "Photo saved to:\nSentinelX/%s" % fname)
-                # Auto-dismiss evidence notification after 5 seconds
-                _fname = fname  # capture for closure
-                def _dismiss(dt, fn=_fname):
-                    if self.evidence_status.endswith(fn):
-                        self.evidence_status = ""
-                Clock.schedule_once(_dismiss, 5.0)
-
-                # Notify Android gallery about new file
-                self._notify_gallery(fpath)
-
-                # Phase 5: OCR the full-resolution evidence and auto-fill the
-                # plate if the user has not entered one. Runs on a background
-                # thread (ML Kit must not block the UI thread).
-                if (not self.ids.in_plate.text.strip()
-                        and self._plate_ocr and self._plate_ocr.available):
-                    threading.Thread(
-                        target=self._ocr_image_worker,
-                        args=(fpath, False), daemon=True,
-                    ).start()
-            else:
+            if not (os.path.isfile(fpath) and os.path.getsize(fpath) > 0):
                 self._popup("Failed", "File was not created.")
+                return
+
+            # The ORIGINAL is never modified: it is what gets hashed, signed,
+            # attached to the police email and sent to official apps (Delhi's
+            # Traffic Prahari rejects edited evidence). Night enhancement,
+            # face blur and the watermark go on a separate annotated copy.
+            EvidenceHasher.write_hashfile(fpath)
+            self._write_proof(fpath)
+            plate = self.ids.in_plate.text.strip()
+            annotated, quality = self._make_annotated(fpath, ts, plate)
+            self._evidence_quality = quality
+
+            self.evidence_path = fpath
+            self._evidence_annotated = annotated
+            self.evidence_status = "Evidence: %s%s" % (
+                fname, " (night-enhanced copy)" if quality.get("night") else "")
+            self._evidence_uri = self._publish_to_gallery(fpath)
+            if annotated:
+                self._publish_to_gallery(annotated, "Pictures/SentinelX/Annotated",
+                                         "image/jpeg")
+            where = ("Pictures/SentinelX/%s" % fname if self._evidence_uri
+                     else fname)
+            self._popup("Saved!", "Original photo saved to:\n%s%s" % (
+                where, "\n\nAnnotated copy in Pictures/SentinelX/Annotated"
+                if annotated else ""))
+            _fname = fname  # capture for closure
+
+            def _dismiss(dt, fn=_fname):
+                if fn in self.evidence_status:
+                    self.evidence_status = ""
+            Clock.schedule_once(_dismiss, 5.0)
+
+            # Phase 5: OCR the full-resolution evidence and auto-fill the
+            # plate if the user has not entered one. Runs on a background
+            # thread (ML Kit must not block the UI thread).
+            if (not plate and self._plate_ocr and self._plate_ocr.available):
+                threading.Thread(
+                    target=self._ocr_image_worker,
+                    args=(fpath, False), daemon=True,
+                ).start()
         except Exception as e:
             self._popup("Capture Error", str(e))
+
+    def _make_annotated(self, path, ts, plate):
+        """Build <name>_annotated.jpg (night enhancement when the photo is
+        dark or Night Mode is on, optional face blur, metadata watermark).
+        Returns (annotated path or "", quality dict)."""
+        quality = {}
+        if cv2 is None:
+            return "", quality
+        img = cv2.imread(path)
+        if img is None:
+            return "", quality
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        quality["sharpness"] = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        quality["brightness"] = float(gray.mean())
+        # Automatic night mode: enhance dark scenes even if the switch is off
+        night = self.ids.sw_clahe.active or quality["brightness"] < QualityCheck.DARK_MEAN
+        quality["night"] = bool(night)
+        if night:
+            img = AnalyticsEngine.clahe(img)
+        if getattr(self, "_privacy_blur", False):
+            img = PrivacyBlur.blur_faces(img)
+        out = os.path.splitext(path)[0] + "_annotated.jpg"
+        cv2.imwrite(out, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        EvidenceWatermark.apply(out, float(self.latest_lat),
+                                float(self.latest_lon), ts, plate)
+        return out, quality
 
     # ── On-demand full-resolution scan ───────────────────────────────────
     def scan_now(self):
@@ -2507,21 +3013,116 @@ class RootUI(BoxLayout):
                 "No readable plate found.\nMove closer and hold steady.",
             )
 
-    def _notify_gallery(self, path):
-        """Tell Android to scan the file so it shows in gallery."""
-        if platform != "android" or autoclass is None:
-            return
-        try:
-            Intent = autoclass("android.content.Intent")
-            Uri = autoclass("android.net.Uri")
-            File = autoclass("java.io.File")
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    def _write_proof(self, path):
+        """Sign a provenance record for a captured photo (see EvidenceProof)."""
+        fix = {}
+        if self._gps is not None:
+            self._gps.get_location()  # refresh accuracy / fix time
+            fix = self._gps.last_fix
+        device = ""
+        if platform == "android" and autoclass is not None:
+            try:
+                Build = autoclass("android.os.Build")
+                device = "%s %s" % (Build.MANUFACTURER, Build.MODEL)
+            except Exception:
+                pass
+        payload = EvidenceProof.build_payload(
+            path, EvidenceHasher.hash_file(path), self.latest_lat,
+            self.latest_lon, fix, device, APP_VERSION)
+        return EvidenceProof.write(path, payload)
 
-            intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-            intent.setData(Uri.fromFile(File(path)))
-            PythonActivity.mActivity.sendBroadcast(intent)
+    def _publish_to_gallery(self, path, folder="Pictures/SentinelX",
+                            mime="image/png"):
+        """Copy an evidence file into a shared folder via MediaStore.
+
+        Returns the content:// Uri (Java object), or None off-device / on
+        failure. Bytes are copied verbatim so the .sha256 sidecar still
+        matches the gallery copy.
+        """
+        if platform != "android" or autoclass is None:
+            return None
+        out = None
+        try:
+            Media = autoclass("android.provider.MediaStore$Video$Media"
+                              if mime.startswith("video/")
+                              else "android.provider.MediaStore$Downloads"
+                              if mime == "application/pdf"
+                              else "android.provider.MediaStore$Images$Media")
+            Cols = autoclass("android.provider.MediaStore$MediaColumns")
+            ContentValues = autoclass("android.content.ContentValues")
+            Version = autoclass("android.os.Build$VERSION")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            cr = act.getContentResolver()
+            cv = ContentValues()
+            cv.put(Cols.DISPLAY_NAME, os.path.basename(path))
+            cv.put(Cols.MIME_TYPE, mime)
+            if Version.SDK_INT >= 29:
+                cv.put(Cols.RELATIVE_PATH, folder)
+            uri = cr.insert(Media.EXTERNAL_CONTENT_URI, cv)
+            if uri is None:
+                return None
+            with open(path, "rb") as f:
+                data = f.read()
+            out = cr.openOutputStream(uri)
+            out.write(data)
+            return uri
         except Exception:
-            pass
+            return None
+        finally:
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+
+    def _send_email(self, to, subject, body, stream_uri=None):
+        """Open an email composer pre-filled with recipients/subject/body.
+
+        ACTION_SEND + a mailto: selector limits the chooser to email apps
+        (plyer's text/plain share listed every app on the phone) while still
+        allowing the evidence photo to be attached via EXTRA_STREAM.
+        Returns True if a composer was launched.
+        """
+        if platform == "android" and autoclass is not None:
+            try:
+                from jnius import cast
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                String = autoclass("java.lang.String")
+
+                def chars(s):
+                    # Bare str resolves to the wrong putExtra overload and
+                    # mail apps then show an empty subject/body.
+                    return cast("java.lang.CharSequence", String(s))
+
+                i = Intent(Intent.ACTION_SEND)
+                i.setSelector(Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")))
+                if to:
+                    i.putExtra(Intent.EXTRA_EMAIL, list(to))
+                i.putExtra(Intent.EXTRA_SUBJECT, chars(subject))
+                i.putExtra(Intent.EXTRA_TEXT, chars(body))
+                if stream_uri is not None:
+                    ClipData = autoclass("android.content.ClipData")
+                    i.putExtra(Intent.EXTRA_STREAM,
+                               cast("android.os.Parcelable", stream_uri))
+                    # ClipData carries the read grant through the chooser.
+                    i.setClipData(ClipData.newRawUri("", stream_uri))
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                chooser = Intent.createChooser(i, chars("Send report with:"))
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                act.startActivity(chooser)
+                return True
+            except Exception:
+                pass
+        if plyer_email is None:
+            return False
+        try:
+            plyer_email.send(recipient=",".join(to) if to else None,
+                             subject=subject, text=body, create_chooser=True)
+            return True
+        except Exception:
+            return False
 
     # ── UI update ────────────────────────────────────────────────────────
     def _tick_ui(self, _dt):
@@ -2533,13 +3134,18 @@ class RootUI(BoxLayout):
         rcpts = ", ".join(rt["all"]) or DASH
         lc = rt["lc"] or DASH
         pc = rt["pc"] or DASH
+        if rt.get("city"):
+            lc = "%s (%s)" % (lc, rt["city"])
         self.route_text = "Loc:%s Plate:%s\n%s" % (lc, pc, rcpts)
         kmh = self.latest_speed * 3.6
         cv = self._analytics.result if self.ids.sw_cv.active else ""
         # Phase 4: Subsystem status updates
         if self._subsystem_status:
             self._subsystem_status.update("cam", self._cam_ok)
-            self._subsystem_status.update("gps", lat != 0 or lon != 0)
+            age = (self._gps.last_fix.get("age_s") if self._gps else None)
+            self._subsystem_status.update(
+                "gps", (lat != 0 or lon != 0) and (age is None or age < 60),
+                "" if age is None else "%.0fs old" % age)
             self._subsystem_status.update(
                 "dashcam", bool(self._dashcam and self._dashcam.recording)
             )
@@ -2602,6 +3208,8 @@ class RootUI(BoxLayout):
         else:
             self.ocr_suggest_text = ""
 
+        self._update_ocr_chips(ocr_active)
+
         # Phase 5: Update subsystem status for OCR
         if self._subsystem_status and self._plate_ocr:
             self._subsystem_status.update(
@@ -2610,10 +3218,36 @@ class RootUI(BoxLayout):
             )
 
         status_suffix = self._subsystem_status.summary() if self._subsystem_status else ""
-        self.status_text = "%.4f,%.4f | %s | %.0fkm/h | G:%.1f | %s%s\n%s" % (
+        # "You:" makes clear this is the phone's own speed, not a target's.
+        self.status_text = "%.4f,%.4f | %s | You:%.0fkm/h | G:%.1f | %s%s\n%s" % (
             lat, lon, self.state_name or DASH, kmh, self.latest_g, cv,
             zone_warn, status_suffix
         )
+
+    def _update_ocr_chips(self, ocr_active):
+        """Show up to 3 recently read plates as tap targets when more than
+        one plate is in view (e.g. a car behind the offender)."""
+        cands = []
+        if ocr_active and self._plate_ocr is not None:
+            cands = self._plate_ocr.candidates[:3]
+        if len(cands) < 2:
+            cands = []
+        if cands == getattr(self, "_chip_cache", []):
+            return
+        self._chip_cache = cands
+        box = self.ids.ocr_chips
+        box.clear_widgets()
+        from kivy.uix.button import Button
+        for p in cands:
+            b = Button(text=p, font_size="12sp", bold=True,
+                       color=(0.9, 0.93, 0.97, 1), background_normal="",
+                       background_down="", background_color=(0.16, 0.2, 0.33, 1))
+            b.bind(on_release=lambda _b, plate=p: self._pick_plate(plate))
+            box.add_widget(b)
+
+    def _pick_plate(self, plate):
+        self.ids.in_plate.text = plate
+        self._ocr_accepted_plate = plate
 
     # ── Form ─────────────────────────────────────────────────────────────
     def on_offense_selected(self, text):
@@ -2631,12 +3265,15 @@ class RootUI(BoxLayout):
     def clear_form(self):
         self.ids.in_plate.text = ""
         self.ids.in_notes.text = ""
-        self.ids.sp_offense.text = "Select"
+        self.ids.sp_offense.text = "Select violation..."
         self.ids.sp_sign_group.text = "Group"
         self.ids.sp_sign.text = "Sign"
         self.section_penalty = DASH
         self.route_text = DASH
         self.evidence_path = ""
+        self._evidence_uri = None
+        self._evidence_annotated = ""
+        self._evidence_quality = {}
         self.evidence_status = ""
         # Phase 5: Reset OCR state
         self._ocr_accepted_plate = ""
@@ -2647,11 +3284,21 @@ class RootUI(BoxLayout):
             self._analytics.ocr_plate = ""
             self._analytics.ocr_confidence = 0.0
 
+    def _location_text(self):
+        """'District, State' without empty parts (the offline geocoder only
+        resolves the state, which used to render as ', Haryana')."""
+        parts = [p for p in (self.district, self.state_name) if p and p != DASH]
+        return ", ".join(parts) or DASH
+
+    def _sign_text(self):
+        """Selected sign, or DASH while the spinners still show placeholders."""
+        g, sg = self.ids.sp_sign_group.text, self.ids.sp_sign.text
+        if g in TrafficLawDB.SIGN_GROUPS and sg != "Sign":
+            return "%s / %s" % (g, sg)
+        return DASH
+
     # ── Email ────────────────────────────────────────────────────────────
     def send_report(self):
-        if plyer_email is None:
-            self._popup("Unavailable", "Email not available.")
-            return
         plate = self.ids.in_plate.text.strip()
         if not plate:
             self._popup("Missing", "Enter plate number.")
@@ -2664,7 +3311,18 @@ class RootUI(BoxLayout):
         lon = float(self.latest_lon)
         rt = JurisdictionEngine.route(lat, lon, plate)
         if not rt["all"]:
-            self._popup("No route", "Unknown state code.")
+            # Say why and where else to report, instead of a bare dead end:
+            # a few states publish no police email at all.
+            alts = [CivicDirectory.NO_EMAIL[c] for c in (rt["lc"], rt["pc"])
+                    if c in CivicDirectory.NO_EMAIL]
+            if alts:
+                self._popup(
+                    "No route",
+                    "This state publishes no official police email.\n\n"
+                    "Report via: %s\n\nOr: MORE > Share to X, or CPGRAMS (%s)."
+                    % (alts[0], CivicDirectory.CPGRAMS_PORTAL), tall=True)
+            else:
+                self._popup("No route", "Unknown state code.")
             return
 
         # Phase 6: warn on near-duplicate (same plate+offense, close in time/space)
@@ -2683,6 +3341,27 @@ class RootUI(BoxLayout):
                 return
         self._dup_ack = False
 
+        # Warn about evidence that police apps commonly reject
+        if not self._quality_ack:
+            fix = self._gps.last_fix if self._gps is not None else {}
+            issues = QualityCheck.issues(
+                has_photo=bool(self.evidence_path),
+                sharpness=self._evidence_quality.get("sharpness"),
+                gps_accuracy_m=(fix or {}).get("accuracy_m"),
+                gps_age_s=(fix or {}).get("age_s"),
+                plate_conf=PlateOCR.clean_plate_text(plate)[1])
+            if issues:
+                def anyway():
+                    self._quality_ack = True
+                    try:
+                        self.send_report()
+                    finally:
+                        self._quality_ack = False
+                self._confirm("Check evidence",
+                              "This report may be rejected:\n\n- %s" % "\n- ".join(issues),
+                              "Send anyway", anyway)
+                return
+
         o = TrafficLawDB.OFFENSES[okey]
         anon = bool(self.ids.sw_anon.active)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2691,17 +3370,29 @@ class RootUI(BoxLayout):
             "SENTINEL-X CIVIC ENFORCEMENT REPORT",
             "Time: %s" % now, "",
             "GPS: %.6f, %.6f" % (lat, lon),
-            "Location: %s, %s" % (self.district, self.state_name),
-            "Speed: %.1f km/h" % (self.latest_speed * 3.6),
-            "G_dyn: %.2f m/s2" % self.latest_g, "",
+            # No speed/G-force here: those come from the reporter's own phone
+            # (GPS + accelerometer), not the offending vehicle, and would read
+            # as a measured speed of the reported car.
+            "Location: %s" % self._location_text(), "",
             "Plate: %s" % plate,
             "Offense: %s - %s" % (okey, o["label"]),
             "Section: %s" % o["section"],
             "Penalty: %s" % o["penalty"], "",
-            "Sign: %s / %s" % (self.ids.sp_sign_group.text, self.ids.sp_sign.text), "",
+        ]
+        if okey.startswith("SPEEDING"):
+            lines += [
+                "Vehicle speed: not measured. Speeding is reported from the "
+                "reporter's observation; please verify with speed-camera / "
+                "ITMS records for this time and location.", "",
+            ]
+        lines += [
+            "Sign: %s" % self._sign_text(), "",
             "Reporter: %s" % ("ANONYMOUS" if anon else "See contact"), "",
             "Notes: %s" % (self.ids.in_notes.text.strip() or DASH), "",
-            "Routing: Loc=%s Plate=%s" % (rt["lc"] or DASH, rt["pc"] or DASH), "",
+            "Routing: Loc=%s%s Plate=%s" % (
+                rt["lc"] or DASH,
+                " (%s)" % rt["city"] if rt.get("city") else "",
+                rt["pc"] or DASH), "",
             TrafficLawDB.GOOD_SAMARITAN_FOOTER,
         ]
         subj = "[Sentinel-X] %s - %s" % (plate, o["label"])
@@ -2711,58 +3402,62 @@ class RootUI(BoxLayout):
         # Phase 2: Build report record for logging
         report_record = {
             "plate": plate, "offense": okey, "section": o["section"],
-            "lat": lat, "lon": lon, "speed_kmh": self.latest_speed * 3.6,
-            "g_dyn": self.latest_g, "recipients": to, "subject": subj,
+            "lat": lat, "lon": lon,
+            # The reporter's own motion at send time (local log only; never
+            # put in the email).
+            "reporter_speed_kmh": self.latest_speed * 3.6,
+            "reporter_g_dyn": self.latest_g, "recipients": to, "subject": subj,
             "ts": time.time(),  # for duplicate detection
             "evidence": self.evidence_path,
             "evidence_hash": EvidenceHasher.hash_file(self.evidence_path) if self.evidence_path else "",
+            # Lets a queued retry re-attach THIS report's photo
+            "evidence_uri": (self._evidence_uri.toString()
+                             if getattr(self, "_evidence_uri", None) is not None else ""),
         }
 
-        sent = False
-        if not sent:
-            try:
-                plyer_email.send(recipient=to, subject=subj, text=body, create_chooser=True)
-                sent = True
-            except Exception:
-                pass
-        if not sent:
-            try:
-                plyer_email.send(recipients=to, subject=subj, text=body)
-                sent = True
-            except Exception:
-                pass
-        if not sent:
-            try:
-                plyer_email.send(recipient=";".join(to), subject=subj, text=body, create_chooser=True)
-                sent = True
-            except Exception as e:
-                # Phase 3: Queue for offline retry
-                if self._offline_queue:
-                    report_record["body"] = body
-                    self._offline_queue.enqueue(report_record)
-                    self._popup("Queued", "No connection. Report queued for retry.")
-                else:
-                    self._popup("Failed", str(e))
-                return
-        if sent:
-            # Phase 2: Log the sent report
+        if self._send_email(to, subj, body, getattr(self, "_evidence_uri", None)):
+            # Phase 2: Log the report (composer opened with it pre-filled)
             if self._report_log:
                 report_record["status"] = "sent"
                 self._report_log.append(report_record)
-            self._popup("Ready", "Email app opened.")
+            self._popup("Ready", "Email app opened." + (
+                "\nEvidence photo attached." if getattr(self, "_evidence_uri", None)
+                else ""))
+        elif self._offline_queue:
+            # Phase 3: Queue for retry when no composer could be launched
+            report_record["body"] = body
+            self._offline_queue.enqueue(report_record)
+            self._popup("Queued", "Could not open an email app.\nReport queued for retry.")
+        else:
+            self._popup("Failed", "No email app available.")
 
     # ── Phase 3: Queued report sender callback ──────────────────────────
+    def _queued_evidence_uri(self, report):
+        """Content URI for a queued report's own photo: the URI saved with
+        it, else re-publish its evidence file. Never the current form's
+        photo, which may belong to a different report."""
+        if platform != "android" or autoclass is None:
+            return None
+        try:
+            if report.get("evidence_uri"):
+                return autoclass("android.net.Uri").parse(report["evidence_uri"])
+            path = report.get("evidence") or ""
+            if path and os.path.isfile(path):
+                return self._publish_to_gallery(path)
+        except Exception:
+            pass
+        return None
+
     def _send_queued_report(self, report):
         """Attempt to send a queued report. Returns True on success."""
-        if plyer_email is None:
-            return False
         try:
             to = report.get("recipients", [])
             subj = report.get("subject", "Sentinel-X Report")
             body = report.get("body", "")
             if not to or not body:
                 return False
-            plyer_email.send(recipient=to, subject=subj, text=body, create_chooser=False)
+            if not self._send_email(to, subj, body, self._queued_evidence_uri(report)):
+                return False
             # Log the sent report
             if self._report_log:
                 report["status"] = "sent_from_queue"
@@ -2787,16 +3482,28 @@ class RootUI(BoxLayout):
                 e.get("offense", DASH) or DASH,
                 e.get("status", DASH) or DASH,
             ))
-        title = "History (%d of %d)" % (min(len(entries), 10), len(entries))
+        title = "%s (%d/%d)" % (I18N.tr("History"), min(len(entries), 10), len(entries))
         self._popup(title, "\n\n".join(lines), tall=True)
 
     # ═════════════════════════════════════════════════════════════════════
     # Phase 6 — citizen features (menu + handlers)
     # ═════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _tr_font(text):
+        """(translated text, font kwargs). Text that still contains Latin
+        letters (plates, emails, untranslated strings) keeps the Latin font,
+        because the Indic Noto fonts have no Latin glyphs."""
+        t = I18N.tr(text)
+        if I18N.LANG == "en" or I18N.has_latin(t):
+            return t, {"font_name": "Roboto", "font_script_name": "Zyyy"}
+        font, script = I18N.font_for()
+        return t, {"font_name": font, "font_script_name": script}
+
     def _menu_button(self, text, cb):
         from kivy.uix.button import Button
+        text, fkw = self._tr_font(text)
         b = Button(
-            text=text, size_hint_y=None, height=dp(46), font_size="14sp",
+            text=text, size_hint_y=None, height=dp(46), font_size="14sp", **fkw,
             bold=True, color=(0.9, 0.93, 0.97, 1),
             background_normal="", background_down="",
             background_color=(0.10, 0.12, 0.20, 1),
@@ -2807,8 +3514,9 @@ class RootUI(BoxLayout):
     def _dismiss_button(self, text, cb):
         """A visually distinct Close/OK button for popups."""
         from kivy.uix.button import Button
+        text, fkw = self._tr_font(text)
         b = Button(
-            text=text, size_hint_y=None, height=dp(48), font_size="15sp",
+            text=text, size_hint_y=None, height=dp(48), font_size="15sp", **fkw,
             bold=True, color=(1, 1, 1, 1),
             background_normal="", background_down="",
             background_color=(0.22, 0.26, 0.34, 1),
@@ -2821,14 +3529,21 @@ class RootUI(BoxLayout):
         box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8),
                         size_hint_y=None)
         box.bind(minimum_height=box.setter("height"))
-        blur_lbl = "Privacy blur (faces): %s" % ("ON" if self._privacy_blur else "OFF")
-        lang_lbl = "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English")
+        blur_lbl = "%s: %s" % (I18N.tr("Privacy blur (faces)"),
+                               I18N.tr("ON" if self._privacy_blur else "OFF"))
+        lang_lbl = "%s: %s" % (I18N.tr("Language"), I18N.LANGS[I18N.LANG][0])
         items = [
             ("Share to X / Twitter", self.share_twitter),
             ("Share to WhatsApp", self.share_whatsapp),
+            ("WhatsApp traffic police (official no.)", self.whatsapp_police),
+            ("Report in official police app", self.police_app_report),
             ("Vehicle lookup (RC/Insurance/PUC)", self.vehicle_lookup),
             ("Report a road hazard", self.report_hazard),
             ("SOS / Emergency", self.show_sos),
+            ("Save last 15 s as video clip", self.save_clip),
+            ("Evidence pack (PDF)", self.evidence_pdf),
+            ("RTI request for last report", self.rti_last_report),
+            ("Emergency contact (crash SOS)", self.edit_emergency_contact),
             ("Violation hotspots", self.show_hotspots),
             ("Check for app updates", lambda: self._auto_update_check(True)),
             (blur_lbl, self.toggle_privacy_blur),
@@ -2842,11 +3557,13 @@ class RootUI(BoxLayout):
         container.add_widget(scroll)
         container.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="More — Citizen Tools", content=container,
+            title=self._tr_font("More - Citizen Tools")[0], content=container,
             size_hint=(0.9, 0.85), title_size="15sp",
             title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
         )
+        mtitle, mkw = self._tr_font("More - Citizen Tools")
+        self._style_title(self._menu_popup, mtitle, mkw)
         self._menu_popup.open()
 
     def _close_menu(self):
@@ -2861,7 +3578,7 @@ class RootUI(BoxLayout):
         plate = self.ids.in_plate.text.strip()
         okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
         label = TrafficLawDB.OFFENSES.get(okey, {}).get("label", "")
-        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        loc = self._location_text()
         sc = JurisdictionEngine.extract_state_code(plate) or \
             JurisdictionEngine._resolve_state(float(self.latest_lat), float(self.latest_lon))
         return plate, label, loc, sc
@@ -2902,6 +3619,98 @@ class RootUI(BoxLayout):
             return False
 
     # ── share channels ───────────────────────────────────────────────────
+    def _share_to_app(self, package, text, uri=None, jid=None):
+        """ACTION_SEND to one app (None = system chooser), optionally with an
+        image and a WhatsApp chat id. Returns True if an activity started."""
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            from jnius import cast
+            Intent = autoclass("android.content.Intent")
+            String = autoclass("java.lang.String")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = Intent(Intent.ACTION_SEND)
+            i.putExtra(Intent.EXTRA_TEXT, cast("java.lang.CharSequence", String(text)))
+            if uri is not None:
+                i.setType("image/*")
+                i.putExtra(Intent.EXTRA_STREAM, cast("android.os.Parcelable", uri))
+                i.setClipData(autoclass("android.content.ClipData").newRawUri("", uri))
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            else:
+                i.setType("text/plain")
+            if jid:
+                i.putExtra("jid", jid)  # opens that WhatsApp chat directly
+            if package:
+                i.setPackage(package)
+            else:
+                i = Intent.createChooser(
+                    i, cast("java.lang.CharSequence", String("Share with:")))
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            act.startActivity(i)
+            return True
+        except Exception:
+            return False
+
+    def _make_share_copy(self, path, plate):
+        """Privacy-safe JPEG copy for public sharing: faces and every
+        plate-like region except the reported vehicle's plate are blurred.
+        The original evidence file is never modified. Runs off the UI thread
+        (uses ML Kit to locate the reported plate). Returns the copy path."""
+        img = cv2.imread(path) if cv2 is not None else None
+        if img is None:
+            return ""
+        keep = None
+        if self._plate_ocr is not None and self._plate_ocr.available:
+            try:
+                _raw, lines = self._plate_ocr._ocr(img)
+                keep = PlateOCR.plate_box(re.sub(r"[^A-Z0-9]", "", plate.upper()), lines)
+            except Exception:
+                keep = None
+        boxes = []
+        cascade = PrivacyBlur._face_cascade()
+        if cascade is not None:
+            try:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                boxes += [tuple(int(v) for v in b) for b in
+                          cascade.detectMultiScale(gray, 1.1, 5, minSize=(24, 24))]
+            except Exception:
+                pass
+        for _crop, b in PlateOCR.crop_plate_candidates(img):
+            if keep is None or not PrivacyBlur.overlaps(b, keep):
+                boxes.append(b)
+        img = PrivacyBlur.blur_regions(img, boxes)
+        out = os.path.splitext(path)[0] + "_share.jpg"
+        cv2.imwrite(out, img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        return out
+
+    def _share_public(self, package, text, fallback_url, label):
+        """Share text + a blurred copy of the evidence (if any) to a public
+        app; falls back to the chooser, then to the web intent URL."""
+        if not self.evidence_path or cv2 is None:
+            if not self._open_url(fallback_url):
+                self._popup("Unavailable", "Could not open %s." % label)
+            return
+        plate = self.ids.in_plate.text.strip()
+        src = self.evidence_path
+        self.ocr_suggest_text = "Preparing a privacy-safe copy..."
+
+        def work():
+            try:
+                copy = self._make_share_copy(src, plate)
+            except Exception:
+                copy = ""
+
+            def done(_dt):
+                self.ocr_suggest_text = ""
+                uri = self._publish_to_gallery(copy, "Pictures/SentinelX/Shared",
+                                               "image/jpeg") if copy else None
+                if not (self._share_to_app(package, text, uri)
+                        or self._share_to_app(None, text, uri)
+                        or self._open_url(fallback_url)):
+                    self._popup("Unavailable", "Could not open %s." % label)
+            Clock.schedule_once(done, 0)
+        threading.Thread(target=work, daemon=True).start()
+
     def share_twitter(self):
         self._close_menu()
         plate, label, loc, sc = self._ctx()
@@ -2909,8 +3718,8 @@ class RootUI(BoxLayout):
             self._popup("Missing", "Enter or scan a plate first.")
             return
         text = ReportChannels.compose(plate, label, loc, sc)
-        if not self._open_url(ReportChannels.twitter_url(text)):
-            self._popup("Unavailable", "Could not open X/Twitter.")
+        self._share_public("com.twitter.android", text,
+                           ReportChannels.twitter_url(text), "X/Twitter")
 
     def share_whatsapp(self):
         self._close_menu()
@@ -2919,8 +3728,92 @@ class RootUI(BoxLayout):
             self._popup("Missing", "Enter or scan a plate first.")
             return
         text = ReportChannels.compose(plate, label, loc, sc)
-        if not self._open_url(ReportChannels.whatsapp_url(text)):
-            self._popup("Unavailable", "WhatsApp not installed.")
+        self._share_public("com.whatsapp", text,
+                           ReportChannels.whatsapp_url(text), "WhatsApp")
+
+    def _app_installed(self, package):
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            return act.getPackageManager().getLaunchIntentForPackage(package) is not None
+        except Exception:
+            return False
+
+    def _launch_or_store(self, package):
+        """Open an installed app, else its Play Store page."""
+        if self._app_installed(package):
+            try:
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                i = act.getPackageManager().getLaunchIntentForPackage(package)
+                i.addFlags(autoclass("android.content.Intent").FLAG_ACTIVITY_NEW_TASK)
+                act.startActivity(i)
+                return True
+            except Exception:
+                pass
+        return (self._open_url("market://details?id=" + package)
+                or self._open_url("https://play.google.com/store/apps/details?id=" + package))
+
+    def police_app_report(self):
+        """Hand the report to the force's own app, where citizen photo reports
+        become challans (Delhi's Traffic Prahari also pays rewards). The
+        ORIGINAL photo is shared because these apps reject edited images."""
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        lc = JurisdictionEngine._resolve_state(lat, lon)
+        city = CivicDirectory.city_for(lat, lon) or {}
+        app = CivicDirectory.police_app_for(lc, city.get("name", ""))
+        if not app:
+            have = ", ".join(sorted(
+                "%s (%s)" % ("Delhi" if k == "DL" else k, v[1])
+                for k, v in CivicDirectory.POLICE_APPS.items()))
+            self._popup("Official app", "No official citizen-reporting police app is "
+                        "published for this location.\n\nAvailable for: %s.\nUse SEND "
+                        "(email) instead." % have, tall=True)
+            return
+        pkg, title, _src = app
+        if not self._app_installed(pkg):
+            self._popup("Official app", "%s is not installed. Opening the Play Store - "
+                        "install it, then come back and tap this again." % title)
+            self._launch_or_store(pkg)
+            return
+        plate, label, loc, _sc = self._ctx()
+        text = "%s - %s at %s (GPS %.6f, %.6f)" % (plate or "?", label or "violation",
+                                                  loc, lat, lon)
+        # Try sharing the original photo straight into the app; if it doesn't
+        # accept shares, open it - the photo is in Pictures/SentinelX.
+        if not (self._evidence_uri is not None
+                and self._share_to_app(pkg, text, self._evidence_uri)):
+            self._launch_or_store(pkg)
+            self._copy(text)
+            self._popup("Official app", "Opened %s. Attach the photo from "
+                        "Pictures/SentinelX; the report details are copied to the "
+                        "clipboard." % title)
+
+    def whatsapp_police(self):
+        """Send the report and the ORIGINAL evidence photo to the official
+        traffic-police WhatsApp number for this location (or plate state)."""
+        self._close_menu()
+        plate, label, loc, sc = self._ctx()
+        if not plate:
+            self._popup("Missing", "Enter or scan a plate first.")
+            return
+        lc = JurisdictionEngine._resolve_state(float(self.latest_lat),
+                                               float(self.latest_lon))
+        code = next((c for c in (lc, sc) if c in CivicDirectory.WHATSAPP), "")
+        if not code:
+            have = ", ".join(sorted(CivicDirectory.WHATSAPP))
+            self._popup("WhatsApp", "No official traffic-police WhatsApp number is "
+                        "published for this state.\n\nAvailable for: %s.\nUse SEND "
+                        "(email) instead." % have, tall=True)
+            return
+        num = CivicDirectory.WHATSAPP[code][0]
+        text = "Traffic violation: %s - %s at %s. GPS %s (via Sentinel-X)" % (
+            plate, label or "violation", loc,
+            Emergency.maps_link(float(self.latest_lat), float(self.latest_lon)))
+        if not self._share_to_app("com.whatsapp", text, self._evidence_uri,
+                                  jid=num + "@s.whatsapp.net"):
+            self._open_url(ReportChannels.whatsapp_url(text, num))
 
     # ── vehicle lookup ───────────────────────────────────────────────────
     def vehicle_lookup(self):
@@ -2998,18 +3891,47 @@ class RootUI(BoxLayout):
     def _send_hazard(self, category):
         self._close_menu()
         lat, lon = float(self.latest_lat), float(self.latest_lon)
-        loc = "%s, %s" % (self.district or DASH, self.state_name or DASH)
+        ch = CivicDirectory.civic_channel_for(
+            lat, lon, JurisdictionEngine._resolve_state(lat, lon))
+        if ch and not getattr(self, "_hazard_email_ok", False):
+            box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+            box.add_widget(Label(
+                text="%s - the city's own grievance channel usually acts on this "
+                     "faster than email.\nYour photo is in Pictures/SentinelX." % ch["name"],
+                halign="left", valign="top", text_size=(dp(250), None),
+                font_size="13sp", color=(0.82, 0.84, 0.88, 1)))
+
+            def close_then(fn):
+                return lambda: (pop.dismiss(), fn())
+            if ch["package"]:
+                box.add_widget(self._dismiss_button(
+                    "Open app", close_then(lambda: self._launch_or_store(ch["package"]))))
+            if ch["phone"]:
+                box.add_widget(self._dismiss_button(
+                    "Call %s" % ch["phone"], close_then(lambda: self._dial(ch["phone"]))))
+            if ch["web"]:
+                box.add_widget(self._dismiss_button(
+                    "Open website", close_then(lambda: self._open_url(ch["web"]))))
+
+            def by_email():
+                self._hazard_email_ok = True
+                try:
+                    self._send_hazard(category)
+                finally:
+                    self._hazard_email_ok = False
+            box.add_widget(self._dismiss_button("Email instead", close_then(by_email)))
+            pop = Popup(title=category, content=box, size_hint=(0.9, 0.7),
+                        title_size="15sp", title_color=(1, 0.84, 0.25, 1),
+                        separator_color=(1, 0.84, 0.25, 1),
+                        background_color=(0.08, 0.09, 0.15, 0.96))
+            pop.open()
+            return
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        loc = self._location_text()
         notes = self.ids.in_notes.text.strip()
         subj = HazardReport.subject(category, loc)
         body = HazardReport.body(category, lat, lon, loc, notes)
-        opened = False
-        if plyer_email is not None:
-            try:
-                plyer_email.send(subject=subj, text=body, create_chooser=True)
-                opened = True
-            except Exception:
-                opened = False
-        if not opened:
+        if not self._send_email([], subj, body):
             # Fall back to the national grievance portal
             self._open_url(HazardReport.CPGRAMS_PORTAL)
         self._popup("Hazard", "Hazard report prepared:\n%s" % category)
@@ -3025,13 +3947,21 @@ class RootUI(BoxLayout):
             ("Call 112 (Emergency)", lambda: self._dial(CivicDirectory.EMERGENCY)),
             ("Call 108 (Ambulance)", lambda: self._dial(CivicDirectory.AMBULANCE)),
             ("Report accident (Good Samaritan)", self._good_samaritan),
+            ("Nearest hospital (map)", lambda: self._nearest_hospital(lat, lon)),
+            ("Reached hospital (Rah-Veer)" if self._settings().get("rahveer")
+             else "I'm taking a victim to hospital (Rah-Veer)", self._rahveer_step),
             ("Share my location (SMS)", lambda: self._sos_sms(lat, lon)),
         ]
         for text, cb in actions:
             box.add_widget(self._menu_button(text, cb))
-        box.add_widget(self._dismiss_button("Close", self._close_menu))
+        from kivy.uix.scrollview import ScrollView
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="SOS / Emergency", content=box, size_hint=(0.9, 0.62),
+            title="SOS / Emergency", content=container, size_hint=(0.9, 0.8),
             title_size="15sp", title_color=(1, 0.32, 0.32, 1),
             separator_color=(1, 0.32, 0.32, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
@@ -3057,7 +3987,8 @@ class RootUI(BoxLayout):
         self._popup(
             "Good Samaritan",
             "Reporting an accident under Sec.134A protection.\n\n%s\n\n"
-            "Use SOS to call 112/108." % Emergency.good_samaritan_text(lat, lon),
+            "%s\n\nUse SOS to call 112/108." % (Emergency.good_samaritan_text(lat, lon),
+                                                AccidentHelp.CASHLESS_INFO),
             tall=True,
         )
 
@@ -3080,10 +4011,11 @@ class RootUI(BoxLayout):
                     % ("ON" if self._privacy_blur else "OFF"))
 
     def toggle_language(self):
-        I18N.set_lang("hi" if I18N.LANG == "en" else "en")
+        """Cycle English -> Hindi -> Marathi -> Tamil -> Kannada -> Bengali."""
+        App.get_running_app().set_language(I18N.next_lang())
+        self._save_settings({"lang": I18N.LANG})
         self._close_menu()
-        self._popup(I18N.tr("Ready"),
-                    "Language: %s" % ("हिंदी" if I18N.LANG == "hi" else "English"))
+        self.show_more_menu()  # reopen so the menu itself shows the change
 
     # ═════════════════════════════════════════════════════════════════════
     # Over-the-air auto-update (detect -> download -> one-tap install)
@@ -3250,6 +4182,509 @@ class RootUI(BoxLayout):
         except Exception:
             self._popup("Update", "Downloaded. Open it from notifications to install.")
 
+    # ═════════════════════════════════════════════════════════════════════
+    # Settings, crash SOS, follow-ups, video clip
+    # ═════════════════════════════════════════════════════════════════════
+    def _settings_path(self):
+        try:
+            return os.path.join(App.get_running_app().user_data_dir, "settings.json")
+        except Exception:
+            return "settings.json"
+
+    def _settings(self):
+        try:
+            with open(self._settings_path(), "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_settings(self, data):
+        try:
+            cur = self._settings()
+            cur.update(data)
+            with open(self._settings_path(), "w") as f:
+                json.dump(cur, f)
+        except Exception:
+            pass
+
+    def edit_emergency_contact(self):
+        self._close_menu()
+        from kivy.uix.textinput import TextInput
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(10))
+        box.add_widget(Label(
+            text="Phone number to alert if a crash is detected while driving.\n"
+                 "Sentinel-X opens a pre-filled SMS with your location after a "
+                 "%d s countdown you can cancel." % Emergency.SOS_COUNTDOWN_S,
+            halign="left", valign="top", text_size=(dp(250), None),
+            font_size="13sp", color=(0.82, 0.84, 0.88, 1)))
+        ti = TextInput(text=self._settings().get("emergency_contact", ""),
+                       multiline=False, input_filter=lambda t, _u: "".join(
+                           c for c in t if c.isdigit() or c == "+"),
+                       size_hint_y=None, height=dp(44), font_size="16sp",
+                       hint_text="+91XXXXXXXXXX")
+        box.add_widget(ti)
+
+        def save():
+            self._save_settings({"emergency_contact": ti.text.strip()})
+            pop.dismiss()
+            self._popup("Saved", "Emergency contact: %s" % (ti.text.strip() or "none"))
+        box.add_widget(self._dismiss_button("Save", save))
+        pop = Popup(title="Emergency contact", content=box, size_hint=(0.88, 0.55),
+                    title_size="15sp", title_color=(1, 0.32, 0.32, 1),
+                    separator_color=(1, 0.32, 0.32, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        pop.open()
+
+    def _check_crash(self):
+        """Crash = crash-level g while recently moving at vehicle speed."""
+        now = time.time()
+        if self.latest_speed * 3.6 >= Emergency.CRASH_MIN_SPEED_KMH:
+            self._last_moving_ts = now
+        if (getattr(self, "_crash_popup", None) is None
+                and now - getattr(self, "_last_crash_ts", 0) > 60
+                and Emergency.is_crash(self.latest_g,
+                                       getattr(self, "_last_moving_ts", 0), now)):
+            self._last_crash_ts = now
+            self._start_crash_countdown()
+
+    def _start_crash_countdown(self):
+        from kivy.uix.button import Button
+        self._crash_left = Emergency.SOS_COUNTDOWN_S
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(10))
+        lbl = Label(text="", halign="center", valign="middle", font_size="16sp",
+                    color=(1, 1, 1, 1), text_size=(dp(250), None))
+        box.add_widget(lbl)
+        ok = Button(text="I'M OK - CANCEL", size_hint_y=None, height=dp(56),
+                    bold=True, font_size="16sp", background_normal="",
+                    background_color=(0, 0.6, 0.3, 1))
+        call = self._dismiss_button("Call 112 now", lambda: self._crash_finish(dial=True))
+        box.add_widget(ok)
+        box.add_widget(call)
+        self._crash_popup = Popup(
+            title="Possible crash detected", content=box, size_hint=(0.9, 0.55),
+            auto_dismiss=False, title_size="16sp", title_color=(1, 0.32, 0.32, 1),
+            separator_color=(1, 0.32, 0.32, 1),
+            background_color=(0.12, 0.04, 0.05, 0.97))
+
+        def tick(_dt):
+            if self._crash_popup is None:
+                return False
+            if self._crash_left <= 0:
+                self._crash_finish(dial=False)
+                return False
+            contact = self._settings().get("emergency_contact", "")
+            lbl.text = ("Sending SOS %s in %d s" % (
+                "to " + contact if contact else "(calling 112)", self._crash_left))
+            self._crash_left -= 1
+            return True
+        ok.bind(on_release=lambda *_: self._crash_cancel())
+        tick(0)
+        self._crash_event = Clock.schedule_interval(tick, 1.0)
+        self._crash_popup.open()
+
+    def _crash_cancel(self):
+        if getattr(self, "_crash_event", None):
+            self._crash_event.cancel()
+        if self._crash_popup is not None:
+            self._crash_popup.dismiss()
+        self._crash_popup = None
+
+    def _crash_finish(self, dial):
+        self._crash_cancel()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        contact = self._settings().get("emergency_contact", "")
+        if contact and not dial:
+            # Pre-filled SMS: the user taps send (no SEND_SMS permission).
+            if self._android_intent("android.intent.action.SENDTO", "smsto:" + contact,
+                                    {"sms_body": Emergency.crash_text(lat, lon)}):
+                return
+        self._dial(CivicDirectory.EMERGENCY)
+
+    def _check_followups(self):
+        entries = self._report_log.read_all() if self._report_log else []
+        done = set(self._settings().get("followups_done", []))
+        due = FollowUp.due(entries, done)
+        if not due:
+            return
+        shown = due[:FollowUp.MAX_SHOWN]
+        lines = ["%s - %s (sent %s)" % (
+            e.get("plate", "?"), e.get("offense", "?"),
+            time.strftime("%d %b", time.localtime(float(e.get("ts", 0)))))
+            for e in shown]
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        box.add_widget(Label(
+            text="No action seen yet on %d report(s) older than %d days:\n\n%s\n\n"
+                 "Escalate on CPGRAMS (national grievance portal)? A complaint "
+                 "draft is copied for you to paste." % (len(due), FollowUp.DAYS,
+                                                        "\n".join(lines)),
+            halign="left", valign="top", text_size=(dp(250), None),
+            font_size="13sp", color=(0.82, 0.84, 0.88, 1)))
+
+        def mark(entries_):
+            keys = done | {FollowUp.key(e) for e in entries_}
+            self._save_settings({"followups_done": sorted(keys)})
+
+        def escalate():
+            try:
+                from kivy.core.clipboard import Clipboard
+                Clipboard.copy("\n\n---\n\n".join(FollowUp.draft(e) for e in shown))
+            except Exception:
+                pass
+            mark(shown)
+            pop.dismiss()
+            self._open_url(CivicDirectory.CPGRAMS_PORTAL)
+
+        def dismiss():
+            mark(shown)
+            pop.dismiss()
+        box.add_widget(self._dismiss_button("Escalate (copy draft)", escalate))
+
+        def rti():
+            self._copy("\n\n---\n\n".join(RTIRequest.draft(e) for e in shown))
+            mark(shown)
+            pop.dismiss()
+            self._popup("RTI", "RTI application draft copied. File it with the state "
+                        "police PIO (state RTI portal or post, Rs 10 fee).")
+        box.add_widget(self._dismiss_button("RTI request (copy draft)", rti))
+        box.add_widget(self._dismiss_button("Dismiss", dismiss))
+        pop = Popup(title="Follow up on reports", content=box, size_hint=(0.9, 0.7),
+                    title_size="15sp", title_color=(1, 0.84, 0.25, 1),
+                    separator_color=(1, 0.84, 0.25, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        pop.open()
+
+    def save_clip(self, quiet=False):
+        """Save the dashcam's last 15 s as a video in Movies/SentinelX.
+        quiet=True (volume-key flag while driving) shows a status-bar alert
+        instead of a popup that would need a tap."""
+        self._close_menu()
+        if self._dashcam is None:
+            if not quiet:
+                self._popup("Clip", "Dashcam is not running.")
+            return
+        out = os.path.join(self._get_evidence_folder(),
+                           "SentinelX_clip_%s.avi" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+        def work():
+            path, n = self._dashcam.save_clip(out)
+
+            def done(_dt):
+                if not path:
+                    if quiet:
+                        self._flash_alert("FLAG: no footage")
+                    else:
+                        self._popup("Clip", "Not enough recent footage yet.")
+                    return
+                EvidenceHasher.write_hashfile(path)
+                uri = self._publish_to_gallery(path, "Movies/SentinelX", "video/x-msvideo")
+                if quiet:
+                    self._flash_alert("INCIDENT CLIP SAVED")
+                    return
+                self._popup("Saved!", "Video clip saved (%d frames, %.0f s):\n%s" % (
+                    n, n / float(DashcamRecorder.CLIP_FPS),
+                    "Movies/SentinelX/" + os.path.basename(path) if uri
+                    else os.path.basename(path)))
+            Clock.schedule_once(done, 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _flash_alert(self, text, secs=4.0):
+        self.alert_text = text
+
+        def clear(_dt, t=text):
+            if self.alert_text == t:
+                self.alert_text = ""
+        Clock.schedule_once(clear, secs)
+
+    def _copy(self, text):
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(text)
+            return True
+        except Exception:
+            return False
+
+    # ── power / heat ─────────────────────────────────────────────────────
+    def _battery(self):
+        """(percent, charging, temperature C) from the sticky battery intent."""
+        if platform != "android" or autoclass is None:
+            return None, False, None
+        try:
+            Intent = autoclass("android.content.Intent")
+            IntentFilter = autoclass("android.content.IntentFilter")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = act.registerReceiver(None, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if i is None:
+                return None, False, None
+            level, scale = i.getIntExtra("level", -1), i.getIntExtra("scale", 100)
+            temp = i.getIntExtra("temperature", -1)
+            pct = 100.0 * level / scale if level >= 0 and scale > 0 else None
+            return pct, i.getIntExtra("plugged", 0) > 0, (temp / 10.0 if temp > 0 else None)
+        except Exception:
+            return None, False, None
+
+    def _check_power(self, _dt):
+        pct, charging, temp = self._battery()
+        saving = PowerPolicy.should_save(pct, charging, temp, self._power_saving)
+        if saving != self._power_saving:
+            self._power_saving = saving
+            if self._dashcam is not None:
+                self._dashcam.recording = not saving
+            self._analytics.paused = saving
+            self._flash_alert("POWER SAVE" if saving else "", 6.0)
+        self._subsystem_status.update(
+            "power", not saving, "%s%% %s" % (
+                "?" if pct is None else int(pct),
+                "" if temp is None else "%.0fC" % temp))
+
+    # ── hands-free flag ──────────────────────────────────────────────────
+    def _start_flag_gesture(self):
+        """Double-press a volume key to save the last 15 s. Volume keys never
+        reach Kivy, so this listens for Android's volume-changed broadcast
+        (media stream) through p4a's BroadcastReceiver helper."""
+        if platform != "android":
+            return
+        self._flag = FlagGesture()
+        try:
+            from android.broadcast import BroadcastReceiver
+
+            def on_volume(_context, intent):
+                if intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) != 3:
+                    return
+                if self._flag.press(time.time()):
+                    Clock.schedule_once(lambda _dt: self.save_clip(quiet=True), 0)
+            self._volume_rx = BroadcastReceiver(
+                on_volume, actions=["android.media.VOLUME_CHANGED_ACTION"])
+            self._volume_rx.start()
+        except Exception:
+            self._volume_rx = None
+
+    # ── accident help ────────────────────────────────────────────────────
+    def _nearest_hospital(self, lat, lon):
+        self._close_menu()
+        if not self._open_url("geo:%.6f,%.6f?q=hospital" % (lat, lon)):
+            self._open_url("https://www.google.com/maps/search/hospital/@%.6f,%.6f,14z"
+                           % (lat, lon))
+
+    def _signed_record(self, kind, payload):
+        """Write a JSON record + signed proof in the evidence folder."""
+        path = os.path.join(self._get_evidence_folder(), "%s_%s.json" % (
+            kind, datetime.now().strftime("%Y%m%d_%H%M%S")))
+        try:
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=1)
+            EvidenceHasher.write_hashfile(path)
+            EvidenceProof.write(path, dict(payload, sha256=EvidenceHasher.hash_file(path)))
+        except Exception:
+            pass
+        return path
+
+    def _rahveer_step(self):
+        """Two taps: start (accident scene) -> stop (reached hospital)."""
+        self._close_menu()
+        point = {"ts": time.time(), "lat": float(self.latest_lat),
+                 "lon": float(self.latest_lon)}
+        session = self._settings().get("rahveer")
+        if not session:
+            self._save_settings({"rahveer": point})
+            self._signed_record("rahveer_accident", point)
+            self._popup("Rah-Veer", "Accident time and place recorded.\n\nTake the "
+                        "victim to the nearest hospital, then open SOS and tap "
+                        "'Reached hospital'.\n\n%s" % AccidentHelp.CASHLESS_INFO, tall=True)
+            return
+        self._save_settings({"rahveer": None})
+        self._signed_record("rahveer_hospital", point)
+        self._rahveer_form(session, point)
+
+    def _rahveer_form(self, accident, hospital):
+        from kivy.uix.textinput import TextInput
+        st = self._settings()
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        mins = (hospital["ts"] - accident["ts"]) / 60.0
+        ok = AccidentHelp.within_golden_hour(accident["ts"], hospital["ts"])
+        box.add_widget(Label(
+            text="Reached hospital in %.0f min (%s the golden hour).\nThe Rah-Veer award "
+                 "(%s) needs your name and mobile; they stay on this phone until you "
+                 "file the application." % (mins, "within" if ok else "after",
+                                            AccidentHelp.RAHVEER_REWARD),
+            halign="left", valign="top", text_size=(dp(250), None), font_size="13sp",
+            color=(0.82, 0.84, 0.88, 1), size_hint_y=None, height=dp(110)))
+        fields = {}
+        for key, hint in (("name", "Your full name"), ("phone", "Mobile number"),
+                          ("hospital", "Hospital name")):
+            from kivy.factory import Factory
+            ti = Factory.StyledInput(
+                text=st.get("rahveer_" + key, "") if key != "hospital" else "",
+                hint_text=hint, multiline=False, size_hint_y=None, height=dp(42))
+            box.add_widget(ti)
+            fields[key] = ti
+
+        def make():
+            name, phone = fields["name"].text.strip(), fields["phone"].text.strip()
+            self._save_settings({"rahveer_name": name, "rahveer_phone": phone})
+            text = AccidentHelp.rahveer_application(
+                name, phone, accident, hospital, fields["hospital"].text.strip())
+            path = self._signed_record("rahveer_application",
+                                       {"application": text, "accident": accident,
+                                        "hospital": hospital})
+            self._copy(text)
+            pop.dismiss()
+            self._popup("Rah-Veer", "Application copied to clipboard and saved "
+                        "(%s).\n\nSubmit it to the District Magistrate's appraisal "
+                        "committee.\n\n%s" % (os.path.basename(path), text), tall=True)
+        box.add_widget(self._dismiss_button("Create application", make))
+        from kivy.uix.widget import Widget
+        box.add_widget(Widget())  # absorb spare height below the form
+        pop = Popup(title="Rah-Veer (Good Samaritan)", content=box, size_hint=(0.92, 0.8),
+                    title_size="15sp", title_color=(0, 0.78, 0.33, 1),
+                    separator_color=(0, 0.78, 0.33, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        pop.open()
+
+    # ── RTI + PDF evidence pack ──────────────────────────────────────────
+    def _last_report(self):
+        entries = self._report_log.read_all() if self._report_log else []
+        return entries[-1] if entries else None
+
+    def rti_last_report(self):
+        self._close_menu()
+        entry = self._last_report()
+        if entry is None:
+            self._popup("RTI", "No reports sent yet.")
+            return
+        text = RTIRequest.draft(entry)
+        self._copy(text)
+        self._popup("RTI", "Draft copied to clipboard. File it with the state police "
+                    "PIO (state RTI portal or post, Rs 10 fee).\n\n%s" % text, tall=True)
+
+    def evidence_pdf(self):
+        """One-file evidence pack: report summary, original photo, signed
+        proof and verification steps (Android PdfDocument; no extra libs)."""
+        self._close_menu()
+        if not self.evidence_path:
+            self._popup("Evidence pack", "CAPTURE a photo first.")
+            return
+        try:
+            out = self._build_pdf()
+        except Exception as e:
+            self._popup("Evidence pack", "Could not build the PDF: %s" % e)
+            return
+        uri = self._publish_to_gallery(out, "Download/SentinelX", "application/pdf")
+        self._popup("Saved!", "Evidence pack saved:\n%s" % (
+            "Download/SentinelX/" + os.path.basename(out) if uri else out))
+
+    def _pdf_lines(self):
+        plate = self.ids.in_plate.text.strip() or DASH
+        okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
+        o = TrafficLawDB.OFFENSES.get(okey, {})
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        lines = [
+            "SENTINEL-X EVIDENCE PACK",
+            "Generated: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "",
+            "Vehicle: %s" % plate,
+            "Offense: %s %s" % (o.get("label", DASH), o.get("section", "")),
+            "Location: %s  GPS %.6f, %.6f" % (self._location_text(), lat, lon),
+            "Map: %s" % Emergency.maps_link(lat, lon),
+            "Sent to: %s" % (", ".join(rt["all"]) or DASH),
+            "Evidence file: %s" % os.path.basename(self.evidence_path),
+            "SHA-256: %s" % EvidenceHasher.hash_file(self.evidence_path),
+        ]
+        return lines
+
+    def _build_pdf(self):
+        PdfDocument = autoclass("android.graphics.pdf.PdfDocument")
+        PageInfo = autoclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+        Paint = autoclass("android.graphics.Paint")
+        BitmapFactory = autoclass("android.graphics.BitmapFactory")
+        Bitmap = autoclass("android.graphics.Bitmap")
+        FileOutputStream = autoclass("java.io.FileOutputStream")
+        W, H, M = 595, 842, 36  # A4 in points, margin
+
+        doc = PdfDocument()
+        paint = Paint()
+        paint.setAntiAlias(True)
+        # Ligatures turn "ff"/"fi" in hashes and base64 into single glyphs,
+        # which corrupts copy-pasted signatures.
+        paint.setFontFeatureSettings("'liga' 0, 'clig' 0")
+
+        def text_page(n, lines, size=10.0):
+            page = doc.startPage(PageInfo(W, H, n).create())
+            c = page.getCanvas()
+            paint.setTextSize(size)
+            y = M + size
+            for line in lines:
+                for chunk in [line[i:i + 95] for i in range(0, len(line), 95)] or [""]:
+                    c.drawText(chunk, float(M), float(y), paint)
+                    y += size * 1.45
+            return page, c, y
+
+        # Page 1: summary + original photo
+        page, c, y = text_page(1, self._pdf_lines())
+        bmp = BitmapFactory.decodeFile(self.evidence_path)
+        if bmp is not None:
+            bw, bh = bmp.getWidth(), bmp.getHeight()
+            sw = W - 2 * M
+            sh = int(bh * sw / float(bw))
+            sh = min(sh, int(H - y - M))
+            sw = int(bw * sh / float(bh))
+            scaled = Bitmap.createScaledBitmap(bmp, sw, sh, True)
+            c.drawBitmap(scaled, float(M), float(y + 10), None)
+        doc.finishPage(page)
+
+        # Page 2: signed proof + how to verify
+        proof_lines = ["SIGNED PROVENANCE RECORD", ""]
+        try:
+            with open(self.evidence_path + ".proof.json") as f:
+                proof = json.load(f)
+            proof_lines += ["Payload: " + proof["payload"], "",
+                            "Algorithm: " + proof["algorithm"],
+                            "Signature (base64): " + proof["signature_b64"],
+                            "Public key (base64 DER): " + proof["public_key_b64"], "",
+                            "Verify: ECDSA-SHA256 over the payload bytes with the public "
+                            "key above; SHA-256 of the original photo must equal the "
+                            "payload's sha256."]
+        except Exception:
+            proof_lines.append("No signed proof available for this photo.")
+        paint.setTypeface(autoclass("android.graphics.Typeface").MONOSPACE)
+        page, _c, _y = text_page(2, proof_lines, 8.0)
+        doc.finishPage(page)
+
+        out = os.path.splitext(self.evidence_path)[0] + "_pack.pdf"
+        fos = FileOutputStream(out)
+        doc.writeTo(fos)
+        fos.close()
+        doc.close()
+        return out
+
+    def _confirm(self, title, message, ok_label, on_ok, cancel_label="Go back"):
+        """Two-button dialog; on_ok runs after the dialog closes."""
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        m, mkw = self._tr_font(message)
+        box.add_widget(Label(text=m, halign="left", valign="top",
+                             text_size=(dp(250), None), font_size="13sp",
+                             color=(0.82, 0.84, 0.88, 1), **mkw))
+
+        def ok():
+            pop.dismiss()
+            on_ok()
+        box.add_widget(self._dismiss_button(ok_label, ok))
+        box.add_widget(self._dismiss_button(cancel_label, lambda: pop.dismiss()))
+        t, tkw = self._tr_font(title)
+        pop = Popup(title=t, content=box, size_hint=(0.88, 0.6), title_size="15sp",
+                    title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        self._style_title(pop, t, tkw)
+        pop.open()
+
+    @staticmethod
+    def _style_title(popup, title, fkw):
+        """Popup only exposes title_font; also set the HarfBuzz script on its
+        internal title label so Indic titles shape correctly."""
+        popup.title_font = fkw["font_name"]
+        for w in popup.walk(restrict=True):
+            if isinstance(w, Label) and w.text == title:
+                w.font_script_name = fkw["font_script_name"]
+
     def _popup(self, t, m, tall=False):
         # Determine accent color based on popup type
         if t in ("Saved!", "Ready"):
@@ -3261,11 +4696,13 @@ class RootUI(BoxLayout):
         else:
             accent = (0, 0.9, 1, 1)            # cyan
 
+        t, tkw = self._tr_font(t)
+        m, mkw = self._tr_font(m)
         content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
         lbl = Label(
             text=m, halign="left", valign="top",
             text_size=(dp(240), None), font_size="13sp",
-            color=(0.82, 0.84, 0.88, 1),
+            color=(0.82, 0.84, 0.88, 1), **mkw
         )
         if tall:
             from kivy.uix.scrollview import ScrollView
@@ -3289,11 +4726,27 @@ class RootUI(BoxLayout):
             background_color=(0.08, 0.09, 0.15, 0.95),
         )
         okbtn.bind(on_release=lambda *_: p.dismiss())
+        self._style_title(p, t, tkw)
         p.open()
 
 
 class SentinelXApp(App):
+    # Current UI language and the font/script to render it (bound in KV)
+    lang = StringProperty("en")
+    ui_font = StringProperty("Roboto")
+    ui_script = StringProperty("Zyyy")
+
+    def set_language(self, lang):
+        I18N.set_lang(lang)
+        self.ui_font, self.ui_script = I18N.font_for()
+        self.lang = I18N.LANG
+
     def build(self):
+        try:
+            with open(os.path.join(self.user_data_dir, "settings.json")) as f:
+                self.set_language(json.load(f).get("lang", "en"))
+        except Exception:
+            self.set_language("en")
         Window.clearcolor = (0.043, 0.055, 0.09, 1)  # #0B0E17
         Builder.load_string(KV)
         return RootUI()
@@ -3331,6 +4784,16 @@ class SentinelXApp(App):
             if r._preview and r._cam_ok:
                 try:
                     r._preview.disconnect_camera()
+                except Exception:
+                    pass
+            if r._gps is not None:
+                r._gps.stop()
+            # Stop the telemetry service: it holds a partial wakelock and
+            # would otherwise keep polling GPS after the app has exited.
+            if r._service_cls is not None:
+                try:
+                    act = autoclass("org.kivy.android.PythonActivity").mActivity
+                    r._service_cls.stop(act)
                 except Exception:
                     pass
         if plyer_accel:

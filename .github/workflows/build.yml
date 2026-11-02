@@ -71,20 +71,48 @@ jobs:
       # Inject a monotonic versionCode AFTER cache restore so the cache key
       # (hash of the committed buildozer.spec) stays stable across runs. This
       # versionCode is what each device compares against the published manifest.
+      # The key must sit in the [app] section: appending it to the end of the
+      # file put it under [buildozer], where it was ignored, so every APK got
+      # the computed code 102610600 while update.json advertised the run
+      # number (OTA never saw an update). The 200000000 base keeps codes above
+      # that computed value, so new builds install as upgrades, not downgrades.
       - name: Set build version code
         run: |
-          if grep -q '^android.numeric_version' buildozer.spec; then
-            sed -i "s/^android.numeric_version.*/android.numeric_version = ${{ github.run_number }}/" buildozer.spec
-          else
-            printf '\nandroid.numeric_version = %s\n' "${{ github.run_number }}" >> buildozer.spec
-          fi
+          VC=$((200000000 + ${{ github.run_number }}))
+          echo "VERSION_CODE=$VC" >> "$GITHUB_ENV"
+          sed -i '/^android.numeric_version/d' buildozer.spec
+          sed -i "/^version = /a android.numeric_version = $VC" buildozer.spec
           grep -E '^version|^android.numeric_version' buildozer.spec
+          # fail loudly if it didn't land in [app]
+          awk '/^\[/{s=$0} /^android.numeric_version/{print s}' buildozer.spec | grep -qx '\[app\]'
 
       - name: Build debug APK
         run: |
           set -o pipefail
           buildozer -v android debug 2>&1 | tee /tmp/build.log
         timeout-minutes: 45
+
+      # Gradle signs with a debug key it generates fresh on every runner, so
+      # each build had a different signature and could not install over the
+      # previous one (OTA updates failed with "App not installed"). Re-sign
+      # the APK with a persistent key kept in a repository secret.
+      - name: Sign APK with the persistent key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "::warning::ANDROID_DEBUG_KEYSTORE_B64 secret is not set - this APK is signed with a throwaway key and cannot update a previously installed build."
+            exit 0
+          fi
+          BT=$(ls -d ~/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+          KS=$(mktemp)
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$KS"
+          for apk in bin/*.apk; do
+            "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android \
+              --ks-key-alias androiddebugkey --key-pass pass:android "$apk"
+            "$BT/apksigner" verify --print-certs "$apk" | grep -E "DN|SHA-256"
+          done
+          rm -f "$KS"
 
       - name: Build log diagnostics (on failure)
         if: failure()
@@ -152,11 +180,14 @@ jobs:
           cp "$APK" sentinelx.apk
           VC="${{ github.run_number }}"
           VER=$(grep -E '^version' buildozer.spec | head -1 | cut -d'=' -f2 | tr -d ' ')
+          # version_code must equal the APK's versionCode (set above)
           printf '{"version":"%s","version_code":%s,"url":"https://github.com/%s/releases/latest/download/sentinelx.apk","notes":"Automated build %s"}\n' \
-            "$VER" "$VC" "${{ github.repository }}" "$VC" > update.json
+            "$VER" "$VERSION_CODE" "${{ github.repository }}" "$VC" > update.json
           cat update.json
+          # Police directory for over-the-air updates (no APK needed)
+          python -c "import json, civic; json.dump(civic.CivicDirectory.export_directory(), open('directory.json', 'w'), indent=1)"
           TAG="v${VER}-${VC}"
-          gh release create "$TAG" sentinelx.apk update.json \
+          gh release create "$TAG" sentinelx.apk update.json directory.json \
             --title "Sentinel-X ${VER} (build ${VC})" \
             --notes "Automated OTA release. Installed apps auto-detect this and prompt to install." \
             --latest
