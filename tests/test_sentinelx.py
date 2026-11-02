@@ -2356,6 +2356,23 @@ class TestCityRoutingAndChannels:
         for name, state, la, lo, rad, emails, src in d.CITIES:
             assert state in codes and src.startswith("https://") and emails, name
 
+    def test_official_police_app_lookup(self):
+        d = civic.CivicDirectory
+        assert d.police_app_for("DL")[0] == "com.dtp.trafficsentinel"
+        assert d.police_app_for("KA", "Bengaluru")[0] == "com.BTPASTraM"
+        assert d.police_app_for("KA") is None          # app is Bengaluru-only
+        assert d.police_app_for("HR", "Gurugram") is None
+
+    def test_civic_channel_lookup(self):
+        d = civic.CivicDirectory
+        assert d.civic_channel_for(28.70, 77.10, "DL")["phone"] == "155305"
+        assert d.civic_channel_for(13.06, 80.25, "TN")["phone"] == "1913"
+        assert d.civic_channel_for(19.9, 75.3, "MH") is None
+
+    def test_quality_flags_stale_gps(self):
+        issues = civic.QualityCheck.issues(True, sharpness=200, gps_age_s=5 * 86400)
+        assert len(issues) == 1 and "120 h" in issues[0]
+
     def test_whatsapp_numbers_international_format(self):
         for code, (num, _src) in civic.CivicDirectory.WHATSAPP.items():
             assert num.isdigit() and num.startswith("91") and len(num) == 12, code
@@ -2387,6 +2404,46 @@ class TestSafetyFeatures:
         assert E.is_crash(E.CRASH_G + 1, last_moving_ts=100.0, now_ts=105.0)
         assert not E.is_crash(E.CRASH_G + 1, last_moving_ts=0.0, now_ts=105.0)
         assert not E.is_crash(E.CRASH_G - 1, last_moving_ts=100.0, now_ts=101.0)
+
+    def test_quality_check_flags_common_rejections(self):
+        Q = civic.QualityCheck
+        assert Q.issues(True, sharpness=200, gps_accuracy_m=8, plate_conf=0.85) == []
+        assert len(Q.issues(False, plate_conf=0.85)) == 1
+        issues = Q.issues(True, sharpness=20, gps_accuracy_m=120, plate_conf=0.3)
+        assert len(issues) == 3 and "blurry" in issues[0]
+
+    def test_power_policy_hysteresis(self):
+        P = civic.PowerPolicy
+        assert P.should_save(10, False, 30, saving=False)          # low battery
+        assert not P.should_save(10, True, 30, saving=False)       # charging
+        assert P.should_save(80, True, 45, saving=False)           # hot
+        assert P.should_save(17, False, 30, saving=True)           # not yet resumed
+        assert not P.should_save(25, False, 39, saving=True)       # recovered
+        assert P.should_save(50, False, 42.5, saving=True)         # still warm
+
+    def test_flag_gesture_double_press(self):
+        g = civic.FlagGesture()
+        assert not g.press(100.0)
+        assert g.press(100.8)            # second press within the window
+        assert not g.press(101.0)        # cooldown
+        assert not g.press(103.0)
+        assert not g.press(105.0)        # presses too far apart
+        assert g.press(111.0) is False and g.press(111.5) is True
+
+    def test_rahveer_application_and_golden_hour(self):
+        A = civic.AccidentHelp
+        acc = {"ts": 1_000_000.0, "lat": 28.6, "lon": 77.2}
+        hosp = {"ts": 1_000_000.0 + 40 * 60, "lat": 28.62, "lon": 77.21}
+        assert A.within_golden_hour(acc["ts"], hosp["ts"])
+        assert not A.within_golden_hour(acc["ts"], acc["ts"] + 2 * 3600)
+        text = A.rahveer_application("A Kumar", "9999999999", acc, hosp, "AIIMS")
+        assert "40 minutes" in text and "within the golden hour" in text and "AIIMS" in text
+
+    def test_rti_draft(self):
+        e = {"plate": "DL3CAB1234", "ts": 1_000_000.0, "offense": "HELMET",
+             "section": "S.194D", "lat": 28.6, "lon": 77.2, "recipients": ["a@b.in"]}
+        d = civic.RTIRequest.draft(e)
+        assert "Section 6(1)" in d and "DL3CAB1234" in d and "challan" in d
 
     def test_followups_due_after_a_week(self):
         F = civic.FollowUp

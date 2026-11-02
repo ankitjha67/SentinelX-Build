@@ -152,7 +152,7 @@ except Exception:
 from civic import (
     CivicDirectory, ReportChannels, VehicleLookup, DuplicateGuard, I18N,
     HazardReport, Emergency, ViolationHeatmap, PrivacyBlur, UpdateManifest,
-    FollowUp,
+    FollowUp, QualityCheck, PowerPolicy, FlagGesture, AccidentHelp, RTIRequest,
 )
 
 try:
@@ -194,15 +194,67 @@ APP_VERSION = "1.6.0"  # keep in sync with buildozer.spec
 # GPS via pyjnius — directly calls Android LocationManager Java API
 # This is far more reliable than plyer.gps
 # ═════════════════════════════════════════════════════════════════════════
+_LocationListener = None
+try:
+    if platform == "android":
+        from jnius import PythonJavaClass, java_method
+
+        class _LocationListener(PythonJavaClass):
+            """Receives live fixes; callbacks run on the Android main looper."""
+            __javainterfaces__ = ["android/location/LocationListener"]
+
+            def __init__(self, sink):
+                super().__init__()
+                self._sink = sink
+
+            @java_method("(Landroid/location/Location;)V")
+            def onLocationChanged(self, location):
+                self._sink(location)
+
+            # Android 12+ batches fixes through this overload (a default
+            # method, but pyjnius proxies must implement every call).
+            @java_method("(Ljava/util/List;)V", name="onLocationChanged")
+            def onLocationChangedList(self, locations):
+                for i in range(locations.size()):
+                    self._sink(locations.get(i))
+
+            @java_method("(I)V")
+            def onFlushComplete(self, request_code):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderEnabled(self, provider):
+                pass
+
+            @java_method("(Ljava/lang/String;)V")
+            def onProviderDisabled(self, provider):
+                pass
+
+            @java_method("(Ljava/lang/String;ILandroid/os/Bundle;)V")
+            def onStatusChanged(self, provider, status, extras):
+                pass
+except Exception:
+    _LocationListener = None
+
+
 class AndroidGPS:
-    """Direct access to Android LocationManager via pyjnius."""
+    """Android location via pyjnius, with live updates.
+
+    getLastKnownLocation alone can be days old (seen on device: a 5-day-old
+    fix stamped onto fresh evidence), so live GPS + network updates are
+    requested and the freshest fix wins.
+    """
+
+    MIN_TIME_MS = 1000
 
     def __init__(self):
         self._lm = None
         self._available = False
+        self._live = None          # newest Location from the listener
+        self._listener = None
         # Details of the last fix for evidence proofs: accuracy (m), fix time
         # (ms since epoch, from the GNSS/network fix rather than the phone
-        # clock) and provider.
+        # clock), age (s) and provider.
         self.last_fix = {}
         if platform == "android" and autoclass is not None:
             try:
@@ -213,24 +265,58 @@ class AndroidGPS:
                 self._available = True
             except Exception:
                 self._available = False
+            self._start_updates()
+
+    def _on_location(self, loc):
+        cur = self._live
+        # Prefer GPS; accept a network fix only if no recent GPS fix exists
+        if (cur is None or str(loc.getProvider()) == "gps"
+                or int(loc.getTime()) - int(cur.getTime()) > 10000):
+            self._live = loc
+
+    def _start_updates(self):
+        if not self._available or _LocationListener is None:
+            return
+        try:
+            LocationManager = autoclass("android.location.LocationManager")
+            Looper = autoclass("android.os.Looper")
+            self._listener = _LocationListener(self._on_location)
+            for provider in (LocationManager.GPS_PROVIDER,
+                             LocationManager.NETWORK_PROVIDER):
+                try:
+                    if self._lm.isProviderEnabled(provider):
+                        self._lm.requestLocationUpdates(
+                            provider, self.MIN_TIME_MS, 0.0, self._listener,
+                            Looper.getMainLooper())
+                except Exception:
+                    continue
+        except Exception:
+            self._listener = None
+
+    def stop(self):
+        try:
+            if self._listener is not None:
+                self._lm.removeUpdates(self._listener)
+        except Exception:
+            pass
 
     def get_location(self):
-        """Returns (lat, lon, speed) from last known GPS or network location."""
+        """Returns (lat, lon, speed) from the freshest live or last-known fix."""
         if not self._available or self._lm is None:
             return 0.0, 0.0, 0.0
         try:
             LocationManager = autoclass("android.location.LocationManager")
-            # Try GPS first, then network
-            loc = None
+            cands = [self._live] if self._live is not None else []
             for provider in [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]:
                 try:
                     loc = self._lm.getLastKnownLocation(provider)
                     if loc is not None:
-                        break
+                        cands.append(loc)
                 except Exception:
                     continue
-            if loc is None:
+            if not cands:
                 return 0.0, 0.0, 0.0
+            loc = max(cands, key=lambda l: int(l.getTime()))
             lat = float(loc.getLatitude())
             lon = float(loc.getLongitude())
             speed = 0.0
@@ -240,9 +326,11 @@ class AndroidGPS:
             except Exception:
                 pass
             try:
+                fix_ms = int(loc.getTime())
                 self.last_fix = {
                     "accuracy_m": float(loc.getAccuracy()) if loc.hasAccuracy() else None,
-                    "fix_time_ms": int(loc.getTime()),
+                    "fix_time_ms": fix_ms,
+                    "age_s": max(0.0, time.time() - fix_ms / 1000.0),
                     "provider": str(loc.getProvider()),
                 }
             except Exception:
@@ -376,8 +464,10 @@ class AnalyticsEngine:
         except Exception:
             return img
 
+    paused = False  # set by the power-saving policy
+
     def analyze_frame(self, pixels, image_size, image_pos=None, scale=None, mirror=False):
-        if cv2 is None or np is None:
+        if cv2 is None or np is None or self.paused:
             return
         self._skip += 1
         if self._skip % 3 != 0:
@@ -2452,6 +2542,9 @@ class RootUI(BoxLayout):
         self._privacy_blur = False
         self._dup_ack = False
         self._evidence_uri = None  # MediaStore copy of the last capture
+        self._evidence_annotated = ""
+        self._evidence_quality = {}
+        self._quality_ack = False
         Clock.schedule_once(self._boot, 0)
 
     def _get_evidence_folder(self):
@@ -2571,6 +2664,12 @@ class RootUI(BoxLayout):
         self._load_vahan_config()
         # Police directory: apply the last downloaded copy, then refresh it
         self._load_directory_updates()
+        # Battery / heat watch for the always-on camera pipeline
+        self._power_saving = False
+        Clock.schedule_interval(self._check_power, 30.0)
+        Clock.schedule_once(self._check_power, 5.0)
+        # Hands-free incident flag: double-press a volume key
+        self._start_flag_gesture()
         # Polling loops
         Clock.schedule_interval(self._poll_gps, 1.0)
         Clock.schedule_interval(self._poll_accel, 0.1)
@@ -2631,6 +2730,14 @@ class RootUI(BoxLayout):
 
     # ── GPS polling (prefer service telemetry, fallback to pyjnius) ─────
     def _poll_gps(self, _dt):
+        # A fresh live fix beats the service's telemetry, which only reads
+        # the (possibly days-old) last-known location.
+        if self._gps is not None:
+            lat, lon, speed = self._gps.get_location()
+            if lat and lon and self._gps.last_fix.get("age_s", 1e9) < 15:
+                self.latest_lat, self.latest_lon = lat, lon
+                self.latest_speed = speed
+                return
         t = self._telemetry.latest if self._telemetry else {}
         if t.get("lat", 0) != 0 and t.get("lon", 0) != 0:
             self.latest_lat = t["lat"]
@@ -2755,67 +2862,76 @@ class RootUI(BoxLayout):
         try:
             # export_to_png grabs current frame from the preview texture
             self._preview.export_to_png(fpath)
-
-            if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
-                # Apply CLAHE if enabled
-                if self.ids.sw_clahe.active and cv2:
-                    try:
-                        img = cv2.imread(fpath)
-                        if img is not None:
-                            enhanced = AnalyticsEngine.clahe(img)
-                            cv2.imwrite(fpath, enhanced)
-                    except Exception:
-                        pass
-
-                # Phase 6: Optional privacy blur of bystander faces (opt-in via
-                # MORE menu; off by default because a rider's head can itself be
-                # evidence of a helmet/phone violation).
-                if getattr(self, "_privacy_blur", False) and cv2:
-                    try:
-                        img = cv2.imread(fpath)
-                        if img is not None:
-                            cv2.imwrite(fpath, PrivacyBlur.blur_faces(img))
-                    except Exception:
-                        pass
-
-                # Phase 2: Watermark evidence with metadata
-                plate = self.ids.in_plate.text.strip()
-                EvidenceWatermark.apply(
-                    fpath, float(self.latest_lat), float(self.latest_lon),
-                    ts, plate
-                )
-                # Phase 2: Hash evidence for tamper detection
-                EvidenceHasher.write_hashfile(fpath)
-                # Signed provenance record (hardware-backed key)
-                self._write_proof(fpath)
-                self.evidence_path = fpath
-                self.evidence_status = "Evidence: %s" % fname
-                # Publish a byte-identical copy to the gallery (MediaStore);
-                # its content:// URI is also what SEND attaches to the email.
-                self._evidence_uri = self._publish_to_gallery(fpath)
-                where = ("Pictures/SentinelX/%s" % fname if self._evidence_uri
-                         else fname)
-                self._popup("Saved!", "Photo saved to:\n%s" % where)
-                # Auto-dismiss evidence notification after 5 seconds
-                _fname = fname  # capture for closure
-                def _dismiss(dt, fn=_fname):
-                    if self.evidence_status.endswith(fn):
-                        self.evidence_status = ""
-                Clock.schedule_once(_dismiss, 5.0)
-
-                # Phase 5: OCR the full-resolution evidence and auto-fill the
-                # plate if the user has not entered one. Runs on a background
-                # thread (ML Kit must not block the UI thread).
-                if (not self.ids.in_plate.text.strip()
-                        and self._plate_ocr and self._plate_ocr.available):
-                    threading.Thread(
-                        target=self._ocr_image_worker,
-                        args=(fpath, False), daemon=True,
-                    ).start()
-            else:
+            if not (os.path.isfile(fpath) and os.path.getsize(fpath) > 0):
                 self._popup("Failed", "File was not created.")
+                return
+
+            # The ORIGINAL is never modified: it is what gets hashed, signed,
+            # attached to the police email and sent to official apps (Delhi's
+            # Traffic Prahari rejects edited evidence). Night enhancement,
+            # face blur and the watermark go on a separate annotated copy.
+            EvidenceHasher.write_hashfile(fpath)
+            self._write_proof(fpath)
+            plate = self.ids.in_plate.text.strip()
+            annotated, quality = self._make_annotated(fpath, ts, plate)
+            self._evidence_quality = quality
+
+            self.evidence_path = fpath
+            self._evidence_annotated = annotated
+            self.evidence_status = "Evidence: %s%s" % (
+                fname, " (night-enhanced copy)" if quality.get("night") else "")
+            self._evidence_uri = self._publish_to_gallery(fpath)
+            if annotated:
+                self._publish_to_gallery(annotated, "Pictures/SentinelX/Annotated",
+                                         "image/jpeg")
+            where = ("Pictures/SentinelX/%s" % fname if self._evidence_uri
+                     else fname)
+            self._popup("Saved!", "Original photo saved to:\n%s%s" % (
+                where, "\n\nAnnotated copy in Pictures/SentinelX/Annotated"
+                if annotated else ""))
+            _fname = fname  # capture for closure
+
+            def _dismiss(dt, fn=_fname):
+                if fn in self.evidence_status:
+                    self.evidence_status = ""
+            Clock.schedule_once(_dismiss, 5.0)
+
+            # Phase 5: OCR the full-resolution evidence and auto-fill the
+            # plate if the user has not entered one. Runs on a background
+            # thread (ML Kit must not block the UI thread).
+            if (not plate and self._plate_ocr and self._plate_ocr.available):
+                threading.Thread(
+                    target=self._ocr_image_worker,
+                    args=(fpath, False), daemon=True,
+                ).start()
         except Exception as e:
             self._popup("Capture Error", str(e))
+
+    def _make_annotated(self, path, ts, plate):
+        """Build <name>_annotated.jpg (night enhancement when the photo is
+        dark or Night Mode is on, optional face blur, metadata watermark).
+        Returns (annotated path or "", quality dict)."""
+        quality = {}
+        if cv2 is None:
+            return "", quality
+        img = cv2.imread(path)
+        if img is None:
+            return "", quality
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        quality["sharpness"] = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        quality["brightness"] = float(gray.mean())
+        # Automatic night mode: enhance dark scenes even if the switch is off
+        night = self.ids.sw_clahe.active or quality["brightness"] < QualityCheck.DARK_MEAN
+        quality["night"] = bool(night)
+        if night:
+            img = AnalyticsEngine.clahe(img)
+        if getattr(self, "_privacy_blur", False):
+            img = PrivacyBlur.blur_faces(img)
+        out = os.path.splitext(path)[0] + "_annotated.jpg"
+        cv2.imwrite(out, img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        EvidenceWatermark.apply(out, float(self.latest_lat),
+                                float(self.latest_lon), ts, plate)
+        return out, quality
 
     # ── On-demand full-resolution scan ───────────────────────────────────
     def scan_now(self):
@@ -2922,6 +3038,8 @@ class RootUI(BoxLayout):
         try:
             Media = autoclass("android.provider.MediaStore$Video$Media"
                               if mime.startswith("video/")
+                              else "android.provider.MediaStore$Downloads"
+                              if mime == "application/pdf"
                               else "android.provider.MediaStore$Images$Media")
             Cols = autoclass("android.provider.MediaStore$MediaColumns")
             ContentValues = autoclass("android.content.ContentValues")
@@ -3017,7 +3135,10 @@ class RootUI(BoxLayout):
         # Phase 4: Subsystem status updates
         if self._subsystem_status:
             self._subsystem_status.update("cam", self._cam_ok)
-            self._subsystem_status.update("gps", lat != 0 or lon != 0)
+            age = (self._gps.last_fix.get("age_s") if self._gps else None)
+            self._subsystem_status.update(
+                "gps", (lat != 0 or lon != 0) and (age is None or age < 60),
+                "" if age is None else "%.0fs old" % age)
             self._subsystem_status.update(
                 "dashcam", bool(self._dashcam and self._dashcam.recording)
             )
@@ -3144,6 +3265,8 @@ class RootUI(BoxLayout):
         self.route_text = DASH
         self.evidence_path = ""
         self._evidence_uri = None
+        self._evidence_annotated = ""
+        self._evidence_quality = {}
         self.evidence_status = ""
         # Phase 5: Reset OCR state
         self._ocr_accepted_plate = ""
@@ -3210,6 +3333,27 @@ class RootUI(BoxLayout):
                 )
                 return
         self._dup_ack = False
+
+        # Warn about evidence that police apps commonly reject
+        if not self._quality_ack:
+            fix = self._gps.last_fix if self._gps is not None else {}
+            issues = QualityCheck.issues(
+                has_photo=bool(self.evidence_path),
+                sharpness=self._evidence_quality.get("sharpness"),
+                gps_accuracy_m=(fix or {}).get("accuracy_m"),
+                gps_age_s=(fix or {}).get("age_s"),
+                plate_conf=PlateOCR.clean_plate_text(plate)[1])
+            if issues:
+                def anyway():
+                    self._quality_ack = True
+                    try:
+                        self.send_report()
+                    finally:
+                        self._quality_ack = False
+                self._confirm("Check evidence",
+                              "This report may be rejected:\n\n- %s" % "\n- ".join(issues),
+                              "Send anyway", anyway)
+                return
 
         o = TrafficLawDB.OFFENSES[okey]
         anon = bool(self.ids.sw_anon.active)
@@ -3366,10 +3510,13 @@ class RootUI(BoxLayout):
             ("Share to X / Twitter", self.share_twitter),
             ("Share to WhatsApp", self.share_whatsapp),
             ("WhatsApp traffic police (official no.)", self.whatsapp_police),
+            ("Report in official police app", self.police_app_report),
             ("Vehicle lookup (RC/Insurance/PUC)", self.vehicle_lookup),
             ("Report a road hazard", self.report_hazard),
             ("SOS / Emergency", self.show_sos),
             ("Save last 15 s as video clip", self.save_clip),
+            ("Evidence pack (PDF)", self.evidence_pdf),
+            ("RTI request for last report", self.rti_last_report),
             ("Emergency contact (crash SOS)", self.edit_emergency_contact),
             ("Violation hotspots", self.show_hotspots),
             ("Check for app updates", lambda: self._auto_update_check(True)),
@@ -3558,6 +3705,65 @@ class RootUI(BoxLayout):
         self._share_public("com.whatsapp", text,
                            ReportChannels.whatsapp_url(text), "WhatsApp")
 
+    def _app_installed(self, package):
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            return act.getPackageManager().getLaunchIntentForPackage(package) is not None
+        except Exception:
+            return False
+
+    def _launch_or_store(self, package):
+        """Open an installed app, else its Play Store page."""
+        if self._app_installed(package):
+            try:
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                i = act.getPackageManager().getLaunchIntentForPackage(package)
+                i.addFlags(autoclass("android.content.Intent").FLAG_ACTIVITY_NEW_TASK)
+                act.startActivity(i)
+                return True
+            except Exception:
+                pass
+        return (self._open_url("market://details?id=" + package)
+                or self._open_url("https://play.google.com/store/apps/details?id=" + package))
+
+    def police_app_report(self):
+        """Hand the report to the force's own app, where citizen photo reports
+        become challans (Delhi's Traffic Prahari also pays rewards). The
+        ORIGINAL photo is shared because these apps reject edited images."""
+        self._close_menu()
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        lc = JurisdictionEngine._resolve_state(lat, lon)
+        city = CivicDirectory.city_for(lat, lon) or {}
+        app = CivicDirectory.police_app_for(lc, city.get("name", ""))
+        if not app:
+            have = ", ".join(sorted(
+                "%s (%s)" % ("Delhi" if k == "DL" else k, v[1])
+                for k, v in CivicDirectory.POLICE_APPS.items()))
+            self._popup("Official app", "No official citizen-reporting police app is "
+                        "published for this location.\n\nAvailable for: %s.\nUse SEND "
+                        "(email) instead." % have, tall=True)
+            return
+        pkg, title, _src = app
+        if not self._app_installed(pkg):
+            self._popup("Official app", "%s is not installed. Opening the Play Store - "
+                        "install it, then come back and tap this again." % title)
+            self._launch_or_store(pkg)
+            return
+        plate, label, loc, _sc = self._ctx()
+        text = "%s - %s at %s (GPS %.6f, %.6f)" % (plate or "?", label or "violation",
+                                                  loc, lat, lon)
+        # Try sharing the original photo straight into the app; if it doesn't
+        # accept shares, open it - the photo is in Pictures/SentinelX.
+        if not (self._evidence_uri is not None
+                and self._share_to_app(pkg, text, self._evidence_uri)):
+            self._launch_or_store(pkg)
+            self._copy(text)
+            self._popup("Official app", "Opened %s. Attach the photo from "
+                        "Pictures/SentinelX; the report details are copied to the "
+                        "clipboard." % title)
+
     def whatsapp_police(self):
         """Send the report and the ORIGINAL evidence photo to the official
         traffic-police WhatsApp number for this location (or plate state)."""
@@ -3659,6 +3865,42 @@ class RootUI(BoxLayout):
     def _send_hazard(self, category):
         self._close_menu()
         lat, lon = float(self.latest_lat), float(self.latest_lon)
+        ch = CivicDirectory.civic_channel_for(
+            lat, lon, JurisdictionEngine._resolve_state(lat, lon))
+        if ch and not getattr(self, "_hazard_email_ok", False):
+            box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+            box.add_widget(Label(
+                text="%s - the city's own grievance channel usually acts on this "
+                     "faster than email.\nYour photo is in Pictures/SentinelX." % ch["name"],
+                halign="left", valign="top", text_size=(dp(250), None),
+                font_size="13sp", color=(0.82, 0.84, 0.88, 1)))
+
+            def close_then(fn):
+                return lambda: (pop.dismiss(), fn())
+            if ch["package"]:
+                box.add_widget(self._dismiss_button(
+                    "Open app", close_then(lambda: self._launch_or_store(ch["package"]))))
+            if ch["phone"]:
+                box.add_widget(self._dismiss_button(
+                    "Call %s" % ch["phone"], close_then(lambda: self._dial(ch["phone"]))))
+            if ch["web"]:
+                box.add_widget(self._dismiss_button(
+                    "Open website", close_then(lambda: self._open_url(ch["web"]))))
+
+            def by_email():
+                self._hazard_email_ok = True
+                try:
+                    self._send_hazard(category)
+                finally:
+                    self._hazard_email_ok = False
+            box.add_widget(self._dismiss_button("Email instead", close_then(by_email)))
+            pop = Popup(title=category, content=box, size_hint=(0.9, 0.7),
+                        title_size="15sp", title_color=(1, 0.84, 0.25, 1),
+                        separator_color=(1, 0.84, 0.25, 1),
+                        background_color=(0.08, 0.09, 0.15, 0.96))
+            pop.open()
+            return
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
         loc = self._location_text()
         notes = self.ids.in_notes.text.strip()
         subj = HazardReport.subject(category, loc)
@@ -3679,13 +3921,21 @@ class RootUI(BoxLayout):
             ("Call 112 (Emergency)", lambda: self._dial(CivicDirectory.EMERGENCY)),
             ("Call 108 (Ambulance)", lambda: self._dial(CivicDirectory.AMBULANCE)),
             ("Report accident (Good Samaritan)", self._good_samaritan),
+            ("Nearest hospital (map)", lambda: self._nearest_hospital(lat, lon)),
+            ("Reached hospital (Rah-Veer)" if self._settings().get("rahveer")
+             else "I'm taking a victim to hospital (Rah-Veer)", self._rahveer_step),
             ("Share my location (SMS)", lambda: self._sos_sms(lat, lon)),
         ]
         for text, cb in actions:
             box.add_widget(self._menu_button(text, cb))
-        box.add_widget(self._dismiss_button("Close", self._close_menu))
+        from kivy.uix.scrollview import ScrollView
+        scroll = ScrollView(do_scroll_x=False)
+        scroll.add_widget(box)
+        container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+        container.add_widget(scroll)
+        container.add_widget(self._dismiss_button("Close", self._close_menu))
         self._menu_popup = Popup(
-            title="SOS / Emergency", content=box, size_hint=(0.9, 0.62),
+            title="SOS / Emergency", content=container, size_hint=(0.9, 0.8),
             title_size="15sp", title_color=(1, 0.32, 0.32, 1),
             separator_color=(1, 0.32, 0.32, 1),
             background_color=(0.08, 0.09, 0.15, 0.96),
@@ -3711,7 +3961,8 @@ class RootUI(BoxLayout):
         self._popup(
             "Good Samaritan",
             "Reporting an accident under Sec.134A protection.\n\n%s\n\n"
-            "Use SOS to call 112/108." % Emergency.good_samaritan_text(lat, lon),
+            "%s\n\nUse SOS to call 112/108." % (Emergency.good_samaritan_text(lat, lon),
+                                                AccidentHelp.CASHLESS_INFO),
             tall=True,
         )
 
@@ -4061,6 +4312,14 @@ class RootUI(BoxLayout):
             mark(shown)
             pop.dismiss()
         box.add_widget(self._dismiss_button("Escalate (copy draft)", escalate))
+
+        def rti():
+            self._copy("\n\n---\n\n".join(RTIRequest.draft(e) for e in shown))
+            mark(shown)
+            pop.dismiss()
+            self._popup("RTI", "RTI application draft copied. File it with the state "
+                        "police PIO (state RTI portal or post, Rs 10 fee).")
+        box.add_widget(self._dismiss_button("RTI request (copy draft)", rti))
         box.add_widget(self._dismiss_button("Dismiss", dismiss))
         pop = Popup(title="Follow up on reports", content=box, size_hint=(0.9, 0.7),
                     title_size="15sp", title_color=(1, 0.84, 0.25, 1),
@@ -4068,11 +4327,14 @@ class RootUI(BoxLayout):
                     background_color=(0.08, 0.09, 0.15, 0.96))
         pop.open()
 
-    def save_clip(self):
-        """Save the dashcam's last 15 s as a video in Movies/SentinelX."""
+    def save_clip(self, quiet=False):
+        """Save the dashcam's last 15 s as a video in Movies/SentinelX.
+        quiet=True (volume-key flag while driving) shows a status-bar alert
+        instead of a popup that would need a tap."""
         self._close_menu()
         if self._dashcam is None:
-            self._popup("Clip", "Dashcam is not running.")
+            if not quiet:
+                self._popup("Clip", "Dashcam is not running.")
             return
         out = os.path.join(self._get_evidence_folder(),
                            "SentinelX_clip_%s.avi" % datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -4082,16 +4344,311 @@ class RootUI(BoxLayout):
 
             def done(_dt):
                 if not path:
-                    self._popup("Clip", "Not enough recent footage yet.")
+                    if quiet:
+                        self._flash_alert("FLAG: no footage")
+                    else:
+                        self._popup("Clip", "Not enough recent footage yet.")
                     return
                 EvidenceHasher.write_hashfile(path)
                 uri = self._publish_to_gallery(path, "Movies/SentinelX", "video/x-msvideo")
+                if quiet:
+                    self._flash_alert("INCIDENT CLIP SAVED")
+                    return
                 self._popup("Saved!", "Video clip saved (%d frames, %.0f s):\n%s" % (
                     n, n / float(DashcamRecorder.CLIP_FPS),
                     "Movies/SentinelX/" + os.path.basename(path) if uri
                     else os.path.basename(path)))
             Clock.schedule_once(done, 0)
         threading.Thread(target=work, daemon=True).start()
+
+    def _flash_alert(self, text, secs=4.0):
+        self.alert_text = text
+
+        def clear(_dt, t=text):
+            if self.alert_text == t:
+                self.alert_text = ""
+        Clock.schedule_once(clear, secs)
+
+    def _copy(self, text):
+        try:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(text)
+            return True
+        except Exception:
+            return False
+
+    # ── power / heat ─────────────────────────────────────────────────────
+    def _battery(self):
+        """(percent, charging, temperature C) from the sticky battery intent."""
+        if platform != "android" or autoclass is None:
+            return None, False, None
+        try:
+            Intent = autoclass("android.content.Intent")
+            IntentFilter = autoclass("android.content.IntentFilter")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            i = act.registerReceiver(None, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if i is None:
+                return None, False, None
+            level, scale = i.getIntExtra("level", -1), i.getIntExtra("scale", 100)
+            temp = i.getIntExtra("temperature", -1)
+            pct = 100.0 * level / scale if level >= 0 and scale > 0 else None
+            return pct, i.getIntExtra("plugged", 0) > 0, (temp / 10.0 if temp > 0 else None)
+        except Exception:
+            return None, False, None
+
+    def _check_power(self, _dt):
+        pct, charging, temp = self._battery()
+        saving = PowerPolicy.should_save(pct, charging, temp, self._power_saving)
+        if saving != self._power_saving:
+            self._power_saving = saving
+            if self._dashcam is not None:
+                self._dashcam.recording = not saving
+            self._analytics.paused = saving
+            self._flash_alert("POWER SAVE" if saving else "", 6.0)
+        self._subsystem_status.update(
+            "power", not saving, "%s%% %s" % (
+                "?" if pct is None else int(pct),
+                "" if temp is None else "%.0fC" % temp))
+
+    # ── hands-free flag ──────────────────────────────────────────────────
+    def _start_flag_gesture(self):
+        """Double-press a volume key to save the last 15 s. Volume keys never
+        reach Kivy, so this listens for Android's volume-changed broadcast
+        (media stream) through p4a's BroadcastReceiver helper."""
+        if platform != "android":
+            return
+        self._flag = FlagGesture()
+        try:
+            from android.broadcast import BroadcastReceiver
+
+            def on_volume(_context, intent):
+                if intent.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) != 3:
+                    return
+                if self._flag.press(time.time()):
+                    Clock.schedule_once(lambda _dt: self.save_clip(quiet=True), 0)
+            self._volume_rx = BroadcastReceiver(
+                on_volume, actions=["android.media.VOLUME_CHANGED_ACTION"])
+            self._volume_rx.start()
+        except Exception:
+            self._volume_rx = None
+
+    # ── accident help ────────────────────────────────────────────────────
+    def _nearest_hospital(self, lat, lon):
+        self._close_menu()
+        if not self._open_url("geo:%.6f,%.6f?q=hospital" % (lat, lon)):
+            self._open_url("https://www.google.com/maps/search/hospital/@%.6f,%.6f,14z"
+                           % (lat, lon))
+
+    def _signed_record(self, kind, payload):
+        """Write a JSON record + signed proof in the evidence folder."""
+        path = os.path.join(self._get_evidence_folder(), "%s_%s.json" % (
+            kind, datetime.now().strftime("%Y%m%d_%H%M%S")))
+        try:
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=1)
+            EvidenceHasher.write_hashfile(path)
+            EvidenceProof.write(path, dict(payload, sha256=EvidenceHasher.hash_file(path)))
+        except Exception:
+            pass
+        return path
+
+    def _rahveer_step(self):
+        """Two taps: start (accident scene) -> stop (reached hospital)."""
+        self._close_menu()
+        point = {"ts": time.time(), "lat": float(self.latest_lat),
+                 "lon": float(self.latest_lon)}
+        session = self._settings().get("rahveer")
+        if not session:
+            self._save_settings({"rahveer": point})
+            self._signed_record("rahveer_accident", point)
+            self._popup("Rah-Veer", "Accident time and place recorded.\n\nTake the "
+                        "victim to the nearest hospital, then open SOS and tap "
+                        "'Reached hospital'.\n\n%s" % AccidentHelp.CASHLESS_INFO, tall=True)
+            return
+        self._save_settings({"rahveer": None})
+        self._signed_record("rahveer_hospital", point)
+        self._rahveer_form(session, point)
+
+    def _rahveer_form(self, accident, hospital):
+        from kivy.uix.textinput import TextInput
+        st = self._settings()
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        mins = (hospital["ts"] - accident["ts"]) / 60.0
+        ok = AccidentHelp.within_golden_hour(accident["ts"], hospital["ts"])
+        box.add_widget(Label(
+            text="Reached hospital in %.0f min (%s the golden hour).\nThe Rah-Veer award "
+                 "(%s) needs your name and mobile; they stay on this phone until you "
+                 "file the application." % (mins, "within" if ok else "after",
+                                            AccidentHelp.RAHVEER_REWARD),
+            halign="left", valign="top", text_size=(dp(250), None), font_size="13sp",
+            color=(0.82, 0.84, 0.88, 1), size_hint_y=None, height=dp(110)))
+        fields = {}
+        for key, hint in (("name", "Your full name"), ("phone", "Mobile number"),
+                          ("hospital", "Hospital name")):
+            from kivy.factory import Factory
+            ti = Factory.StyledInput(
+                text=st.get("rahveer_" + key, "") if key != "hospital" else "",
+                hint_text=hint, multiline=False, size_hint_y=None, height=dp(42))
+            box.add_widget(ti)
+            fields[key] = ti
+
+        def make():
+            name, phone = fields["name"].text.strip(), fields["phone"].text.strip()
+            self._save_settings({"rahveer_name": name, "rahveer_phone": phone})
+            text = AccidentHelp.rahveer_application(
+                name, phone, accident, hospital, fields["hospital"].text.strip())
+            path = self._signed_record("rahveer_application",
+                                       {"application": text, "accident": accident,
+                                        "hospital": hospital})
+            self._copy(text)
+            pop.dismiss()
+            self._popup("Rah-Veer", "Application copied to clipboard and saved "
+                        "(%s).\n\nSubmit it to the District Magistrate's appraisal "
+                        "committee.\n\n%s" % (os.path.basename(path), text), tall=True)
+        box.add_widget(self._dismiss_button("Create application", make))
+        from kivy.uix.widget import Widget
+        box.add_widget(Widget())  # absorb spare height below the form
+        pop = Popup(title="Rah-Veer (Good Samaritan)", content=box, size_hint=(0.92, 0.8),
+                    title_size="15sp", title_color=(0, 0.78, 0.33, 1),
+                    separator_color=(0, 0.78, 0.33, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        pop.open()
+
+    # ── RTI + PDF evidence pack ──────────────────────────────────────────
+    def _last_report(self):
+        entries = self._report_log.read_all() if self._report_log else []
+        return entries[-1] if entries else None
+
+    def rti_last_report(self):
+        self._close_menu()
+        entry = self._last_report()
+        if entry is None:
+            self._popup("RTI", "No reports sent yet.")
+            return
+        text = RTIRequest.draft(entry)
+        self._copy(text)
+        self._popup("RTI", "Draft copied to clipboard. File it with the state police "
+                    "PIO (state RTI portal or post, Rs 10 fee).\n\n%s" % text, tall=True)
+
+    def evidence_pdf(self):
+        """One-file evidence pack: report summary, original photo, signed
+        proof and verification steps (Android PdfDocument; no extra libs)."""
+        self._close_menu()
+        if not self.evidence_path:
+            self._popup("Evidence pack", "CAPTURE a photo first.")
+            return
+        try:
+            out = self._build_pdf()
+        except Exception as e:
+            self._popup("Evidence pack", "Could not build the PDF: %s" % e)
+            return
+        uri = self._publish_to_gallery(out, "Download/SentinelX", "application/pdf")
+        self._popup("Saved!", "Evidence pack saved:\n%s" % (
+            "Download/SentinelX/" + os.path.basename(out) if uri else out))
+
+    def _pdf_lines(self):
+        plate = self.ids.in_plate.text.strip() or DASH
+        okey = (self.ids.sp_offense.text.split(":")[0] or "").strip()
+        o = TrafficLawDB.OFFENSES.get(okey, {})
+        lat, lon = float(self.latest_lat), float(self.latest_lon)
+        rt = JurisdictionEngine.route(lat, lon, plate)
+        lines = [
+            "SENTINEL-X EVIDENCE PACK",
+            "Generated: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "",
+            "Vehicle: %s" % plate,
+            "Offense: %s %s" % (o.get("label", DASH), o.get("section", "")),
+            "Location: %s  GPS %.6f, %.6f" % (self._location_text(), lat, lon),
+            "Map: %s" % Emergency.maps_link(lat, lon),
+            "Sent to: %s" % (", ".join(rt["all"]) or DASH),
+            "Evidence file: %s" % os.path.basename(self.evidence_path),
+            "SHA-256: %s" % EvidenceHasher.hash_file(self.evidence_path),
+        ]
+        return lines
+
+    def _build_pdf(self):
+        PdfDocument = autoclass("android.graphics.pdf.PdfDocument")
+        PageInfo = autoclass("android.graphics.pdf.PdfDocument$PageInfo$Builder")
+        Paint = autoclass("android.graphics.Paint")
+        BitmapFactory = autoclass("android.graphics.BitmapFactory")
+        Bitmap = autoclass("android.graphics.Bitmap")
+        FileOutputStream = autoclass("java.io.FileOutputStream")
+        W, H, M = 595, 842, 36  # A4 in points, margin
+
+        doc = PdfDocument()
+        paint = Paint()
+        paint.setAntiAlias(True)
+        # Ligatures turn "ff"/"fi" in hashes and base64 into single glyphs,
+        # which corrupts copy-pasted signatures.
+        paint.setFontFeatureSettings("'liga' 0, 'clig' 0")
+
+        def text_page(n, lines, size=10.0):
+            page = doc.startPage(PageInfo(W, H, n).create())
+            c = page.getCanvas()
+            paint.setTextSize(size)
+            y = M + size
+            for line in lines:
+                for chunk in [line[i:i + 95] for i in range(0, len(line), 95)] or [""]:
+                    c.drawText(chunk, float(M), float(y), paint)
+                    y += size * 1.45
+            return page, c, y
+
+        # Page 1: summary + original photo
+        page, c, y = text_page(1, self._pdf_lines())
+        bmp = BitmapFactory.decodeFile(self.evidence_path)
+        if bmp is not None:
+            bw, bh = bmp.getWidth(), bmp.getHeight()
+            sw = W - 2 * M
+            sh = int(bh * sw / float(bw))
+            sh = min(sh, int(H - y - M))
+            sw = int(bw * sh / float(bh))
+            scaled = Bitmap.createScaledBitmap(bmp, sw, sh, True)
+            c.drawBitmap(scaled, float(M), float(y + 10), None)
+        doc.finishPage(page)
+
+        # Page 2: signed proof + how to verify
+        proof_lines = ["SIGNED PROVENANCE RECORD", ""]
+        try:
+            with open(self.evidence_path + ".proof.json") as f:
+                proof = json.load(f)
+            proof_lines += ["Payload: " + proof["payload"], "",
+                            "Algorithm: " + proof["algorithm"],
+                            "Signature (base64): " + proof["signature_b64"],
+                            "Public key (base64 DER): " + proof["public_key_b64"], "",
+                            "Verify: ECDSA-SHA256 over the payload bytes with the public "
+                            "key above; SHA-256 of the original photo must equal the "
+                            "payload's sha256."]
+        except Exception:
+            proof_lines.append("No signed proof available for this photo.")
+        paint.setTypeface(autoclass("android.graphics.Typeface").MONOSPACE)
+        page, _c, _y = text_page(2, proof_lines, 8.0)
+        doc.finishPage(page)
+
+        out = os.path.splitext(self.evidence_path)[0] + "_pack.pdf"
+        fos = FileOutputStream(out)
+        doc.writeTo(fos)
+        fos.close()
+        doc.close()
+        return out
+
+    def _confirm(self, title, message, ok_label, on_ok, cancel_label="Go back"):
+        """Two-button dialog; on_ok runs after the dialog closes."""
+        box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+        m, mkw = self._tr_font(message)
+        box.add_widget(Label(text=m, halign="left", valign="top",
+                             text_size=(dp(250), None), font_size="13sp",
+                             color=(0.82, 0.84, 0.88, 1), **mkw))
+
+        def ok():
+            pop.dismiss()
+            on_ok()
+        box.add_widget(self._dismiss_button(ok_label, ok))
+        box.add_widget(self._dismiss_button(cancel_label, lambda: pop.dismiss()))
+        t, tkw = self._tr_font(title)
+        pop = Popup(title=t, content=box, size_hint=(0.88, 0.6), title_size="15sp",
+                    title_color=(1, 0.84, 0.25, 1), separator_color=(1, 0.84, 0.25, 1),
+                    background_color=(0.08, 0.09, 0.15, 0.96))
+        self._style_title(pop, t, tkw)
+        pop.open()
 
     @staticmethod
     def _style_title(popup, title, fkw):
@@ -4203,6 +4760,8 @@ class SentinelXApp(App):
                     r._preview.disconnect_camera()
                 except Exception:
                     pass
+            if r._gps is not None:
+                r._gps.stop()
             # Stop the telemetry service: it holds a partial wakelock and
             # would otherwise keep polling GPS after the app has exited.
             if r._service_cls is not None:

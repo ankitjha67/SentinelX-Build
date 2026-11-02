@@ -80,6 +80,22 @@ jobs:
           fi
           grep -E '^version|^android.numeric_version' buildozer.spec
 
+      # Every fresh runner generates a new ~/.android/debug.keystore, so each
+      # build had a different signature and could not install over the
+      # previous one (OTA updates failed with "App not installed"). Restore a
+      # persistent key from a repository secret instead.
+      - name: Stable signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+            echo "Using the persistent signing key from secrets."
+          else
+            echo "::warning::ANDROID_DEBUG_KEYSTORE_B64 secret is not set - this APK is signed with a throwaway key and cannot update a previously installed build."
+          fi
+
       - name: Build debug APK
         run: |
           set -o pipefail

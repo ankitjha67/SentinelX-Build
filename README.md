@@ -92,6 +92,19 @@ setup.py build — newer p4a ships numpy 2.x which fails to cross-compile on NDK
 - **Follow-up reminders** -- Reports older than 7 days prompt an escalation; a CPGRAMS complaint draft is copied to the clipboard
 - **6 UI languages** -- English, Hindi, Marathi, Tamil, Kannada, Bengali, rendered with the phone's Noto fonts + HarfBuzz script shaping (MORE > Language)
 
+### Phase 8 -- Reports That Lead to Challans
+- **Unedited originals** -- CAPTURE keeps the camera image untouched (hashed, signed, attached, shared with police apps); night enhancement, face blur and the watermark go on a separate `_annotated.jpg` (Delhi's Traffic Prahari rejects edited evidence)
+- **Pre-send quality check** -- Warns before SEND about a missing/blurry photo, a stale or imprecise GPS fix, or an invalid plate -- the usual reasons police apps reject reports
+- **Live GPS** -- Requests live GPS + network fixes; previously only Android's last-known location was read, which on test was 5 days (8 km) stale
+- **Official police apps** -- "Report in official police app" hands the original photo to Traffic Prahari (Delhi), BTP ASTraM (Bengaluru) or the Mumbai Traffic Police app (package ids verified on Google Play)
+- **City civic channels** -- Road hazards go to the city's own grievance app / helpline / website (MCD 311, MyBMC, Sahaaya 2.0, Namma Chennai, GHMC, KMC, PMC CARE, AMC CCRS, Jaipur, Patna) with email as fallback
+- **Automatic night mode** -- Dark photos get CLAHE enhancement on the annotated copy without touching the switch
+- **Battery / heat care** -- Dashcam + live OCR pause below 15% battery (not charging) or above 44 C, resuming with hysteresis
+- **Hands-free flag** -- Double-press a volume key to save the last 15 s clip with no screen interaction
+- **Accident help** -- SOS shows the cashless-treatment entitlement (Rs 1.5 lakh / 7 days), a nearest-hospital map, and a Rah-Veer (Rs 25,000 Good Samaritan award) helper that records signed accident/hospital timestamps and drafts the application
+- **RTI + PDF evidence pack** -- RTI Act s.6(1) request draft for any report; one-file PDF with the summary, original photo and signed proof (`Download/SentinelX`)
+- **Stable APK signing in CI** -- Set the `ANDROID_DEBUG_KEYSTORE_B64` repository secret so every build is signed with the same key; otherwise builds cannot update each other (OTA fails)
+
 ### UI/UX
 - **Dark Theme** -- Custom design system (#0B0E17 background, cyan/green/amber/red accents)
 - **Action Bar** -- SCAN (purple), CAPTURE (blue), SEND (green), CLEAR (slate)

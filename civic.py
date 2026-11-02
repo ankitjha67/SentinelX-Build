@@ -138,6 +138,63 @@ class CivicDirectory:
          "https://police.rajasthan.gov.in/portal/Directory"),
     ]
 
+    # Official police apps that turn citizen photo reports into challans.
+    # Package ids verified on Google Play (developer = the police force) and
+    # linked from the force's site. Keyed by CITIES name or state code.
+    POLICE_APPS = {
+        "DL": ("com.dtp.trafficsentinel", "Traffic Prahari",
+               "https://traffic.delhipolice.gov.in/en/node/67"),
+        "Bengaluru": ("com.BTPASTraM", "BTP ASTraM",
+                      "https://btp.karnataka.gov.in/en"),
+        "Mumbai": ("com.sparken.mum.policealert", "Mumbai Traffic Police App",
+                   "https://trafficpolicemumbai.maharashtra.gov.in/"),
+    }
+
+    # Municipal grievance channels for road hazards (potholes, streetlights,
+    # waterlogging, manholes): (name, lat, lon, radius_km or state code,
+    # Play package or "", helpline or "", web or "", official source).
+    CIVIC_CHANNELS = [
+        ("Delhi (MCD 311)", 28.6139, 77.2090, "DL", "com.everythingcivic.mcd",
+         "155305", "https://mcd.everythingcivic.com", "https://mcdonline.nic.in/portal"),
+        ("Mumbai (MyBMC)", 19.0760, 72.8777, 25, "in.cdac.gov.mgov.mcgm", "", "",
+         "Play developer: BMC (mcgm.gov.in)"),
+        ("Bengaluru (Sahaaya 2.0)", 12.9716, 77.5946, 25, "com.nammabengaluruNew.org",
+         "", "", "Play developer: BBMP (bbmp.gov.in)"),
+        ("Chennai (Namma Chennai)", 13.0827, 80.2707, 25, "com.ceedeev.grivenancev2",
+         "1913", "", "https://chennaicorporation.gov.in/gcc/"),
+        ("Hyderabad (GHMC)", 17.3850, 78.4867, 22, "cgg.gov.ghmc", "04021111111",
+         "https://igs.ghmc.gov.in/operator/send_otp_mobile", "https://www.ghmc.gov.in/"),
+        ("Kolkata (KMC)", 22.5726, 88.3639, 15, "com.kmc.app", "", "",
+         "Play developer: KMC (kmcgov.in)"),
+        ("Pune (PMC CARE)", 18.5204, 73.8567, 20, "in.gov.pmc.pmccare", "", "",
+         "Play developer: Pune Municipal Corporation"),
+        ("Ahmedabad (AMC CCRS)", 23.0225, 72.5714, 20, "com.amplvb.ccrs", "155303",
+         "https://www.amccrs.com", "https://ahmedabadcity.gov.in/"),
+        ("Jaipur (Nagar Nigam)", 26.9124, 75.7873, 18, "com.oispl.citizen_app",
+         "01412747400", "", "https://jaipurmc.org/"),
+        ("Patna (Clean Patna)", 25.5941, 85.1376, 15, "com.citizen.grievance.app",
+         "06122223791", "", "https://pmc.bihar.gov.in/"),
+    ]
+
+    @staticmethod
+    def police_app_for(state_code, city_name=""):
+        apps = CivicDirectory.POLICE_APPS
+        return apps.get(city_name) or apps.get(CivicDirectory.canonical(state_code))
+
+    @staticmethod
+    def civic_channel_for(lat, lon, state_code=""):
+        """Nearest municipal channel covering (lat, lon), as a dict or None."""
+        best, best_d = None, float("inf")
+        for name, cla, clo, area, pkg, phone, web, src in CivicDirectory.CIVIC_CHANNELS:
+            d = haversine_m(lat, lon, cla, clo)
+            covers = (area == CivicDirectory.canonical(state_code)
+                      if isinstance(area, str) else d <= area * 1000.0)
+            if covers and d < best_d:
+                best_d = d
+                best = {"name": name, "package": pkg, "phone": phone, "web": web,
+                        "source": src}
+        return best
+
     # Official WhatsApp numbers for photo reports (international format).
     WHATSAPP = {
         "GA": ("917875756110", "Goa Traffic Sentinel scheme, citizen.goapolice.gov.in"),
@@ -637,6 +694,8 @@ class I18N:
 
     STRINGS = {
         "hi": {
+            "Report in official police app": "आधिकारिक पुलिस ऐप में रिपोर्ट करें",
+            "Evidence pack (PDF)": "साक्ष्य पैक (पीडीएफ)", "RTI request for last report": "पिछली रिपोर्ट पर आरटीआई आवेदन",
             "MORE": "और", "HISTORY": "इतिहास", "SETTINGS": "सेटिंग्स",
             "Anonymous Reporter": "गुमनाम रिपोर्टर", "Night Mode": "रात्रि मोड",
             "CV Assist": "दृष्टि सहायता", "Plate OCR": "प्लेट पहचान",
@@ -664,6 +723,8 @@ class I18N:
             "Privacy blur (faces)": "चेहरे धुंधले करें", "ON": "चालू", "OFF": "बंद",
         },
         "mr": {
+            "Report in official police app": "अधिकृत पोलीस ॲपमध्ये तक्रार करा",
+            "Evidence pack (PDF)": "पुरावा संच (पीडीएफ)", "RTI request for last report": "मागील अहवालावर माहिती अधिकार अर्ज",
             "MORE": "अधिक", "HISTORY": "इतिहास", "SETTINGS": "सेटिंग्ज",
             "Anonymous Reporter": "निनावी तक्रारदार", "Night Mode": "रात्र मोड",
             "CV Assist": "दृष्टी सहाय्य", "Plate OCR": "प्लेट ओळख",
@@ -691,6 +752,8 @@ class I18N:
             "Privacy blur (faces)": "चेहरे अस्पष्ट करा", "ON": "चालू", "OFF": "बंद",
         },
         "ta": {
+            "Report in official police app": "அதிகாரப்பூர்வ காவல் செயலியில் புகாரளி",
+            "Evidence pack (PDF)": "சான்று தொகுப்பு (பிடிஎஃப்)", "RTI request for last report": "கடைசி புகாருக்கு தகவல் உரிமை மனு",
             "MORE": "மேலும்", "HISTORY": "வரலாறு", "SETTINGS": "அமைப்புகள்",
             "Anonymous Reporter": "பெயரில்லா புகார்தாரர்", "Night Mode": "இரவு முறை",
             "CV Assist": "பார்வை உதவி", "Plate OCR": "பலகை அறிதல்",
@@ -719,6 +782,8 @@ class I18N:
             "Privacy blur (faces)": "முகங்களை மங்கலாக்கு", "ON": "இயக்கு", "OFF": "அணை",
         },
         "kn": {
+            "Report in official police app": "ಅಧಿಕೃತ ಪೊಲೀಸ್ ಆ್ಯಪ್‌ನಲ್ಲಿ ವರದಿ ಮಾಡಿ",
+            "Evidence pack (PDF)": "ಸಾಕ್ಷ್ಯ ಸಂಗ್ರಹ (ಪಿಡಿಎಫ್)", "RTI request for last report": "ಕೊನೆಯ ವರದಿಗೆ ಮಾಹಿತಿ ಹಕ್ಕು ಅರ್ಜಿ",
             "MORE": "ಇನ್ನಷ್ಟು", "HISTORY": "ಇತಿಹಾಸ", "SETTINGS": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು",
             "Anonymous Reporter": "ಅನಾಮಧೇಯ ದೂರುದಾರ", "Night Mode": "ರಾತ್ರಿ ಮೋಡ್",
             "CV Assist": "ದೃಷ್ಟಿ ನೆರವು", "Plate OCR": "ಫಲಕ ಗುರುತಿಸುವಿಕೆ",
@@ -746,6 +811,8 @@ class I18N:
             "Privacy blur (faces)": "ಮುಖಗಳನ್ನು ಮಸುಕುಗೊಳಿಸಿ", "ON": "ಆನ್", "OFF": "ಆಫ್",
         },
         "bn": {
+            "Report in official police app": "সরকারি পুলিশ অ্যাপে রিপোর্ট করুন",
+            "Evidence pack (PDF)": "প্রমাণ সংকলন (পিডিএফ)", "RTI request for last report": "শেষ রিপোর্টের জন্য তথ্য অধিকার আবেদন",
             "MORE": "আরও", "HISTORY": "ইতিহাস", "SETTINGS": "সেটিংস",
             "Anonymous Reporter": "বেনামী অভিযোগকারী", "Night Mode": "রাত্রি মোড",
             "CV Assist": "দৃষ্টি সহায়তা", "Plate OCR": "প্লেট শনাক্তকরণ",
@@ -890,6 +957,167 @@ class Emergency:
         return ("Accident reported. Location: %s. Reporting under Good Samaritan "
                 "protection (MVA Sec.134A). Please dispatch help."
                 % Emergency.maps_link(lat, lon))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pre-send evidence quality check (mirrors common police-app rejections)
+# ─────────────────────────────────────────────────────────────────────────
+class QualityCheck:
+    """Flags evidence that police apps commonly reject: no photo, a blurry
+    photo, an imprecise GPS fix, or a plate that isn't a valid format."""
+
+    MIN_SHARPNESS = 60.0      # variance of Laplacian; below = blurry
+    MAX_GPS_ACCURACY_M = 50.0
+    MAX_GPS_AGE_S = 120.0     # older fix = location may be wrong
+    DARK_MEAN = 60.0          # mean grey level below which a photo is "dark"
+
+    @staticmethod
+    def issues(has_photo, sharpness=None, gps_accuracy_m=None, plate_conf=1.0,
+               gps_age_s=None):
+        out = []
+        if not has_photo:
+            out.append("No photo attached - tap CAPTURE with the plate in view.")
+        elif sharpness is not None and sharpness < QualityCheck.MIN_SHARPNESS:
+            out.append("Photo looks blurry (sharpness %.0f) - hold steady and recapture."
+                       % sharpness)
+        if gps_age_s is not None and gps_age_s > QualityCheck.MAX_GPS_AGE_S:
+            out.append("GPS position is %s old - go outdoors / enable location "
+                       "until it updates." % (
+                           "%.0f min" % (gps_age_s / 60) if gps_age_s < 7200
+                           else "%.0f h" % (gps_age_s / 3600)))
+        if gps_accuracy_m is not None and gps_accuracy_m > QualityCheck.MAX_GPS_ACCURACY_M:
+            out.append("GPS is imprecise (+/- %.0f m) - wait for a better fix."
+                       % gps_accuracy_m)
+        if plate_conf < 0.5:
+            out.append("Plate doesn't look like a valid Indian registration number.")
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Power / heat policy for the always-on camera pipeline
+# ─────────────────────────────────────────────────────────────────────────
+class PowerPolicy:
+    """Pause the dashcam + live OCR on low battery or a hot phone, with
+    hysteresis so it doesn't flap on/off around the thresholds."""
+
+    LOW_PCT, RESUME_PCT = 15, 20
+    HOT_C, COOL_C = 44.0, 41.0
+
+    @staticmethod
+    def should_save(pct, charging, temp_c, saving):
+        hot = temp_c is not None and temp_c >= PowerPolicy.HOT_C
+        low = pct is not None and pct < PowerPolicy.LOW_PCT and not charging
+        if not saving:
+            return hot or low
+        cool = temp_c is None or temp_c <= PowerPolicy.COOL_C
+        ok_batt = charging or pct is None or pct >= PowerPolicy.RESUME_PCT
+        return not (cool and ok_batt)
+
+
+class FlagGesture:
+    """Hands-free flag: two volume-key presses within WINDOW_S seconds."""
+
+    WINDOW_S = 1.2
+    COOLDOWN_S = 10.0
+
+    def __init__(self):
+        self._presses = []
+        self._last_flag = -1e9
+
+    def press(self, ts):
+        """Record a press at ts; returns True when it completes a flag."""
+        self._presses = [t for t in self._presses if ts - t <= self.WINDOW_S] + [ts]
+        if len(self._presses) >= 2 and ts - self._last_flag >= self.COOLDOWN_S:
+            self._presses = []
+            self._last_flag = ts
+            return True
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Accident victims: cashless treatment + Rah-Veer (Good Samaritan) reward
+# ─────────────────────────────────────────────────────────────────────────
+class AccidentHelp:
+    """Facts shown in the SOS flow and the Rah-Veer application draft.
+
+    Cashless Treatment of Road Accident Victims Scheme, 2025 (MoRTH):
+    up to Rs 1.5 lakh for the first 7 days at designated hospitals; police
+    should be informed (112) promptly. Rah-Veer: Rs 25,000 for taking a
+    victim to hospital within the golden hour; the helper must disclose
+    their identity to claim, and is protected from legal harassment.
+    """
+
+    CASHLESS_INFO = (
+        "Any road-accident victim in India is entitled to cashless treatment "
+        "up to Rs 1.5 lakh for the first 7 days at designated hospitals. "
+        "Call 112 so the police record the accident.")
+    GOLDEN_HOUR_S = 3600
+    RAHVEER_REWARD = "Rs 25,000"
+
+    @staticmethod
+    def within_golden_hour(accident_ts, hospital_ts):
+        return 0 <= hospital_ts - accident_ts <= AccidentHelp.GOLDEN_HOUR_S
+
+    @staticmethod
+    def rahveer_application(name, phone, accident, hospital, hospital_name=""):
+        """accident / hospital: dicts with ts, lat, lon."""
+        fmt = "%d %b %Y %H:%M"
+        mins = (hospital["ts"] - accident["ts"]) / 60.0
+        return (
+            "To: The District Level Appraisal Committee (Rah-Veer Scheme),\n"
+            "Office of the District Magistrate\n\n"
+            "Subject: Application for Rah-Veer (Good Samaritan) award\n\n"
+            "I, %s (mobile %s), helped a road-accident victim reach hospital.\n\n"
+            "Accident: %s at GPS %.6f, %.6f (%s)\n"
+            "Reached hospital%s: %s at GPS %.6f, %.6f (%s)\n"
+            "Time taken: %.0f minutes (%s the golden hour)\n\n"
+            "These times and locations were recorded on my phone and are "
+            "available as signed records. I consent to share my identity for "
+            "this award and request the reward under the Rah-Veer scheme.\n"
+            % (name or "[your name]", phone or "[your mobile]",
+               time.strftime(fmt, time.localtime(accident["ts"])),
+               accident["lat"], accident["lon"],
+               Emergency.maps_link(accident["lat"], accident["lon"]),
+               (" (%s)" % hospital_name) if hospital_name else "",
+               time.strftime(fmt, time.localtime(hospital["ts"])),
+               hospital["lat"], hospital["lon"],
+               Emergency.maps_link(hospital["lat"], hospital["lon"]),
+               mins, "within" if AccidentHelp.within_golden_hour(
+                   accident["ts"], hospital["ts"]) else "after"))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# RTI request: ask what action was taken on a report
+# ─────────────────────────────────────────────────────────────────────────
+class RTIRequest:
+    """Draft under Section 6(1) of the RTI Act, 2005. Central bodies file
+    at rtionline.gov.in; most state police accept their own state RTI
+    portal or a postal application to the PIO with the Rs 10 fee."""
+
+    CENTRAL_PORTAL = "https://rtionline.gov.in/"
+
+    @staticmethod
+    def draft(entry):
+        when = time.strftime("%d %b %Y %H:%M", time.localtime(float(entry.get("ts", 0))))
+        return (
+            "To: The Public Information Officer, Traffic Police\n\n"
+            "Subject: Application under Section 6(1) of the Right to "
+            "Information Act, 2005\n\n"
+            "On %s I reported a traffic violation by vehicle %s (%s, %s) at "
+            "GPS %.6f, %.6f, by email to %s with photographic evidence.\n\n"
+            "Please provide:\n"
+            "1. Whether the complaint was received and registered, with its "
+            "reference number.\n"
+            "2. The action taken on it, including whether a challan was "
+            "issued to the vehicle, with date.\n"
+            "3. The name and designation of the officer who handled it.\n"
+            "4. If no action was taken, the reasons recorded.\n\n"
+            "I am an Indian citizen. The application fee of Rs 10 is paid "
+            "herewith."
+            % (when, entry.get("plate", "?"), entry.get("offense", "?"),
+               entry.get("section", ""), float(entry.get("lat", 0.0)),
+               float(entry.get("lon", 0.0)),
+               ", ".join(entry.get("recipients", []) or ["the traffic police"])))
 
 
 # ─────────────────────────────────────────────────────────────────────────
